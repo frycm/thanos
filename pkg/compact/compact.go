@@ -596,6 +596,41 @@ func (cg *Group) Resolution() int64 {
 	return cg.resolution
 }
 
+// AcceptMalformedIndex returns whether blocks with a malformed index are
+// tolerated in this group.
+func (cg *Group) AcceptMalformedIndex() bool {
+	return cg.acceptMalformedIndex
+}
+
+// EnableVerticalCompaction returns whether overlapping blocks may be compacted
+// vertically in this group.
+func (cg *Group) EnableVerticalCompaction() bool {
+	return cg.enableVerticalCompaction
+}
+
+// HashFunc returns the hash function used for the files of this group's blocks.
+func (cg *Group) HashFunc() metadata.HashFunc {
+	return cg.hashFunc
+}
+
+// BlockFilesConcurrency returns how many files of a single block are fetched or
+// uploaded concurrently.
+func (cg *Group) BlockFilesConcurrency() int {
+	return cg.blockFilesConcurrency
+}
+
+// CompactBlocksFetchConcurrency returns how many blocks of a plan are downloaded
+// concurrently.
+func (cg *Group) CompactBlocksFetchConcurrency() int {
+	return cg.compactBlocksFetchConcurrency
+}
+
+// BlocksMarkedForDeletion returns the counter tracking blocks this group marked
+// for deletion.
+func (cg *Group) BlocksMarkedForDeletion() prometheus.Counter {
+	return cg.blocksMarkedForDeletion
+}
+
 func (cg *Group) Extensions() any {
 	return cg.extensions
 }
@@ -989,6 +1024,11 @@ func NewIssue347Error(err error, brokenBlock ulid.ULID) error {
 	return issue347Error(err, brokenBlock)
 }
 
+// Block returns the ID of the block that caused the error.
+func (e Issue347Error) Block() ulid.ULID {
+	return e.id
+}
+
 func (e Issue347Error) Error() string {
 	return e.err.Error()
 }
@@ -1005,6 +1045,11 @@ type OutOfOrderChunksError struct {
 	id  ulid.ULID
 }
 
+// Block returns the ID of the block that caused the error.
+func (e OutOfOrderChunksError) Block() ulid.ULID {
+	return e.id
+}
+
 func (e OutOfOrderChunksError) Error() string {
 	return e.err.Error()
 }
@@ -1013,7 +1058,7 @@ func outOfOrderChunkError(err error, brokenBlock ulid.ULID) OutOfOrderChunksErro
 	return OutOfOrderChunksError{err: err, id: brokenBlock}
 }
 
-// NewOutOfOrderChunksError returns an error signalling that the given block
+// NewOutOfOrderChunksError returns an error signaling that the given block
 // contains out-of-order chunks. It is exported so that out-of-process executors
 // can reconstruct the error class reported by a remote worker.
 func NewOutOfOrderChunksError(err error, brokenBlock ulid.ULID) error {
@@ -1232,6 +1277,13 @@ func (cg *Group) planLocked(ctx context.Context, planner Planner, errChan chan e
 
 	return toCompact, overlappingBlocks, nil
 }
+
+// ErrPlanDeferred is returned by a PlanExecutor that deliberately did not
+// execute the plan it was given - for example because the plan's source blocks
+// belong to an abandoned task awaiting operator attention. It tells the control
+// loop not to rerun the group this pass, where an ordinary empty result would
+// mean "done, look for more work" and spin on the same deferred plan forever.
+var ErrPlanDeferred = errors.New("compaction plan deferred")
 
 // PlanExecutor executes a compaction plan produced for a group: it downloads the
 // planned source blocks, compacts them and uploads the resulting block(s) into
@@ -1480,6 +1532,11 @@ func (cg *Group) compact(ctx context.Context, dir string, planner Planner, execu
 
 	compIDs, err := executor.Execute(ctx, dir, cg, toCompact, overlappingBlocks)
 	if err != nil {
+		if errors.Is(err, ErrPlanDeferred) {
+			// The executor chose to sit this plan out. No rerun: replanning
+			// would produce the same plan and defer it again, forever.
+			return false, nil, nil
+		}
 		return false, nil, err
 	}
 
