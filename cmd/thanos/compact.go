@@ -424,7 +424,7 @@ func runCompact(
 		if err != nil {
 			return errors.Wrap(err, "create compaction scheduler")
 		}
-		planExecutor = distributed.NewRemotePlanExecutor(logger, insBkt, scheduler, dedupReplicaLabels, compact.DefaultBlockDeletableChecker{})
+		planExecutor = distributed.NewRemotePlanExecutor(logger, insBkt, scheduler, planner, conf.managerMaxInflightPerGroup, dedupReplicaLabels, compact.DefaultBlockDeletableChecker{})
 	}
 
 	compactor, err := compact.NewBucketCompactorWithExecutor(

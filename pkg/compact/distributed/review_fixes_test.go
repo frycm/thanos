@@ -6,13 +6,19 @@ package distributed
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/efficientgo/core/testutil"
 	"github.com/go-kit/log"
+	"github.com/oklog/ulid/v2"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/thanos-io/objstore"
+	"github.com/thanos-io/thanos/pkg/block/metadata"
+
+	"github.com/thanos-io/thanos/pkg/compact"
 )
 
 // This file holds regression tests for the findings of the multi-agent review
@@ -33,6 +39,13 @@ func TestEffectiveHeartbeatInterval(t *testing.T) {
 		got := effectiveHeartbeatInterval(tc.configured, tc.ttl)
 		testutil.Equals(t, tc.want, got)
 	}
+}
+
+// stubPlanner always returns the same plan.
+type stubPlanner struct{ plan []*metadata.Meta }
+
+func (p stubPlanner) Plan(_ context.Context, _ []*metadata.Meta, _ chan error, _ any) ([]*metadata.Meta, error) {
+	return p.plan, nil
 }
 
 // TestLeaseRevocationsPersistImmediately pins down that requeue and abandonment
@@ -209,6 +222,70 @@ func TestLeaseRefusesMismatchedJournalID(t *testing.T) {
 	testutil.Ok(t, err)
 }
 
+// listPlanner returns its canned plans one Plan call at a time.
+type listPlanner struct {
+	plans [][]*metadata.Meta
+	calls int
+}
+
+func (p *listPlanner) Plan(_ context.Context, _ []*metadata.Meta, _ chan error, _ any) ([]*metadata.Meta, error) {
+	if p.calls >= len(p.plans) {
+		return nil, nil
+	}
+	p.calls++
+	return p.plans[p.calls-1], nil
+}
+
+// TestPlanGroupKeepsConcurrentPlansTimeDisjoint pins down that concurrent
+// plans for one group may not overlap in time. Disjoint source ULIDs are not
+// enough: the planner selects range parts "potentially with gaps", so a second
+// plan could bracket the first, both outputs would overlap, and the next
+// cycle's overlap check would halt the shard.
+func TestPlanGroupKeepsConcurrentPlansTimeDisjoint(t *testing.T) {
+	logger := log.NewNopLogger()
+	bkt := objstore.NewInMemBucket()
+	cnt := func() prometheus.Counter { return prometheus.NewCounter(prometheus.CounterOpts{Name: "test"}) }
+
+	meta := func(minT, maxT int64) *metadata.Meta {
+		m := &metadata.Meta{}
+		m.ULID = ulid.MustNew(uint64(minT)+1, nil)
+		m.MinTime, m.MaxTime = minT, maxT
+		return m
+	}
+
+	newGroup := func(vertical bool, metas ...*metadata.Meta) *compact.Group {
+		cg, err := compact.NewGroup(logger, bkt, "g1", labels.EmptyLabels(), 0, false, vertical,
+			cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), metadata.NoneFunc, 1, 1)
+		testutil.Ok(t, err)
+		for _, m := range metas {
+			testutil.Ok(t, cg.AppendMeta(m))
+		}
+		return cg
+	}
+
+	first := []*metadata.Meta{meta(8000, 12000), meta(12000, 16000)}
+
+	// A second plan whose envelope brackets the first ([0,18000) vs [8000,16000))
+	// must be deferred, even though its source blocks are disjoint.
+	bracket := []*metadata.Meta{meta(0, 8000), meta(16000, 18000)}
+	sched := &Scheduler{journal: NewJournal("t", "")}
+	e := NewRemotePlanExecutor(logger, bkt, sched, &listPlanner{plans: [][]*metadata.Meta{bracket}}, 4, nil, nil)
+	plans := e.planGroup(context.Background(), newGroup(false, append(append([]*metadata.Meta{}, first...), bracket...)...), first)
+	testutil.Equals(t, 1, len(plans))
+
+	// A genuinely disjoint second plan still runs concurrently.
+	disjoint := []*metadata.Meta{meta(16000, 18000), meta(18000, 20000)}
+	e = NewRemotePlanExecutor(logger, bkt, sched, &listPlanner{plans: [][]*metadata.Meta{disjoint}}, 4, nil, nil)
+	plans = e.planGroup(context.Background(), newGroup(false, append(append([]*metadata.Meta{}, first...), disjoint...)...), first)
+	testutil.Equals(t, 2, len(plans))
+
+	// Under vertical compaction blocks overlap by design, so disjoint sources
+	// prove nothing: one plan at a time.
+	e = NewRemotePlanExecutor(logger, bkt, sched, &listPlanner{plans: [][]*metadata.Meta{disjoint}}, 4, nil, nil)
+	plans = e.planGroup(context.Background(), newGroup(true, append(append([]*metadata.Meta{}, first...), disjoint...)...), first)
+	testutil.Equals(t, 1, len(plans))
+}
+
 // TestWorkerSeenIsPruned pins down that the worker liveness map forgets workers
 // gone for many lease TTLs, instead of growing forever under pod churn.
 func TestWorkerSeenIsPruned(t *testing.T) {
@@ -231,6 +308,54 @@ func TestWorkerSeenIsPruned(t *testing.T) {
 	_, gone := sched.workerSeen["long-gone"]
 	testutil.Equals(t, true, fresh)
 	testutil.Equals(t, false, gone)
+}
+
+// countingExecutor records how many Execute calls run at once.
+type countingExecutor struct {
+	mtx     sync.Mutex
+	active  int
+	maxSeen int
+}
+
+func (e *countingExecutor) Execute(_ context.Context, _ string, _ *compact.Group, _ []*metadata.Meta, _ bool) ([]ulid.ULID, error) {
+	e.mtx.Lock()
+	e.active++
+	if e.active > e.maxSeen {
+		e.maxSeen = e.active
+	}
+	e.mtx.Unlock()
+	time.Sleep(50 * time.Millisecond)
+	e.mtx.Lock()
+	e.active--
+	e.mtx.Unlock()
+	return nil, compact.ErrPlanDeferred
+}
+
+// TestGroupCompactRunsAreSerialized pins down the contract Group.Compact always
+// had before the executor seam: one compaction run per group at a time, for
+// external callers that relied on it.
+func TestGroupCompactRunsAreSerialized(t *testing.T) {
+	cnt := func() prometheus.Counter { return prometheus.NewCounter(prometheus.CounterOpts{Name: "test"}) }
+	cg, err := compact.NewGroup(log.NewNopLogger(), objstore.NewInMemBucket(), "g1", labels.EmptyLabels(), 0, false, false,
+		cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), metadata.NoneFunc, 1, 1)
+	testutil.Ok(t, err)
+	m := &metadata.Meta{}
+	m.ULID = ulid.MustNew(1, nil)
+	m.MinTime, m.MaxTime = 0, 1000
+	testutil.Ok(t, cg.AppendMeta(m))
+
+	e := &countingExecutor{}
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _, err := cg.CompactWithExecutor(context.Background(), t.TempDir(), stubPlanner{plan: []*metadata.Meta{m}}, e)
+			testutil.Ok(t, err)
+		}()
+	}
+	wg.Wait()
+	testutil.Equals(t, 1, e.maxSeen)
 }
 
 // TestOversizedLimitsIgnoreUnknownSizes pins down that blocks which report no

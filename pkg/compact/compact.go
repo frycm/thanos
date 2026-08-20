@@ -435,12 +435,18 @@ func (g *DefaultGrouper) Groups(blocks map[ulid.ULID]*metadata.Meta) (res []*Gro
 // Group captures a set of blocks that have the same origin labels and downsampling resolution.
 // Those blocks generally contain the same series and can thus efficiently be compacted.
 type Group struct {
-	logger                        log.Logger
-	bkt                           objstore.Bucket
-	key                           string
-	labels                        labels.Labels
-	resolution                    int64
-	mtx                           sync.Mutex
+	logger     log.Logger
+	bkt        objstore.Bucket
+	key        string
+	labels     labels.Labels
+	resolution int64
+	mtx        sync.Mutex
+	// compactRunMtx serializes whole compaction runs of this group, preserving
+	// the contract Compact always had: one run per group at a time. It is
+	// separate from mtx, which protects the group's state and is taken and
+	// released around planning, so that an executor can plan further work for
+	// the group while a run is in flight.
+	compactRunMtx                 sync.Mutex
 	metasByMinTime                []*metadata.Meta
 	acceptMalformedIndex          bool
 	enableVerticalCompaction      bool
@@ -957,6 +963,9 @@ func (cg *Group) Compact(ctx context.Context, dir string, planner Planner, comp 
 // CompactWithExecutor plans a single compaction against the group and hands the
 // resulting plan to the given executor.
 func (cg *Group) CompactWithExecutor(ctx context.Context, dir string, planner Planner, executor PlanExecutor) (shouldRerun bool, compIDs []ulid.ULID, rerr error) {
+	cg.compactRunMtx.Lock()
+	defer cg.compactRunMtx.Unlock()
+
 	cg.compactionRunsStarted.Inc()
 
 	subDir := filepath.Join(dir, cg.Key())
@@ -1247,14 +1256,26 @@ func RepairIssue347(ctx context.Context, logger log.Logger, bkt objstore.Bucket,
 // Planning is separated from execution so that the resulting plan can be handed
 // to an arbitrary PlanExecutor, possibly running in a different process.
 func (cg *Group) Plan(ctx context.Context, planner Planner, errChan chan error) (toCompact []*metadata.Meta, overlappingBlocks bool, err error) {
+	return cg.PlanExcluding(ctx, planner, nil, errChan)
+}
+
+// PlanExcluding plans the next compaction for the group while pretending the
+// given blocks are not there.
+//
+// Planning repeatedly with everything already being worked on excluded yields
+// plans with disjoint sources. Blocks in a group do not overlap in time, unless
+// vertical compaction is enabled, so disjoint sources means the resulting blocks
+// cannot overlap either, and several of these plans can therefore be compacted
+// at the same time.
+func (cg *Group) PlanExcluding(ctx context.Context, planner Planner, exclude map[ulid.ULID]struct{}, errChan chan error) (toCompact []*metadata.Meta, overlappingBlocks bool, err error) {
 	cg.mtx.Lock()
 	defer cg.mtx.Unlock()
 
-	return cg.planLocked(ctx, planner, errChan)
+	return cg.planLocked(ctx, planner, exclude, errChan)
 }
 
-// planLocked implements Plan. Callers have to hold cg.mtx.
-func (cg *Group) planLocked(ctx context.Context, planner Planner, errChan chan error) ([]*metadata.Meta, bool, error) {
+// planLocked implements PlanExcluding. Callers have to hold cg.mtx.
+func (cg *Group) planLocked(ctx context.Context, planner Planner, exclude map[ulid.ULID]struct{}, errChan chan error) ([]*metadata.Meta, bool, error) {
 	// Check for overlapped blocks.
 	overlappingBlocks := false
 	if err := cg.areBlocksOverlapping(nil); err != nil {
@@ -1267,9 +1288,26 @@ func (cg *Group) planLocked(ctx context.Context, planner Planner, errChan chan e
 		overlappingBlocks = true
 	}
 
+	candidates := cg.metasByMinTime
+	if len(exclude) > 0 {
+		candidates = make([]*metadata.Meta, 0, len(cg.metasByMinTime))
+		for _, m := range cg.metasByMinTime {
+			if _, skip := exclude[m.ULID]; skip {
+				continue
+			}
+			candidates = append(candidates, m)
+		}
+	}
+
+	if len(candidates) == 0 {
+		// Everything in the group is already being worked on. Planners expect a
+		// non-empty set of blocks, so stop here rather than handing them nothing.
+		return nil, overlappingBlocks, nil
+	}
+
 	var toCompact []*metadata.Meta
 	if err := tracing.DoInSpanWithErr(ctx, "compaction_planning", func(ctx context.Context) (e error) {
-		toCompact, e = planner.Plan(ctx, cg.metasByMinTime, errChan, cg.Extensions())
+		toCompact, e = planner.Plan(ctx, candidates, errChan, cg.Extensions())
 		return e
 	}); err != nil {
 		return nil, false, errors.Wrap(err, "plan compaction")
@@ -1517,11 +1555,14 @@ func (ex LocalPlanExecutor) Execute(ctx context.Context, dir string, cg *Group, 
 	return compIDs, nil
 }
 
+// compact plans work for the group and hands it to the executor.
+//
+// The group lock is held only while planning. A group is compacted by a single
+// goroutine at a time, so nothing else mutates it meanwhile, and releasing the
+// lock lets an executor plan further, disjoint work for the same group while the
+// first plan is still running.
 func (cg *Group) compact(ctx context.Context, dir string, planner Planner, executor PlanExecutor, errChan chan error) (bool, []ulid.ULID, error) {
-	cg.mtx.Lock()
-	defer cg.mtx.Unlock()
-
-	toCompact, overlappingBlocks, err := cg.planLocked(ctx, planner, errChan)
+	toCompact, overlappingBlocks, err := cg.Plan(ctx, planner, errChan)
 	if err != nil {
 		return false, nil, err
 	}
