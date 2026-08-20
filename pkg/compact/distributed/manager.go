@@ -30,6 +30,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/compact"
+	"github.com/thanos-io/thanos/pkg/compact/downsample"
 )
 
 // ManagerConfig configures the scheduling side of a distributed compactor.
@@ -1313,4 +1314,177 @@ func GroupSpecOf(cg *compact.Group) (GroupSpec, error) {
 		spec.Extensions = raw
 	}
 	return spec, nil
+}
+
+// DispatchDownsampling hands every block that needs downsampling to a worker and
+// waits for all of them to finish.
+//
+// It replaces downsampling in the manager process. Retention, garbage collection
+// and every other mutation of the bucket stay with the manager; the only thing
+// a worker does is produce the downsampled block.
+func DispatchDownsampling(
+	ctx context.Context,
+	logger log.Logger,
+	bkt objstore.Bucket,
+	sched *Scheduler,
+	metas map[ulid.ULID]*metadata.Meta,
+	concurrency int,
+	hashFunc metadata.HashFunc,
+	blockFilesConcurrency int,
+	acceptMalformedIndex bool,
+) error {
+	candidates, err := downsample.Plan(metas)
+	if err != nil {
+		return err
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+
+	level.Info(logger).Log("msg", "dispatching downsampling to workers", "blocks", len(candidates))
+
+	var (
+		wg       sync.WaitGroup
+		sem      = make(chan struct{}, concurrency)
+		mtx      sync.Mutex
+		firstErr error
+	)
+
+	for _, c := range candidates {
+		if sched.SourcesParked([]string{c.Meta.ULID.String()}) {
+			level.Warn(logger).Log("msg", "not re-dispatching the source block of a parked (abandoned or oversized) downsample task; investigate the journal entry",
+				"block", c.Meta.ULID)
+			continue
+		}
+		task := DownsampleTask(c.Meta, c.TargetResolution, hashFunc, blockFilesConcurrency, acceptMalformedIndex, sched.conf.DedupReplicaLabels)
+		if reason := oversizedReason(task, sched.conf); reason != "" {
+			// Blocks marked no-compact for index size are exactly the ones
+			// downsampling must not assume a worker can hold.
+			level.Error(logger).Log("msg", "refusing to dispatch an oversized downsample task", "block", c.Meta.ULID, "reason", reason)
+			sched.MarkOversized(task, reason)
+			continue
+		}
+		wg.Add(1)
+		go func(task Task, c downsample.Candidate) {
+			defer wg.Done()
+
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				return
+			}
+
+			resultCh, err := sched.Submit(ctx, task)
+			if err != nil {
+				recordErr(&mtx, &firstErr, errors.Wrap(err, "submit downsample task"))
+				return
+			}
+
+			var res Result
+			select {
+			case <-ctx.Done():
+				recordErr(&mtx, &firstErr, ctx.Err())
+				return
+			case res = <-resultCh:
+			}
+
+			if err := ReconstructError(res); err != nil {
+				recordErr(&mtx, &firstErr, errors.Wrapf(err, "downsample block %s", c.Meta.ULID))
+				return
+			}
+			if res.Outcome.Aborted() {
+				// Nothing was uploaded; the block is simply picked up again on the
+				// next pass.
+				level.Info(logger).Log("msg", "worker discarded downsample task without uploading",
+					"task", res.TaskID, "block", c.Meta.ULID, "outcome", res.Outcome)
+				return
+			}
+
+			// Confirm the downsampled block really is in the bucket, and really
+			// is this block's downsample: same labels, same sources, the target
+			// resolution. Downsampling deletes nothing, so a wrong block cannot
+			// lose data the way it could for compaction, but accepting it would
+			// leave this block silently never downsampled.
+			for _, raw := range res.OutputBlocks {
+				id, err := ulid.Parse(raw)
+				if err != nil {
+					recordErr(&mtx, &firstErr, errors.Wrapf(err, "worker reported an unparseable block ID %q", raw))
+					return
+				}
+				rawMeta, err := readRawMeta(ctx, bkt, id)
+				if err != nil {
+					recordErr(&mtx, &firstErr, errors.Wrapf(err, "verify downsampled block %s", id))
+					return
+				}
+				sum, ok := res.OutputChecksums[raw]
+				if !ok || sum == "" {
+					recordErr(&mtx, &firstErr, errors.Errorf("worker reported no checksum for downsampled block %s", id))
+					return
+				}
+				if got := checksumOf(rawMeta); got != sum {
+					recordErr(&mtx, &firstErr, errors.Errorf(
+						"downsampled block %s metadata does not match the checksum the worker reported: got %s, reported %s", id, got, sum))
+					return
+				}
+				var outMeta metadata.Meta
+				if err := json.Unmarshal(rawMeta, &outMeta); err != nil {
+					recordErr(&mtx, &firstErr, errors.Wrapf(err, "unmarshal metadata of downsampled block %s", id))
+					return
+				}
+				if err := verifyDownsampledBlock(&outMeta, c, Provenance{
+					TaskID: res.TaskID, TaskType: TaskDownsample, JournalID: sched.conf.JournalID, Generation: res.Generation,
+				}); err != nil {
+					recordErr(&mtx, &firstErr, errors.Wrapf(err, "downsampled block %s reported for %s", id, c.Meta.ULID))
+					return
+				}
+			}
+		}(task, c)
+	}
+	wg.Wait()
+
+	return firstErr
+}
+
+// verifyDownsampledBlock checks that a block a worker reported is the
+// downsample of the given candidate, produced by the task being reported.
+func verifyDownsampledBlock(outMeta *metadata.Meta, c downsample.Candidate, want Provenance) error {
+	if err := verifyProvenance(outMeta, want); err != nil {
+		return err
+	}
+	if outMeta.Thanos.Downsample.Resolution != c.TargetResolution {
+		return errors.Errorf("has resolution %d, expected %d", outMeta.Thanos.Downsample.Resolution, c.TargetResolution)
+	}
+	if !labels.Equal(labels.FromMap(outMeta.Thanos.Labels), labels.FromMap(c.Meta.Thanos.Labels)) {
+		return errors.Errorf("carries labels %v, the source has %v", outMeta.Thanos.Labels, c.Meta.Thanos.Labels)
+	}
+	if outMeta.MinTime != c.Meta.MinTime || outMeta.MaxTime != c.Meta.MaxTime {
+		return errors.Errorf("spans [%d, %d], the source spans [%d, %d]",
+			outMeta.MinTime, outMeta.MaxTime, c.Meta.MinTime, c.Meta.MaxTime)
+	}
+	expected := map[ulid.ULID]struct{}{}
+	for _, s := range c.Meta.Compaction.Sources {
+		expected[s] = struct{}{}
+	}
+	if len(outMeta.Compaction.Sources) != len(expected) {
+		return errors.Errorf("was built from %d sources, the source block has %d",
+			len(outMeta.Compaction.Sources), len(expected))
+	}
+	for _, s := range outMeta.Compaction.Sources {
+		if _, ok := expected[s]; !ok {
+			return errors.Errorf("was built from %s, which is not a source of the block being downsampled", s)
+		}
+	}
+	return nil
+}
+
+func recordErr(mtx *sync.Mutex, dst *error, err error) {
+	mtx.Lock()
+	defer mtx.Unlock()
+	if *dst == nil {
+		*dst = err
+	}
 }

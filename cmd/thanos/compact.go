@@ -19,6 +19,7 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/oklog/run"
+	"github.com/oklog/ulid/v2"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
@@ -522,18 +523,7 @@ func runCompact(
 				downsampleMetrics.downsampleFailures.WithLabelValues(resolutionLabel)
 			}
 
-			if err := downsampleBucket(
-				ctx,
-				logger,
-				downsampleMetrics,
-				insBkt,
-				filteredMetas,
-				downsamplingDir,
-				conf.downsampleConcurrency,
-				conf.blockFilesConcurrency,
-				metadata.HashFunc(conf.hashFunc),
-				conf.acceptMalformedIndex,
-			); err != nil {
+			if err := runDownsampling(ctx, logger, scheduler, downsampleMetrics, insBkt, filteredMetas, downsamplingDir, conf); err != nil {
 				return errors.Wrap(err, "first pass of downsampling failed")
 			}
 
@@ -550,18 +540,7 @@ func runCompact(
 				delete(filteredMetas, ul)
 			}
 
-			if err := downsampleBucket(
-				ctx,
-				logger,
-				downsampleMetrics,
-				insBkt,
-				filteredMetas,
-				downsamplingDir,
-				conf.downsampleConcurrency,
-				conf.blockFilesConcurrency,
-				metadata.HashFunc(conf.hashFunc),
-				conf.acceptMalformedIndex,
-			); err != nil {
+			if err := runDownsampling(ctx, logger, scheduler, downsampleMetrics, insBkt, filteredMetas, downsamplingDir, conf); err != nil {
 				return errors.Wrap(err, "second pass of downsampling failed")
 			}
 
@@ -799,9 +778,9 @@ type compactConfig struct {
 	managerLeaseTTL            time.Duration
 	managerMaxAttempts         int
 	managerJournalRetention    time.Duration
+	managerMaxInflightPerGroup int
 	managerMaxTaskSeries       uint64
 	managerMaxTaskIndexSize    units.Base2Bytes
-	managerMaxInflightPerGroup int
 	workerManagerAddress       string
 	workerID                   string
 	workerPollInterval         time.Duration
@@ -888,14 +867,14 @@ func (cc *compactConfig) registerFlag(cmd extkingpin.FlagClause) {
 	cmd.Flag("compact.manager.journal-retention", "Experimental. How long finished tasks are kept in the journal.").
 		Default("24h").Hidden().DurationVar(&cc.managerJournalRetention)
 
+	cmd.Flag("compact.manager.max-inflight-per-group", "Experimental. How many non-overlapping plans the manager keeps in flight for a single compaction group. Raising this is what lets one block stream be compacted by several workers at once.").
+		Default("4").Hidden().IntVar(&cc.managerMaxInflightPerGroup)
+
 	cmd.Flag("compact.manager.max-task-series", "Experimental. Refuse to dispatch a task whose source blocks report more series than this, in total. Such a plan is recorded as oversized in the journal and its blocks are withheld from planning until an operator intervenes. 0 disables the limit.").
 		Default("0").Hidden().Uint64Var(&cc.managerMaxTaskSeries)
 
 	cmd.Flag("compact.manager.max-task-index-size", "Experimental. Refuse to dispatch a task whose source blocks carry more index data than this, in total. Such a plan is recorded as oversized in the journal and its blocks are withheld from planning until an operator intervenes. 0 disables the limit.").
 		Default("0").Hidden().BytesVar(&cc.managerMaxTaskIndexSize)
-
-	cmd.Flag("compact.manager.max-inflight-per-group", "Experimental. How many non-overlapping plans the manager keeps in flight for a single compaction group. Raising this is what lets one block stream be compacted by several workers at once.").
-		Default("4").Hidden().IntVar(&cc.managerMaxInflightPerGroup)
 
 	cmd.Flag("compact.worker.manager-address", "Experimental. Address of the compactor manager, either host:port or a Thanos service discovery address such as dnssrv+_http._tcp.thanos-compact-manager.thanos.svc. Required in 'worker' mode.").
 		Hidden().StringVar(&cc.workerManagerAddress)
@@ -1004,4 +983,43 @@ func dedupFuncFor(conf compactConfig, dedupReplicaLabels []string) (storage.Vert
 	default:
 		return nil, errors.Errorf("unsupported deduplication func, got %s", conf.dedupFunc)
 	}
+}
+
+// runDownsampling downsamples the given blocks. In manager mode the work is
+// handed to workers; otherwise it happens in this process as it always has.
+func runDownsampling(
+	ctx context.Context,
+	logger log.Logger,
+	scheduler *distributed.Scheduler,
+	downsampleMetrics *DownsampleMetrics,
+	insBkt objstore.InstrumentedBucket,
+	metas map[ulid.ULID]*metadata.Meta,
+	downsamplingDir string,
+	conf compactConfig,
+) error {
+	if scheduler != nil {
+		return distributed.DispatchDownsampling(
+			ctx,
+			logger,
+			insBkt,
+			scheduler,
+			metas,
+			conf.downsampleConcurrency,
+			metadata.HashFunc(conf.hashFunc),
+			conf.blockFilesConcurrency,
+			conf.acceptMalformedIndex,
+		)
+	}
+	return downsampleBucket(
+		ctx,
+		logger,
+		downsampleMetrics,
+		insBkt,
+		metas,
+		downsamplingDir,
+		conf.downsampleConcurrency,
+		conf.blockFilesConcurrency,
+		metadata.HashFunc(conf.hashFunc),
+		conf.acceptMalformedIndex,
+	)
 }
