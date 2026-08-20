@@ -1247,14 +1247,25 @@ func RepairIssue347(ctx context.Context, logger log.Logger, bkt objstore.Bucket,
 // Planning is separated from execution so that the resulting plan can be handed
 // to an arbitrary PlanExecutor, possibly running in a different process.
 func (cg *Group) Plan(ctx context.Context, planner Planner, errChan chan error) (toCompact []*metadata.Meta, overlappingBlocks bool, err error) {
+	return cg.PlanExcluding(ctx, planner, nil, errChan)
+}
+
+// PlanExcluding plans the next compaction for the group while pretending the
+// given blocks are not there.
+//
+// Repeated planning yields disjoint source IDs, but the resulting blocks can
+// still overlap: the planner may select blocks on both sides of an excluded
+// interval. Executors dispatching several plans concurrently must also check
+// that their full output time spans are disjoint.
+func (cg *Group) PlanExcluding(ctx context.Context, planner Planner, exclude map[ulid.ULID]struct{}, errChan chan error) (toCompact []*metadata.Meta, overlappingBlocks bool, err error) {
 	cg.mtx.Lock()
 	defer cg.mtx.Unlock()
 
-	return cg.planLocked(ctx, planner, errChan)
+	return cg.planLocked(ctx, planner, exclude, errChan)
 }
 
-// planLocked implements Plan. Callers have to hold cg.mtx.
-func (cg *Group) planLocked(ctx context.Context, planner Planner, errChan chan error) ([]*metadata.Meta, bool, error) {
+// planLocked implements PlanExcluding. Callers have to hold cg.mtx.
+func (cg *Group) planLocked(ctx context.Context, planner Planner, exclude map[ulid.ULID]struct{}, errChan chan error) ([]*metadata.Meta, bool, error) {
 	// Check for overlapped blocks.
 	overlappingBlocks := false
 	if err := cg.areBlocksOverlapping(nil); err != nil {
@@ -1267,9 +1278,26 @@ func (cg *Group) planLocked(ctx context.Context, planner Planner, errChan chan e
 		overlappingBlocks = true
 	}
 
+	candidates := cg.metasByMinTime
+	if len(exclude) > 0 {
+		candidates = make([]*metadata.Meta, 0, len(cg.metasByMinTime))
+		for _, m := range cg.metasByMinTime {
+			if _, skip := exclude[m.ULID]; skip {
+				continue
+			}
+			candidates = append(candidates, m)
+		}
+	}
+
+	if len(candidates) == 0 {
+		// Everything in the group is already being worked on. Planners expect a
+		// non-empty set of blocks, so stop here rather than handing them nothing.
+		return nil, overlappingBlocks, nil
+	}
+
 	var toCompact []*metadata.Meta
 	if err := tracing.DoInSpanWithErr(ctx, "compaction_planning", func(ctx context.Context) (e error) {
-		toCompact, e = planner.Plan(ctx, cg.metasByMinTime, errChan, cg.Extensions())
+		toCompact, e = planner.Plan(ctx, candidates, errChan, cg.Extensions())
 		return e
 	}); err != nil {
 		return nil, false, errors.Wrap(err, "plan compaction")
@@ -1517,11 +1545,14 @@ func (ex LocalPlanExecutor) Execute(ctx context.Context, dir string, cg *Group, 
 	return compIDs, nil
 }
 
+// compact plans work for the group and hands it to the executor.
+//
+// The group lock is held only while planning. A group is compacted by a single
+// goroutine at a time, so nothing else mutates it meanwhile, and releasing the
+// lock lets an executor plan further, disjoint work for the same group while the
+// first plan is still running.
 func (cg *Group) compact(ctx context.Context, dir string, planner Planner, executor PlanExecutor, errChan chan error) (bool, []ulid.ULID, error) {
-	cg.mtx.Lock()
-	defer cg.mtx.Unlock()
-
-	toCompact, overlappingBlocks, err := cg.planLocked(ctx, planner, errChan)
+	toCompact, overlappingBlocks, err := cg.Plan(ctx, planner, errChan)
 	if err != nil {
 		return false, nil, err
 	}

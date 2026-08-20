@@ -812,21 +812,166 @@ func randomToken() (string, error) {
 // flight, and the whole control loop around it, including how it reacts to halt
 // and retry errors, is reused unchanged.
 type RemotePlanExecutor struct {
-	logger log.Logger
-	bkt    objstore.Bucket
-	sched  *Scheduler
+	logger  log.Logger
+	bkt     objstore.Bucket
+	sched   *Scheduler
+	planner compact.Planner
+
+	// maxInflightPerGroup bounds how many plans for one group are worked on at
+	// the same time.
+	maxInflightPerGroup int
 
 	// journalID names this manager in the deletion marks it writes.
 	journalID string
 }
 
 // NewRemotePlanExecutor returns an executor that dispatches plans to workers.
-func NewRemotePlanExecutor(logger log.Logger, bkt objstore.Bucket, sched *Scheduler) *RemotePlanExecutor {
-	return &RemotePlanExecutor{logger: logger, bkt: bkt, sched: sched, journalID: sched.conf.JournalID}
+//
+// The planner is used to look for further, disjoint work in the same group while
+// the first plan is still running. That is what lets a single block stream be
+// compacted by several workers at once, which one process cannot do because a
+// compaction job is single threaded.
+func NewRemotePlanExecutor(logger log.Logger, bkt objstore.Bucket, sched *Scheduler, planner compact.Planner, maxInflightPerGroup int) *RemotePlanExecutor {
+	if maxInflightPerGroup <= 0 {
+		maxInflightPerGroup = 1
+	}
+	return &RemotePlanExecutor{
+		logger:              logger,
+		bkt:                 bkt,
+		sched:               sched,
+		planner:             planner,
+		maxInflightPerGroup: maxInflightPerGroup,
+		journalID:           sched.conf.JournalID,
+	}
 }
 
 // Execute implements compact.PlanExecutor.
 func (e *RemotePlanExecutor) Execute(ctx context.Context, _ string, cg *compact.Group, toCompact []*metadata.Meta, overlappingBlocks bool) ([]ulid.ULID, error) {
+	plans := e.planGroup(ctx, cg, toCompact)
+
+	type outcome struct {
+		ids []ulid.ULID
+		err error
+	}
+	outcomes := make([]outcome, len(plans))
+
+	var wg sync.WaitGroup
+	for i, plan := range plans {
+		wg.Add(1)
+		go func(i int, plan []*metadata.Meta) {
+			defer wg.Done()
+			ids, err := e.runPlan(ctx, cg, plan, overlappingBlocks)
+			outcomes[i] = outcome{ids: ids, err: err}
+		}(i, plan)
+	}
+	wg.Wait()
+
+	var (
+		compIDs  []ulid.ULID
+		firstErr error
+		deferred int
+	)
+	for _, o := range outcomes {
+		compIDs = append(compIDs, o.ids...)
+		if o.err == nil {
+			continue
+		}
+		if errors.Is(o.err, compact.ErrPlanDeferred) {
+			deferred++
+			continue
+		}
+		// A halt outweighs anything else: it means something is wrong that more
+		// compaction would only make worse.
+		if firstErr == nil || (compact.IsHaltError(o.err) && !compact.IsHaltError(firstErr)) {
+			firstErr = o.err
+		}
+	}
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	if deferred == len(outcomes) {
+		// Nothing ran at all: every plan sits parked. Tell the control loop so
+		// it does not rerun the group into the same deferrals forever.
+		return nil, compact.ErrPlanDeferred
+	}
+	return compIDs, nil
+}
+
+// planGroup returns the plan it was given plus any further plans for the same
+// group that share no source blocks with it and do not overlap it in time.
+//
+// Disjoint sources alone are not enough: the planner selects range parts
+// "potentially with gaps", so a later plan's blocks can bracket an earlier
+// plan's range, and the two compacted outputs would overlap. The overlap halt
+// guard the in-process compactor runs cannot catch this - each worker sees
+// only its own task's sources - so time disjointness is enforced here, where
+// every in-flight plan is known. A plan's output spans the envelope of its
+// sources, so envelopes are what must not intersect.
+func (e *RemotePlanExecutor) planGroup(ctx context.Context, cg *compact.Group, toCompact []*metadata.Meta) [][]*metadata.Meta {
+	plans := [][]*metadata.Meta{toCompact}
+	if e.planner == nil || e.maxInflightPerGroup <= 1 {
+		return plans
+	}
+
+	type span struct{ min, max int64 }
+	envelope := func(ms []*metadata.Meta) span {
+		s := span{min: ms[0].MinTime, max: ms[0].MaxTime}
+		for _, m := range ms[1:] {
+			s.min = min(s.min, m.MinTime)
+			s.max = max(s.max, m.MaxTime)
+		}
+		return s
+	}
+	taken := []span{envelope(toCompact)}
+
+	inflight := map[ulid.ULID]struct{}{}
+	for _, m := range toCompact {
+		inflight[m.ULID] = struct{}{}
+	}
+
+	for len(plans) < e.maxInflightPerGroup {
+		errChan := make(chan error, 1)
+		next, _, err := cg.PlanExcluding(ctx, e.planner, inflight, errChan)
+		if err != nil {
+			// The plan we already have is good, so a failure to find more work is
+			// not worth failing the group over; it will be looked for again on the
+			// next pass.
+			level.Warn(e.logger).Log("msg", "could not plan further work for the group", "group", cg.Key(), "err", err)
+			break
+		}
+		if len(next) == 0 {
+			break
+		}
+		ns := envelope(next)
+		overlaps := false
+		for _, t := range taken {
+			if ns.min < t.max && t.min < ns.max {
+				overlaps = true
+				break
+			}
+		}
+		if overlaps {
+			// This plan runs on the next pass, once the work it brackets is done.
+			level.Info(e.logger).Log("msg", "further plan overlaps in-flight work; deferring it to the next pass",
+				"group", cg.Key(), "span_min", ns.min, "span_max", ns.max)
+			break
+		}
+		taken = append(taken, ns)
+		for _, m := range next {
+			inflight[m.ULID] = struct{}{}
+		}
+		plans = append(plans, next)
+	}
+
+	if len(plans) > 1 {
+		level.Info(e.logger).Log("msg", "dispatching several plans for one group",
+			"group", cg.Key(), "plans", len(plans))
+	}
+	return plans
+}
+
+// runPlan hands one plan to a worker and waits for it to finish.
+func (e *RemotePlanExecutor) runPlan(ctx context.Context, cg *compact.Group, toCompact []*metadata.Meta, overlappingBlocks bool) ([]ulid.ULID, error) {
 	task, err := CompactionTask(cg, toCompact, overlappingBlocks)
 	if err != nil {
 		return nil, err
