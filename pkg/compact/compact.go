@@ -596,6 +596,41 @@ func (cg *Group) Resolution() int64 {
 	return cg.resolution
 }
 
+// AcceptMalformedIndex returns whether blocks with a malformed index are
+// tolerated in this group.
+func (cg *Group) AcceptMalformedIndex() bool {
+	return cg.acceptMalformedIndex
+}
+
+// EnableVerticalCompaction returns whether overlapping blocks may be compacted
+// vertically in this group.
+func (cg *Group) EnableVerticalCompaction() bool {
+	return cg.enableVerticalCompaction
+}
+
+// HashFunc returns the hash function used for the files of this group's blocks.
+func (cg *Group) HashFunc() metadata.HashFunc {
+	return cg.hashFunc
+}
+
+// BlockFilesConcurrency returns how many files of a single block are fetched or
+// uploaded concurrently.
+func (cg *Group) BlockFilesConcurrency() int {
+	return cg.blockFilesConcurrency
+}
+
+// CompactBlocksFetchConcurrency returns how many blocks of a plan are downloaded
+// concurrently.
+func (cg *Group) CompactBlocksFetchConcurrency() int {
+	return cg.compactBlocksFetchConcurrency
+}
+
+// BlocksMarkedForDeletion returns the counter tracking blocks this group marked
+// for deletion.
+func (cg *Group) BlocksMarkedForDeletion() prometheus.Counter {
+	return cg.blocksMarkedForDeletion
+}
+
 func (cg *Group) Extensions() any {
 	return cg.extensions
 }
@@ -989,6 +1024,11 @@ func NewIssue347Error(err error, brokenBlock ulid.ULID) error {
 	return issue347Error(err, brokenBlock)
 }
 
+// Block returns the ID of the block that caused the error.
+func (e Issue347Error) Block() ulid.ULID {
+	return e.id
+}
+
 func (e Issue347Error) Error() string {
 	return e.err.Error()
 }
@@ -1003,6 +1043,11 @@ func IsIssue347Error(err error) bool {
 type OutOfOrderChunksError struct {
 	err error
 	id  ulid.ULID
+}
+
+// Block returns the ID of the block that caused the error.
+func (e OutOfOrderChunksError) Block() ulid.ULID {
+	return e.id
 }
 
 func (e OutOfOrderChunksError) Error() string {
@@ -1232,6 +1277,13 @@ func (cg *Group) planLocked(ctx context.Context, planner Planner, errChan chan e
 
 	return toCompact, overlappingBlocks, nil
 }
+
+// ErrPlanDeferred is returned by a PlanExecutor that deliberately did not
+// execute the plan it was given - for example because the plan's source blocks
+// belong to an abandoned task awaiting operator attention. It tells the control
+// loop not to rerun the group this pass, where an ordinary empty result would
+// mean "done, look for more work" and spin on the same deferred plan forever.
+var ErrPlanDeferred = errors.New("compaction plan deferred")
 
 // PlanExecutor executes a compaction plan produced for a group: it downloads the
 // planned source blocks, compacts them and uploads the resulting block(s) into
@@ -1480,11 +1532,33 @@ func (cg *Group) compact(ctx context.Context, dir string, planner Planner, execu
 
 	compIDs, err := executor.Execute(ctx, dir, cg, toCompact, overlappingBlocks)
 	if err != nil {
+		if errors.Is(err, ErrPlanDeferred) {
+			// The executor chose to sit this plan out. No rerun: replanning
+			// would produce the same plan and defer it again, forever.
+			return false, nil, nil
+		}
 		return false, nil, err
 	}
 
 	// Even if no blocks were produced, because all sources were empty, there may be more work to do.
 	return true, compIDs, nil
+}
+
+// RecordCompaction increments the group's compaction counters. The in-process
+// executor increments them directly; an executor outside this package - one
+// that verified a worker's result, say - records through this, so the group's
+// metrics tell the same story in every mode.
+func (cg *Group) RecordCompaction(overlappingBlocks bool) {
+	cg.compactions.Inc()
+	if overlappingBlocks {
+		cg.verticalCompactions.Inc()
+	}
+}
+
+// RecordSourceGarbageCollected increments the group's counter of source blocks
+// retired after a compaction, for executors outside this package.
+func (cg *Group) RecordSourceGarbageCollected() {
+	cg.groupGarbageCollectedBlocks.Inc()
 }
 
 func (cg *Group) deleteBlock(id ulid.ULID, bdir string, blockDeletableChecker BlockDeletableChecker) error {
