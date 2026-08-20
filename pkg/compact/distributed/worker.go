@@ -280,7 +280,7 @@ func (w *Worker) execute(ctx context.Context, task Task, acknowledged *atomic.Bo
 		Generation: task.Generation,
 	}
 
-	if task.Type != TaskCompaction {
+	if task.Type != TaskCompaction && task.Type != TaskDownsample {
 		res.Outcome = OutcomeFailedRetryable
 		res.ErrorMessage = "unsupported task type " + string(task.Type)
 		return res
@@ -341,6 +341,14 @@ func (w *Worker) execute(ctx context.Context, task Task, acknowledged *atomic.Bo
 			aborted = OutcomeAbortedStoreUnreachable
 			return errors.Wrap(err, "could not reach the journal to confirm ownership")
 		}
+	}
+
+	if task.Type == TaskDownsample {
+		outIDs, err := w.executeDownsample(ctx, task, dir, ownershipGate)
+		if err != nil {
+			return w.triageExecutionError(ctx, res, err, aborted, acknowledged)
+		}
+		return w.completeResult(ctx, res, outIDs)
 	}
 
 	executor := compact.LocalPlanExecutor{

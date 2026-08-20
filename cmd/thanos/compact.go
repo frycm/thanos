@@ -19,6 +19,7 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/oklog/run"
+	"github.com/oklog/ulid/v2"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
@@ -527,18 +528,7 @@ func runCompact(
 				downsampleMetrics.downsampleFailures.WithLabelValues(resolutionLabel)
 			}
 
-			if err := downsampleBucket(
-				ctx,
-				logger,
-				downsampleMetrics,
-				insBkt,
-				filteredMetas,
-				downsamplingDir,
-				conf.downsampleConcurrency,
-				conf.blockFilesConcurrency,
-				metadata.HashFunc(conf.hashFunc),
-				conf.acceptMalformedIndex,
-			); err != nil {
+			if err := runDownsampling(ctx, logger, scheduler, downsampleMetrics, insBkt, filteredMetas, downsamplingDir, conf); err != nil {
 				return errors.Wrap(err, "first pass of downsampling failed")
 			}
 
@@ -555,18 +545,7 @@ func runCompact(
 				delete(filteredMetas, ul)
 			}
 
-			if err := downsampleBucket(
-				ctx,
-				logger,
-				downsampleMetrics,
-				insBkt,
-				filteredMetas,
-				downsamplingDir,
-				conf.downsampleConcurrency,
-				conf.blockFilesConcurrency,
-				metadata.HashFunc(conf.hashFunc),
-				conf.acceptMalformedIndex,
-			); err != nil {
+			if err := runDownsampling(ctx, logger, scheduler, downsampleMetrics, insBkt, filteredMetas, downsamplingDir, conf); err != nil {
 				return errors.Wrap(err, "second pass of downsampling failed")
 			}
 
@@ -1009,4 +988,46 @@ func dedupFuncFor(conf compactConfig, dedupReplicaLabels []string) (storage.Vert
 	default:
 		return nil, errors.Errorf("unsupported deduplication func, got %s", conf.dedupFunc)
 	}
+}
+
+// runDownsampling downsamples the given blocks. In manager mode the work is
+// handed to workers; otherwise it happens in this process as it always has.
+func runDownsampling(
+	ctx context.Context,
+	logger log.Logger,
+	scheduler *distributed.Scheduler,
+	downsampleMetrics *DownsampleMetrics,
+	insBkt objstore.InstrumentedBucket,
+	metas map[ulid.ULID]*metadata.Meta,
+	downsamplingDir string,
+	conf compactConfig,
+) error {
+	if scheduler != nil {
+		return distributed.DispatchDownsampling(
+			ctx,
+			logger,
+			insBkt,
+			scheduler,
+			metas,
+			conf.downsampleConcurrency,
+			metadata.HashFunc(conf.hashFunc),
+			conf.blockFilesConcurrency,
+			conf.acceptMalformedIndex,
+			strutil.ParseFlagLabels(conf.dedupReplicaLabels),
+			downsampleMetrics.downsamples,
+			downsampleMetrics.downsampleFailures,
+		)
+	}
+	return downsampleBucket(
+		ctx,
+		logger,
+		downsampleMetrics,
+		insBkt,
+		metas,
+		downsamplingDir,
+		conf.downsampleConcurrency,
+		conf.blockFilesConcurrency,
+		metadata.HashFunc(conf.hashFunc),
+		conf.acceptMalformedIndex,
+	)
 }

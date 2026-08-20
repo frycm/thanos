@@ -14,11 +14,13 @@ import (
 	"github.com/go-kit/log"
 	"github.com/oklog/ulid/v2"
 	"github.com/prometheus/client_golang/prometheus"
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 
 	"github.com/thanos-io/thanos/pkg/compact"
+	"github.com/thanos-io/thanos/pkg/compact/downsample"
 )
 
 // This file holds regression tests for the findings of the multi-agent review
@@ -286,6 +288,48 @@ func TestPlanGroupKeepsConcurrentPlansTimeDisjoint(t *testing.T) {
 	testutil.Equals(t, 1, len(plans))
 }
 
+// TestDispatchDownsamplingRecordsFailures pins down that a failed downsample
+// task increments the same per-resolution failure counter the in-process
+// downsampler feeds - previously manager mode exported the pre-seeded series
+// frozen at zero, so failure alerts could never fire.
+func TestDispatchDownsamplingRecordsFailures(t *testing.T) {
+	bkt := objstore.NewInMemBucket()
+	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
+		JournalID:   "shard-ds",
+		MaxAttempts: 1,
+	})
+	testutil.Ok(t, err)
+
+	// A stand-in worker that fails everything it leases.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		for ctx.Err() == nil {
+			task, err := sched.Lease(ctx, LeaseRequest{WorkerID: "w1"})
+			if err == nil && task != nil {
+				_ = sched.Report(ctx, Result{
+					TaskID: task.ID, LeaseToken: task.LeaseToken, Generation: task.Generation,
+					Outcome: OutcomeFailedRetryable, ErrorMessage: "injected failure",
+				})
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	// A raw block old and large enough that downsample.Plan selects it.
+	m := &metadata.Meta{}
+	m.ULID = ulid.MustNew(1, nil)
+	m.MinTime, m.MaxTime = 0, downsample.ResLevel1DownsampleRange
+	m.Compaction.Sources = []ulid.ULID{m.ULID}
+	m.Thanos.Labels = map[string]string{"ext": "1"}
+
+	failures := prometheus.NewCounterVec(prometheus.CounterOpts{Name: "test_ds_failures"}, []string{"resolution"})
+	err = DispatchDownsampling(context.Background(), log.NewNopLogger(), bkt, sched,
+		map[ulid.ULID]*metadata.Meta{m.ULID: m}, 1, metadata.NoneFunc, 1, false, nil, nil, failures)
+	testutil.NotOk(t, err)
+	testutil.Equals(t, 1.0, promtestutil.ToFloat64(failures.WithLabelValues(m.Thanos.ResolutionString())))
+}
+
 // TestWorkerSeenIsPruned pins down that the worker liveness map forgets workers
 // gone for many lease TTLs, instead of growing forever under pod churn.
 func TestWorkerSeenIsPruned(t *testing.T) {
@@ -364,4 +408,41 @@ func TestOversizedLimitsIgnoreUnknownSizes(t *testing.T) {
 	task := Task{ID: "t", Type: TaskCompaction, SourceBlocks: []string{"a"}}
 	conf := ManagerConfig{MaxTaskSeries: 1, MaxTaskIndexBytes: 1}
 	testutil.Equals(t, "", oversizedReason(task, conf))
+}
+
+// TestDispatchDownsamplingRefusesOversizedBlocks pins down that the size gate
+// also covers downsample tasks. The blocks downsampling picks up include ones
+// marked no-compact for exceeding the index size limit - the biggest blocks in
+// the bucket - so assuming any worker can hold them is exactly wrong.
+func TestDispatchDownsamplingRefusesOversizedBlocks(t *testing.T) {
+	bkt := objstore.NewInMemBucket()
+	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
+		JournalID:         "shard-ds-big",
+		MaxTaskIndexBytes: 1024,
+	})
+	testutil.Ok(t, err)
+
+	m := &metadata.Meta{}
+	m.ULID = ulid.MustNew(1, nil)
+	m.MinTime, m.MaxTime = 0, downsample.ResLevel1DownsampleRange
+	m.Compaction.Sources = []ulid.ULID{m.ULID}
+	m.Thanos.Labels = map[string]string{"ext": "1"}
+	m.Thanos.Files = []metadata.File{{RelPath: "index", SizeBytes: 4096}}
+
+	// No worker exists; if the gate failed, Dispatch would hang on Submit's
+	// result channel, so returning at all proves the refusal.
+	testutil.Ok(t, DispatchDownsampling(context.Background(), log.NewNopLogger(), bkt, sched,
+		map[ulid.ULID]*metadata.Meta{m.ULID: m}, 1, metadata.NoneFunc, 1, false, nil, nil, nil))
+
+	j, err := ReadJournal(context.Background(), bkt, "shard-ds-big")
+	testutil.Ok(t, err)
+	found := false
+	for _, e := range j.Tasks {
+		if e.State == StateOversized {
+			found = true
+			testutil.Equals(t, TaskDownsample, e.Task.Type)
+			testutil.Equals(t, int64(4096), e.Task.ExpectedIndexBytes)
+		}
+	}
+	testutil.Assert(t, found, "the refusal must be recorded in the journal")
 }

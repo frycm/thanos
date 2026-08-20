@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-kit/log"
@@ -27,10 +28,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/thanos-io/objstore"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/compact"
+	"github.com/thanos-io/thanos/pkg/compact/downsample"
 )
 
 // ManagerConfig configures the scheduling side of a distributed compactor.
@@ -1510,4 +1513,157 @@ func GroupSpecOf(cg *compact.Group) (GroupSpec, error) {
 		spec.Extensions = raw
 	}
 	return spec, nil
+}
+
+// DispatchDownsampling hands every block that needs downsampling to a worker and
+// waits for all of them to finish.
+//
+// It replaces downsampling in the manager process. Retention, garbage collection
+// and every other mutation of the bucket stay with the manager; the only thing
+// a worker does is produce the downsampled block.
+func DispatchDownsampling(
+	ctx context.Context,
+	logger log.Logger,
+	bkt objstore.Bucket,
+	sched *Scheduler,
+	metas map[ulid.ULID]*metadata.Meta,
+	concurrency int,
+	hashFunc metadata.HashFunc,
+	blockFilesConcurrency int,
+	acceptMalformedIndex bool,
+	dedupReplicaLabels []string,
+	downsamples *prometheus.CounterVec,
+	downsampleFailures *prometheus.CounterVec,
+) error {
+	candidates, err := downsample.Plan(metas)
+	if err != nil {
+		return err
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+
+	level.Info(logger).Log("msg", "dispatching downsampling to workers", "blocks", len(candidates))
+
+	// The counters are the same per-resolution series the in-process
+	// downsampler feeds, so alerts on downsample failures keep firing when a
+	// deployment flips to manager mode. Nil vectors keep this callable from
+	// tests without metrics.
+	inc := func(vec *prometheus.CounterVec, resolution string) {
+		if vec != nil {
+			vec.WithLabelValues(resolution).Inc()
+		}
+	}
+
+	var g errgroup.Group
+	g.SetLimit(concurrency)
+	var failed atomic.Bool
+
+	for _, c := range candidates {
+		if sched.SourcesParked([]string{c.Meta.ULID.String()}) {
+			level.Warn(logger).Log("msg", "not re-dispatching the source block of a parked (abandoned or oversized) downsample task; investigate the journal entry",
+				"block", c.Meta.ULID)
+			continue
+		}
+		task := DownsampleTask(c.Meta, c.TargetResolution, hashFunc, blockFilesConcurrency, acceptMalformedIndex, dedupReplicaLabels)
+		if reason := oversizedReason(task, sched.conf); reason != "" {
+			// Blocks marked no-compact for index size are exactly the ones
+			// downsampling must not assume a worker can hold.
+			level.Error(logger).Log("msg", "refusing to dispatch an oversized downsample task", "block", c.Meta.ULID, "reason", reason)
+			sched.MarkOversized(task, reason)
+			continue
+		}
+		g.Go(func() error {
+			// Fail fast: once anything failed, no further tasks are submitted.
+			// What is already in flight is still awaited, so no task is left
+			// behind in the scheduler without a submitter.
+			if failed.Load() {
+				return nil
+			}
+			resolution := c.Meta.Thanos.ResolutionString()
+
+			resultCh, err := sched.Submit(ctx, task)
+			if err != nil {
+				failed.Store(true)
+				return errors.Wrap(err, "submit downsample task")
+			}
+
+			var res Result
+			select {
+			case <-ctx.Done():
+				failed.Store(true)
+				return ctx.Err()
+			case res = <-resultCh:
+			}
+
+			// Aborted outcomes never reach the submitter: the scheduler requeues
+			// them, and past the abort cap it fails the task.
+			if err := ReconstructError(res); err != nil {
+				failed.Store(true)
+				inc(downsampleFailures, resolution)
+				return errors.Wrapf(err, "downsample block %s", c.Meta.ULID)
+			}
+
+			// Confirm the downsampled block really is in the bucket, and really
+			// is this block's downsample: same labels, same sources, the target
+			// resolution. Downsampling deletes nothing, so a wrong block cannot
+			// lose data the way it could for compaction, but accepting it would
+			// leave this block silently never downsampled.
+			for _, raw := range res.OutputBlocks {
+				outMeta, err := fetchVerifiedMeta(ctx, bkt, raw, res.OutputChecksums)
+				if err != nil {
+					failed.Store(true)
+					inc(downsampleFailures, resolution)
+					return compact.NewRetryError(errors.Wrapf(err, "downsample of %s", c.Meta.ULID))
+				}
+				if err := verifyDownsampledBlock(outMeta, c, Provenance{
+					TaskID: res.TaskID, TaskType: TaskDownsample, JournalID: sched.conf.JournalID, Generation: res.Generation,
+					Sources: []string{c.Meta.ULID.String()},
+				}); err != nil {
+					failed.Store(true)
+					inc(downsampleFailures, resolution)
+					return compact.NewRetryError(errors.Wrapf(err, "downsampled block %s reported for %s", outMeta.ULID, c.Meta.ULID))
+				}
+			}
+
+			inc(downsamples, resolution)
+			return nil
+		})
+	}
+	return g.Wait()
+}
+
+// verifyDownsampledBlock checks that a block a worker reported is the
+// downsample of the given candidate, produced by the task being reported.
+func verifyDownsampledBlock(outMeta *metadata.Meta, c downsample.Candidate, want Provenance) error {
+	if err := verifyProvenance(outMeta, want); err != nil {
+		return err
+	}
+	if outMeta.Thanos.Downsample.Resolution != c.TargetResolution {
+		return errors.Errorf("has resolution %d, expected %d", outMeta.Thanos.Downsample.Resolution, c.TargetResolution)
+	}
+	if !labels.Equal(labels.FromMap(outMeta.Thanos.Labels), labels.FromMap(c.Meta.Thanos.Labels)) {
+		return errors.Errorf("carries labels %v, the source has %v", outMeta.Thanos.Labels, c.Meta.Thanos.Labels)
+	}
+	if outMeta.MinTime != c.Meta.MinTime || outMeta.MaxTime != c.Meta.MaxTime {
+		return errors.Errorf("spans [%d, %d], the source spans [%d, %d]",
+			outMeta.MinTime, outMeta.MaxTime, c.Meta.MinTime, c.Meta.MaxTime)
+	}
+	expected := map[ulid.ULID]struct{}{}
+	for _, s := range c.Meta.Compaction.Sources {
+		expected[s] = struct{}{}
+	}
+	if len(outMeta.Compaction.Sources) != len(expected) {
+		return errors.Errorf("was built from %d sources, the source block has %d",
+			len(outMeta.Compaction.Sources), len(expected))
+	}
+	for _, s := range outMeta.Compaction.Sources {
+		if _, ok := expected[s]; !ok {
+			return errors.Errorf("was built from %s, which is not a source of the block being downsampled", s)
+		}
+	}
+	return nil
 }
