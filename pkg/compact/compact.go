@@ -597,6 +597,41 @@ func (cg *Group) Resolution() int64 {
 	return cg.resolution
 }
 
+// AcceptMalformedIndex returns whether blocks with a malformed index are
+// tolerated in this group.
+func (cg *Group) AcceptMalformedIndex() bool {
+	return cg.acceptMalformedIndex
+}
+
+// EnableVerticalCompaction returns whether overlapping blocks may be compacted
+// vertically in this group.
+func (cg *Group) EnableVerticalCompaction() bool {
+	return cg.enableVerticalCompaction
+}
+
+// HashFunc returns the hash function used for the files of this group's blocks.
+func (cg *Group) HashFunc() metadata.HashFunc {
+	return cg.hashFunc
+}
+
+// BlockFilesConcurrency returns how many files of a single block are fetched or
+// uploaded concurrently.
+func (cg *Group) BlockFilesConcurrency() int {
+	return cg.blockFilesConcurrency
+}
+
+// CompactBlocksFetchConcurrency returns how many blocks of a plan are downloaded
+// concurrently.
+func (cg *Group) CompactBlocksFetchConcurrency() int {
+	return cg.compactBlocksFetchConcurrency
+}
+
+// BlocksMarkedForDeletion returns the counter tracking blocks this group marked
+// for deletion.
+func (cg *Group) BlocksMarkedForDeletion() prometheus.Counter {
+	return cg.blocksMarkedForDeletion
+}
+
 func (cg *Group) Extensions() any {
 	return cg.extensions
 }
@@ -990,6 +1025,11 @@ func NewIssue347Error(err error, brokenBlock ulid.ULID) error {
 	return issue347Error(err, brokenBlock)
 }
 
+// Block returns the ID of the block that caused the error.
+func (e Issue347Error) Block() ulid.ULID {
+	return e.id
+}
+
 func (e Issue347Error) Error() string {
 	return e.err.Error()
 }
@@ -1004,6 +1044,11 @@ func IsIssue347Error(err error) bool {
 type OutOfOrderChunksError struct {
 	err error
 	id  ulid.ULID
+}
+
+// Block returns the ID of the block that caused the error.
+func (e OutOfOrderChunksError) Block() ulid.ULID {
+	return e.id
 }
 
 func (e OutOfOrderChunksError) Error() string {
