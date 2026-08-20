@@ -260,7 +260,7 @@ func (w *Worker) execute(ctx context.Context, task Task, acknowledged *atomicBoo
 		Generation: task.Generation,
 	}
 
-	if task.Type != TaskCompaction {
+	if task.Type != TaskCompaction && task.Type != TaskDownsample {
 		res.Outcome = OutcomeFailedRetryable
 		res.ErrorMessage = "unsupported task type " + string(task.Type)
 		return res
@@ -286,6 +286,50 @@ func (w *Worker) execute(ctx context.Context, task Task, acknowledged *atomicBoo
 	// The ownership check runs as late as possible, right before each result
 	// block becomes visible, and fails closed.
 	var aborted Outcome
+	ownershipGate := func(ctx context.Context) error {
+		if !acknowledged.get() {
+			w.m.ownershipCheckFailures.WithLabelValues("lease_not_acknowledged").Inc()
+			aborted = OutcomeAbortedOwnershipLost
+			return errors.New("the manager no longer acknowledges our lease")
+		}
+
+		status, err := CheckOwnership(ctx, w.bkt, w.conf.JournalID, task.ID, task.LeaseToken, task.Generation)
+		switch status {
+		case OwnershipConfirmed:
+			return nil
+		case OwnershipLost:
+			w.m.ownershipCheckFailures.WithLabelValues("lost").Inc()
+			aborted = OutcomeAbortedOwnershipLost
+			return errors.Wrap(err, "we no longer own this task")
+		default:
+			// The journal could not be read, so whether we still own the task is
+			// unknown. Discard the work rather than risk uploading a block a
+			// second worker is also uploading, and say so distinctly, because
+			// this is a storage problem and not a lost race.
+			w.m.ownershipCheckFailures.WithLabelValues("store_unreachable").Inc()
+			aborted = OutcomeAbortedStoreUnreachable
+			return errors.Wrap(err, "could not reach the journal to confirm ownership")
+		}
+	}
+
+	if task.Type == TaskDownsample {
+		outIDs, err := w.executeDownsample(ctx, task, dir, ownershipGate)
+		if err != nil {
+			return w.triageExecutionError(ctx, res, err, aborted, acknowledged)
+		}
+		res.Outcome = OutcomeCompleted
+		res.OutputChecksums = map[string]string{}
+		for _, id := range outIDs {
+			res.OutputBlocks = append(res.OutputBlocks, id.String())
+			if sum, err := metaChecksum(ctx, w.bkt, id); err == nil {
+				res.OutputChecksums[id.String()] = sum
+			} else if ctx.Err() != nil {
+				return w.triageExecutionError(ctx, res, err, "", acknowledged)
+			}
+		}
+		return res
+	}
+
 	executor := compact.LocalPlanExecutor{
 		Comp:                  w.comp,
 		BlockDeletableChecker: compact.DefaultBlockDeletableChecker{},
@@ -296,30 +340,7 @@ func (w *Worker) execute(ctx context.Context, task Task, acknowledged *atomicBoo
 			if err := w.stampOutputs(task, dir, compIDs); err != nil {
 				return err
 			}
-
-			if !acknowledged.get() {
-				w.m.ownershipCheckFailures.WithLabelValues("lease_not_acknowledged").Inc()
-				aborted = OutcomeAbortedOwnershipLost
-				return errors.New("the manager no longer acknowledges our lease")
-			}
-
-			status, err := CheckOwnership(ctx, w.bkt, w.conf.JournalID, task.ID, task.LeaseToken, task.Generation)
-			switch status {
-			case OwnershipConfirmed:
-				return nil
-			case OwnershipLost:
-				w.m.ownershipCheckFailures.WithLabelValues("lost").Inc()
-				aborted = OutcomeAbortedOwnershipLost
-				return errors.Wrap(err, "we no longer own this task")
-			default:
-				// The journal could not be read, so whether we still own the task is
-				// unknown. Discard the work rather than risk uploading a block a
-				// second worker is also uploading, and say so distinctly, because
-				// this is a storage problem and not a lost race.
-				w.m.ownershipCheckFailures.WithLabelValues("store_unreachable").Inc()
-				aborted = OutcomeAbortedStoreUnreachable
-				return errors.Wrap(err, "could not reach the journal to confirm ownership")
-			}
+			return ownershipGate(ctx)
 		},
 	}
 
