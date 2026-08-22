@@ -11,12 +11,130 @@ import (
 
 	"github.com/efficientgo/core/testutil"
 	"github.com/go-kit/log"
+	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/thanos-io/objstore"
 )
 
 // This file holds regression tests for the findings of the second review of
 // the manager/worker split, the one on data safety and races.
+
+// failNextJournalWrite makes the next journal upload fail once the given
+// condition holds, polling the scheduler's state - which is free while the
+// write is in flight - and returns after that write went through the hook.
+func failNextJournalWrite(bkt *hookBucket, ready func() bool) {
+	bkt.mtx.Lock()
+	defer bkt.mtx.Unlock()
+	bkt.onUpload = func(_ context.Context, name string) error {
+		if !strings.HasPrefix(name, JournalPrefix) {
+			return nil
+		}
+		bkt.mtx.Lock()
+		bkt.onUpload = nil
+		bkt.mtx.Unlock()
+		deadline := time.Now().Add(5 * time.Second)
+		for !ready() && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		return errors.New("injected journal write failure")
+	}
+}
+
+// TestSubmitFailureRemovesOnlyItsTask pins down that a Submit whose journal
+// write fails withdraws its own task and nothing else. The state lock is
+// released during the write, so another task can be queued behind it in the
+// meantime; the old code popped the last queue entry, which was then the
+// other task - left in the scheduler's maps but never leased, forever.
+func TestSubmitFailureRemovesOnlyItsTask(t *testing.T) {
+	bkt := &hookBucket{Bucket: objstore.NewInMemBucket()}
+	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
+		JournalID: "shard-submit", JournalUnavailableTimeout: time.Hour,
+	})
+	testutil.Ok(t, err)
+
+	queued := func(id string) bool {
+		sched.mtx.Lock()
+		defer sched.mtx.Unlock()
+		_, ok := sched.tasks[id]
+		return ok
+	}
+	failNextJournalWrite(bkt, func() bool { return queued("t-behind") })
+
+	behind := make(chan error, 1)
+	go func() {
+		// Queued behind t-front while t-front's write is in flight; its own
+		// write waits for that one and then succeeds.
+		for !queued("t-front") {
+			time.Sleep(time.Millisecond)
+		}
+		_, err := sched.Submit(context.Background(), Task{ID: "t-behind", Type: TaskCompaction})
+		behind <- err
+	}()
+
+	_, err = sched.Submit(context.Background(), Task{ID: "t-front", Type: TaskCompaction})
+	testutil.NotOk(t, err)
+	testutil.Ok(t, <-behind)
+
+	// t-front is gone, t-behind is what a worker gets.
+	testutil.Equals(t, false, queued("t-front"))
+	task, err := sched.Lease(context.Background(), LeaseRequest{WorkerID: "w1"})
+	testutil.Ok(t, err)
+	testutil.Assert(t, task != nil, "t-behind must be leasable")
+	testutil.Equals(t, "t-behind", task.ID)
+}
+
+// TestSubmitSurvivesLeaseDuringJournalWrite pins down that a task leased while
+// its Submit's journal write was in flight is not withdrawn when that write
+// fails: a worker is executing it, and every write from here on carries it.
+// The old code assumed the task was still its own and dereferenced a map
+// entry the lease had moved on - a nil pointer panic in the manager.
+func TestSubmitSurvivesLeaseDuringJournalWrite(t *testing.T) {
+	bkt := &hookBucket{Bucket: objstore.NewInMemBucket()}
+	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
+		JournalID: "shard-submit-lease", JournalUnavailableTimeout: time.Hour,
+	})
+	testutil.Ok(t, err)
+
+	state := func(id string) TaskState {
+		sched.mtx.Lock()
+		defer sched.mtx.Unlock()
+		if p, ok := sched.tasks[id]; ok {
+			return p.entry.State
+		}
+		return ""
+	}
+	failNextJournalWrite(bkt, func() bool { return state("t1") == StateLeased })
+
+	leased := make(chan *Task, 1)
+	go func() {
+		for state("t1") != StatePending {
+			time.Sleep(time.Millisecond)
+		}
+		task, err := sched.Lease(context.Background(), LeaseRequest{WorkerID: "w1"})
+		if err != nil || task == nil {
+			leased <- nil
+			return
+		}
+		leased <- task
+	}()
+
+	resultCh, err := sched.Submit(context.Background(), Task{ID: "t1", Type: TaskCompaction})
+	testutil.Ok(t, err)
+	task := <-leased
+	testutil.Assert(t, task != nil, "the worker must have leased the task")
+
+	// The worker's report reaches the submitter.
+	testutil.Ok(t, sched.Report(context.Background(), Result{
+		TaskID: task.ID, LeaseToken: task.LeaseToken, Generation: task.Generation,
+		Outcome: OutcomeFailedHalt, ErrorMessage: "as planned",
+	}))
+	select {
+	case res := <-resultCh:
+		testutil.Equals(t, OutcomeFailedHalt, res.Outcome)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the submitter never received the result")
+	}
+}
 
 // TestReadJournalRejectsForeignBody pins down that a journal whose body names
 // another shard is not read as this shard's. A journal copied under another
@@ -177,4 +295,39 @@ func TestMaintainPrunesAndUnparks(t *testing.T) {
 		testutil.Ok(t, err)
 		testutil.Equals(t, false, exists, "marker for %s must be removed", id)
 	}
+}
+
+// TestMaintainKeepsUnparkMarkerUntilPersisted pins down that an unpark marker
+// outlives a failed journal write: the entry is only gone once the bucket says
+// so, otherwise a restart would read it back and park the set again.
+func TestMaintainKeepsUnparkMarkerUntilPersisted(t *testing.T) {
+	bkt := &hookBucket{Bucket: objstore.NewInMemBucket()}
+	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
+		JournalID: "shard-a", JournalRetention: time.Hour, LeaseTTL: time.Hour, JournalUnavailableTimeout: time.Hour,
+	})
+	testutil.Ok(t, err)
+
+	sources := []string{"01ARZ3NDEKTSV4RRFFQ69G5FAV"}
+	sched.MarkOversized(Task{ID: "t-big", Type: TaskCompaction, SourceBlocks: sources}, "too big")
+	testutil.Ok(t, bkt.Upload(context.Background(), UnparkPath("shard-a", "t-big"), strings.NewReader("")))
+
+	failNextJournalWrite(bkt, func() bool { return true })
+	testutil.NotOk(t, sched.Maintain())
+	exists, err := bkt.Exists(context.Background(), UnparkPath("shard-a", "t-big"))
+	testutil.Ok(t, err)
+	testutil.Equals(t, true, exists, "the marker must stay until the journal without the entry is in the bucket")
+
+	// A manager restarted now still sees the entry, and the marker.
+	j, err := ReadJournal(context.Background(), bkt, "shard-a")
+	testutil.Ok(t, err)
+	testutil.Equals(t, StateOversized, j.Tasks["t-big"].State)
+
+	testutil.Ok(t, sched.Maintain())
+	exists, err = bkt.Exists(context.Background(), UnparkPath("shard-a", "t-big"))
+	testutil.Ok(t, err)
+	testutil.Equals(t, false, exists)
+	j, err = ReadJournal(context.Background(), bkt, "shard-a")
+	testutil.Ok(t, err)
+	_, ok := j.Tasks["t-big"]
+	testutil.Equals(t, false, ok)
 }

@@ -5,6 +5,7 @@ package distributed
 
 import (
 	"context"
+	"path"
 	"strings"
 	"sync"
 	"testing"
@@ -13,6 +14,7 @@ import (
 	"github.com/efficientgo/core/testutil"
 	"github.com/go-kit/log"
 	"github.com/oklog/ulid/v2"
+	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/prometheus/model/labels"
@@ -25,6 +27,126 @@ import (
 
 // This file holds regression tests for the findings of the multi-agent review
 // of the manager/worker split, one test per finding, named after it.
+
+// TestWorkerShutdownReportsAbortNotHalt pins down that a worker being asked to
+// shut down mid-task reports an abort, not a halt. The compaction seam wraps a
+// cancelled compaction in a halt error, and before the shutdown triage that
+// halt travelled to the manager and stopped the whole shard.
+func TestWorkerShutdownReportsAbortNotHalt(t *testing.T) {
+	c := newTestCluster(t)
+
+	w1 := c.startWorker("w1")
+	_ = gateChunks(w1) // Hold w1 mid-download so the shutdown arrives mid-task.
+
+	cg, toCompact := c.makeGroup(labels.FromStrings("ext", "1"))
+	outcome := c.execute(cg, toCompact)
+
+	c.waitFor("w1 to lease the task", func() bool {
+		e := c.journalTask(StateLeased)
+		return e != nil && e.Lease.WorkerID == "w1"
+	})
+
+	// Shut w1 down. Its report still goes out on a background context.
+	w1.cancel()
+	<-w1.done
+
+	c.waitFor("the shutdown abort to be reported and the task requeued", func() bool {
+		e := c.journalTask(StatePending)
+		return e != nil && e.LastError != nil && e.LastError.Outcome == OutcomeAbortedWorkerShutdown
+	})
+	testutil.Equals(t, 1.0, counterValue(t, w1.reg, "thanos_compact_worker_tasks_total", string(OutcomeAbortedWorkerShutdown)))
+
+	// The shard is not halted: another worker picks the task up and finishes.
+	c.startWorker("w2")
+	var got executeOutcome
+	select {
+	case got = <-outcome:
+	case <-time.After(30 * time.Second):
+		t.Fatal("compaction did not finish after the worker restart")
+	}
+	testutil.Ok(t, got.err)
+	testutil.Equals(t, 1, len(got.compIDs))
+}
+
+// TestWorkerChecksumReadBackFailureAbortsNotCompletes pins down that a worker
+// which cannot read back the checksum of a block it uploaded reports an abort,
+// never a checksum-less completion. The manager rejects a completion without
+// checksums, so the old behaviour threw away the whole finished task on one
+// read blip - and on the downsample path even crashed the manager.
+func TestWorkerChecksumReadBackFailureAbortsNotCompletes(t *testing.T) {
+	old := metaChecksumRetryBackoff
+	metaChecksumRetryBackoff = 10 * time.Millisecond
+	t.Cleanup(func() { metaChecksumRetryBackoff = old })
+
+	c := newTestCluster(t)
+	w1 := c.startWorker("w1")
+
+	cg, toCompact := c.makeGroup(labels.FromStrings("ext", "1"))
+	sources := map[string]bool{}
+	for _, m := range toCompact {
+		sources[m.ULID.String()] = true
+	}
+
+	// Fail reads of any meta.json that is neither a source block's nor the
+	// journal: that is exactly the read-back of the freshly uploaded result.
+	w1.bkt.setOnGet(func(_ context.Context, name string) error {
+		if !strings.HasSuffix(name, "meta.json") || strings.HasPrefix(name, JournalPrefix) {
+			return nil
+		}
+		if sources[strings.SplitN(name, "/", 2)[0]] {
+			return nil
+		}
+		return errors.New("injected: meta read-back unavailable")
+	})
+
+	outcome := c.execute(cg, toCompact)
+
+	c.waitFor("the checksum failure to surface as a store abort", func() bool {
+		return counterValue(t, w1.reg, "thanos_compact_worker_tasks_total", string(OutcomeAbortedStoreUnreachable)) >= 1
+	})
+	testutil.Equals(t, 0.0, counterValue(t, w1.reg, "thanos_compact_worker_tasks_total", string(OutcomeCompleted)))
+
+	// Once the store recovers, the requeued task completes for real.
+	w1.bkt.setOnGet(nil)
+	var got executeOutcome
+	select {
+	case got = <-outcome:
+	case <-time.After(30 * time.Second):
+		t.Fatal("compaction did not finish after the store recovered")
+	}
+	testutil.Ok(t, got.err)
+	testutil.Equals(t, 1, len(got.compIDs))
+}
+
+// TestSubmitJournalBlipIsRetryable pins down that a transient journal write
+// failure during Submit surfaces as a retryable error. A plain error would fall
+// through the compactor's wait loop and exit the whole manager process, whose
+// restart voids every in-flight lease.
+func TestSubmitJournalBlipIsRetryable(t *testing.T) {
+	bkt := &hookBucket{Bucket: objstore.NewInMemBucket()}
+	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
+		JournalID: "shard-blip",
+	})
+	testutil.Ok(t, err)
+
+	bkt.onUpload = func(_ context.Context, name string) error {
+		if strings.HasPrefix(name, JournalPrefix) {
+			return errors.New("injected: journal write failed")
+		}
+		return nil
+	}
+
+	_, err = sched.Submit(context.Background(), Task{ID: "t-blip", Type: TaskCompaction})
+	testutil.NotOk(t, err)
+	testutil.Assert(t, compact.IsRetryError(err), "a journal blip in Submit must be retryable, got: %v", err)
+	testutil.Assert(t, !compact.IsHaltError(err), "a journal blip in Submit must not halt")
+
+	// The submission was rolled back: once the journal recovers the same task
+	// can be submitted again.
+	bkt.onUpload = nil
+	_, err = sched.Submit(context.Background(), Task{ID: "t-blip", Type: TaskCompaction})
+	testutil.Ok(t, err)
+}
 
 // TestEffectiveHeartbeatInterval pins down that a worker paces its heartbeats
 // off the lease TTL the task carries when its own flag is too slow for it,
@@ -41,6 +163,67 @@ func TestEffectiveHeartbeatInterval(t *testing.T) {
 		got := effectiveHeartbeatInterval(tc.configured, tc.ttl)
 		testutil.Equals(t, tc.want, got)
 	}
+}
+
+// TestAbandonedSourcesAreNotReplanned pins down the whole abandonment story: a
+// task that loses its worker MaxAttempts times is abandoned with its own
+// last_error, delivered as OutcomeAbandoned, and - crucially - its source
+// blocks are not replanned into a fresh task with a fresh attempt budget, which
+// used to repeat the worker-killing cycle forever.
+func TestAbandonedSourcesAreNotReplanned(t *testing.T) {
+	c := newTestCluster(t)
+
+	cg, toCompact := c.makeGroup(labels.FromStrings("ext", "1"))
+	outcome := c.execute(cg, toCompact)
+
+	// Lose the worker MaxAttempts (3) times in a row, the hard way.
+	for range 3 {
+		w := c.startWorker("doomed")
+		_ = gateChunks(w)
+		c.waitFor("the doomed worker to lease the task", func() bool {
+			e := c.journalTask(StateLeased)
+			return e != nil
+		})
+		w.crash()
+		<-w.done
+		c.waitFor("the lease to expire", func() bool {
+			return c.journalTask(StateLeased) == nil
+		})
+	}
+
+	var got executeOutcome
+	select {
+	case got = <-outcome:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the abandoned task never reported back to its submitter")
+	}
+	// The submitter learns about it as a retryable failure so the manager's
+	// control loop survives, and the journal records the real story.
+	testutil.NotOk(t, got.err)
+	testutil.Assert(t, compact.IsRetryError(got.err), "abandonment must not halt or crash the manager, got: %v", got.err)
+
+	entry := c.journalTask(StateAbandoned)
+	testutil.Assert(t, entry != nil, "the journal must record the abandoned task")
+	testutil.Equals(t, 3, entry.Attempts)
+	testutil.Assert(t, entry.LastError != nil, "abandonment must record its own last_error")
+	testutil.Equals(t, OutcomeAbandoned, entry.LastError.Outcome)
+
+	// Replanning the same blocks defers instead of minting a fresh task.
+	redo := c.execute(cg, toCompact)
+	select {
+	case got = <-redo:
+	case <-time.After(15 * time.Second):
+		t.Fatal("replanning the abandoned blocks did not return")
+	}
+	testutil.Assert(t, errors.Is(got.err, compact.ErrPlanDeferred), "abandoned sources must be deferred, got: %v", got.err)
+
+	// And the control loop turns the deferral into "do not rerun the group".
+	stub := stubPlanner{plan: toCompact}
+	rerun, ids, err := cg.CompactWithExecutor(context.Background(), t.TempDir(),
+		stub, NewRemotePlanExecutor(c.logger, c.manager, c.sched, nil, 1, nil, nil))
+	testutil.Ok(t, err)
+	testutil.Equals(t, false, rerun)
+	testutil.Equals(t, 0, len(ids))
 }
 
 // stubPlanner always returns the same plan.
@@ -288,6 +471,63 @@ func TestPlanGroupKeepsConcurrentPlansTimeDisjoint(t *testing.T) {
 	testutil.Equals(t, 1, len(plans))
 }
 
+// vetoChecker refuses to let any block be deleted.
+type vetoChecker struct{}
+
+func (vetoChecker) CanDelete(_ *compact.Group, _ ulid.ULID) bool { return false }
+
+// TestRemoteFinalizeRespectsDeletableCheckerAndRecordsMetrics pins down that
+// manager-mode source retirement honours the BlockDeletableChecker extension
+// point - the in-process executor always did - and that the group's compaction
+// and garbage-collection counters move, instead of flatlining the moment a
+// deployment flips to manager mode.
+func TestRemoteFinalizeRespectsDeletableCheckerAndRecordsMetrics(t *testing.T) {
+	c := newTestCluster(t)
+	c.startWorker("w1")
+
+	run := func(ext labels.Labels, checker compact.BlockDeletableChecker) (*compact.Group, []*metadata.Meta, prometheus.Counter, prometheus.Counter) {
+		cg, toCompact := c.makeGroup(ext)
+		compactions := prometheus.NewCounter(prometheus.CounterOpts{Name: "test_compactions"})
+		gcBlocks := prometheus.NewCounter(prometheus.CounterOpts{Name: "test_gc"})
+		cnt := func() prometheus.Counter { return prometheus.NewCounter(prometheus.CounterOpts{Name: "test"}) }
+		// Rebuild the group with counters this test can read.
+		mcg, err := compact.NewGroup(c.logger, c.manager, cg.Key(), ext, 0, false, false,
+			compactions, cnt(), cnt(), cnt(), cnt(), gcBlocks, cnt(), cnt(), metadata.NoneFunc, 1, 1)
+		testutil.Ok(t, err)
+		for _, m := range toCompact {
+			testutil.Ok(t, mcg.AppendMeta(m))
+		}
+
+		e := NewRemotePlanExecutor(c.logger, c.manager, c.sched, nil, 1, nil, checker)
+		ids, err := e.Execute(context.Background(), "", mcg, toCompact, false)
+		testutil.Ok(t, err)
+		testutil.Equals(t, 1, len(ids))
+		return mcg, toCompact, compactions, gcBlocks
+	}
+
+	hasDeletionMark := func(id ulid.ULID) bool {
+		ok, err := c.shared.Exists(context.Background(), path.Join(id.String(), metadata.DeletionMarkFilename))
+		testutil.Ok(t, err)
+		return ok
+	}
+
+	// With the default checker the sources are retired and both counters move.
+	_, toCompact, compactions, gcBlocks := run(labels.FromStrings("ext", "allow"), nil)
+	for _, m := range toCompact {
+		testutil.Assert(t, hasDeletionMark(m.ULID), "source %s must be deletion-marked", m.ULID)
+	}
+	testutil.Equals(t, 1.0, promtestutil.ToFloat64(compactions))
+	testutil.Equals(t, 2.0, promtestutil.ToFloat64(gcBlocks))
+
+	// A vetoing checker keeps every source, exactly as it does in-process.
+	_, toCompact, compactions, gcBlocks = run(labels.FromStrings("ext", "veto"), vetoChecker{})
+	for _, m := range toCompact {
+		testutil.Assert(t, !hasDeletionMark(m.ULID), "the checker's veto on %s must hold", m.ULID)
+	}
+	testutil.Equals(t, 1.0, promtestutil.ToFloat64(compactions))
+	testutil.Equals(t, 0.0, promtestutil.ToFloat64(gcBlocks))
+}
+
 // TestDispatchDownsamplingRecordsFailures pins down that a failed downsample
 // task increments the same per-resolution failure counter the in-process
 // downsampler feeds - previously manager mode exported the pre-seeded series
@@ -328,6 +568,55 @@ func TestDispatchDownsamplingRecordsFailures(t *testing.T) {
 		map[ulid.ULID]*metadata.Meta{m.ULID: m}, 1, metadata.NoneFunc, 1, false, nil, nil, failures)
 	testutil.NotOk(t, err)
 	testutil.Equals(t, 1.0, promtestutil.ToFloat64(failures.WithLabelValues(m.Thanos.ResolutionString())))
+}
+
+// TestHeartbeatsAreNotStalledByJournalIO pins down that journal uploads happen
+// outside the scheduler's state lock. Previously every Submit/Lease/Report held
+// the lock across a bucket GET+PUT, so a slow object store froze all heartbeats
+// - and frozen heartbeats are expired leases and discarded work.
+func TestHeartbeatsAreNotStalledByJournalIO(t *testing.T) {
+	bkt := &hookBucket{Bucket: objstore.NewInMemBucket()}
+	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
+		JournalID: "shard-slow",
+	})
+	testutil.Ok(t, err)
+
+	// Lease a task whose heartbeats we can measure.
+	_, err = sched.Submit(context.Background(), Task{ID: "t-slow", Type: TaskCompaction})
+	testutil.Ok(t, err)
+	task, err := sched.Lease(context.Background(), LeaseRequest{WorkerID: "w1"})
+	testutil.Ok(t, err)
+
+	// Make every journal write take its time, and start a Submit that has to
+	// sit in that slow upload.
+	uploadStarted := make(chan struct{})
+	bkt.mtx.Lock()
+	bkt.onUpload = func(_ context.Context, name string) error {
+		if strings.HasPrefix(name, JournalPrefix) {
+			select {
+			case uploadStarted <- struct{}{}:
+			default:
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		return nil
+	}
+	bkt.mtx.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = sched.Submit(context.Background(), Task{ID: "t-slow-2", Type: TaskCompaction})
+	}()
+	<-uploadStarted
+
+	// The heartbeat must not wait for that upload.
+	start := time.Now()
+	resp := sched.Heartbeat(HeartbeatRequest{TaskID: task.ID, LeaseToken: task.LeaseToken, Generation: task.Generation})
+	elapsed := time.Since(start)
+	testutil.Equals(t, true, resp.Acknowledged)
+	testutil.Assert(t, elapsed < 250*time.Millisecond, "heartbeat stalled behind journal I/O for %s", elapsed)
+	<-done
 }
 
 // TestWorkerSeenIsPruned pins down that the worker liveness map forgets workers
@@ -400,6 +689,66 @@ func TestGroupCompactRunsAreSerialized(t *testing.T) {
 	}
 	wg.Wait()
 	testutil.Equals(t, 1, e.maxSeen)
+}
+
+// TestOversizedTasksAreRefusedNotDispatched pins down tier-1 admission control:
+// a plan whose expected size exceeds the configured worker capacity is never
+// handed to a worker. It is recorded in the journal as oversized with the
+// reason, counted, parked so the next pass does not re-refuse it into a fresh
+// journal entry, and the group is deferred instead of rerun - turning "three
+// workers died at minute 40" into an immediate, named refusal.
+func TestOversizedTasksAreRefusedNotDispatched(t *testing.T) {
+	c := newTestCluster(t)
+	// A worker is running, and must never see the task.
+	w1 := c.startWorker("w1")
+
+	cg, toCompact := c.makeGroup(labels.FromStrings("ext", "1"))
+	var wantSeries uint64
+	for _, m := range toCompact {
+		wantSeries += m.Stats.NumSeries
+	}
+	testutil.Assert(t, wantSeries > 0, "the fixture blocks must report series counts")
+
+	// A limit just below what the plan needs.
+	c.sched.conf.MaxTaskSeries = wantSeries - 1
+
+	e := NewRemotePlanExecutor(c.logger, c.manager, c.sched, nil, 1, nil, nil)
+	_, err := e.Execute(context.Background(), "", cg, toCompact, false)
+	testutil.Assert(t, errors.Is(err, compact.ErrPlanDeferred), "an oversized plan must be deferred, got: %v", err)
+
+	entry := c.journalTask(StateOversized)
+	testutil.Assert(t, entry != nil, "the journal must record the oversized task")
+	testutil.Equals(t, OutcomeOversized, entry.LastError.Outcome)
+	testutil.Assert(t, strings.Contains(entry.LastError.Message, "max-task-series"), "the reason must name the limit: %s", entry.LastError.Message)
+	testutil.Equals(t, wantSeries, entry.Task.ExpectedSeries)
+
+	// A second pass parks on the existing entry instead of minting another.
+	_, err = e.Execute(context.Background(), "", cg, toCompact, false)
+	testutil.Assert(t, errors.Is(err, compact.ErrPlanDeferred), "the parked plan must stay deferred, got: %v", err)
+	oversized := 0
+	for _, e := range c.journal().Tasks {
+		if e.State == StateOversized {
+			oversized++
+		}
+	}
+	testutil.Equals(t, 1, oversized)
+
+	// The worker never leased anything.
+	testutil.Equals(t, 0.0, counterValue(t, w1.reg, "thanos_compact_worker_tasks_total", string(OutcomeCompleted)))
+
+	// Raising the limit lets the same plan through.
+	c.sched.conf.MaxTaskSeries = 0
+	// The parked entry has to be cleared, as an operator would clear it.
+	c.sched.mtx.Lock()
+	for id, e := range c.sched.journal.Tasks {
+		if e.State == StateOversized {
+			delete(c.sched.journal.Tasks, id)
+		}
+	}
+	c.sched.mtx.Unlock()
+	ids, err := e.Execute(context.Background(), "", cg, toCompact, false)
+	testutil.Ok(t, err)
+	testutil.Equals(t, 1, len(ids))
 }
 
 // TestOversizedLimitsIgnoreUnknownSizes pins down that blocks which report no
