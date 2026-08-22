@@ -519,10 +519,3 @@ func TestVerifyTimeCoverage(t *testing.T) {
 		})
 	}
 }
-
-func exists(t *testing.T, bkt objstore.Bucket, name string) bool {
-	t.Helper()
-	ok, err := bkt.Exists(context.Background(), name)
-	testutil.Ok(t, err)
-	return ok
-}
