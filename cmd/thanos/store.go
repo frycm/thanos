@@ -19,6 +19,7 @@ import (
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	commonmodel "github.com/prometheus/common/model"
 	"github.com/prometheus/common/route"
 	"gopkg.in/yaml.v2"
@@ -31,6 +32,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/indexheader"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
+	"github.com/thanos-io/thanos/pkg/compact/downsample"
 	"github.com/thanos-io/thanos/pkg/component"
 	hidden "github.com/thanos-io/thanos/pkg/extflag"
 	"github.com/thanos-io/thanos/pkg/exthttp"
@@ -88,6 +90,8 @@ type storeConfig struct {
 	blockSyncConcurrency          int
 	blockMetaFetchConcurrency     int
 	filterConf                    *store.FilterConfig
+	minBlockResolution            commonmodel.Duration
+	maxBlockResolution            commonmodel.Duration
 	selectorRelabelConf           extflag.PathOrContent
 	advertiseCompatibilityLabel   bool
 	consistencyDelay              commonmodel.Duration
@@ -179,6 +183,12 @@ func (sc *storeConfig) registerFlag(cmd extkingpin.FlagClause) {
 	cmd.Flag("max-time", "End of time range limit to serve. Thanos Store will serve only blocks, which happened earlier than this value. Option can be a constant time in RFC3339 format or time duration relative to current time, such as -1d or 2h45m. Valid duration units are ms, s, m, h, d, w, y.").
 		Default("9999-12-31T23:59:59Z").SetValue(&sc.filterConf.MaxTime)
 
+	cmd.Flag("min-block-resolution", "Minimum downsampling resolution of blocks to serve, e.g. 5m. Queries have to ask for data at this resolution or coarser (max_source_resolution, or --query.auto-downsampling on the querier); a finer request is answered only from the finer blocks this store still serves, since a store cannot substitute coarser data on the client's behalf. Blocks of a finer resolution whose data is not covered by a retained block at this resolution are still served, as hiding those would drop the range entirely.").
+		Default(commonmodel.Duration(time.Duration(downsample.ResLevel0) * time.Millisecond).String()).HintAction(listResLevel).SetValue(&sc.minBlockResolution)
+
+	cmd.Flag("max-block-resolution", "Maximum downsampling resolution of blocks to serve, e.g. 5m. Blocks of a coarser resolution are not served; make sure another store serves them.").
+		Default(commonmodel.Duration(time.Duration(downsample.ResLevel2) * time.Millisecond).String()).HintAction(listResLevel).SetValue(&sc.maxBlockResolution)
+
 	cmd.Flag("debug.advertise-compatibility-label", "If true, Store Gateway in addition to other labels, will advertise special \"@thanos_compatibility_store_type=store\" label set. This makes store Gateway compatible with Querier before 0.8.0").
 		Hidden().Default("true").BoolVar(&sc.advertiseCompatibilityLabel)
 
@@ -246,6 +256,11 @@ func registerStore(app *extkingpin.App) {
 		if conf.filterConf.MinTime.PrometheusTimestamp() > conf.filterConf.MaxTime.PrometheusTimestamp() {
 			return errors.Errorf("invalid argument: --min-time '%s' can't be greater than --max-time '%s'",
 				conf.filterConf.MinTime, conf.filterConf.MaxTime)
+		}
+
+		if conf.minBlockResolution > conf.maxBlockResolution {
+			return errors.Errorf("invalid argument: --min-block-resolution '%s' can't be greater than --max-block-resolution '%s'",
+				conf.minBlockResolution, conf.maxBlockResolution)
 		}
 
 		httpLogOpts, err := logging.ParseHTTPOptions(conf.reqLogConfig)
@@ -393,13 +408,36 @@ func runStore(
 		return errors.Errorf("unknown sync strategy %s", conf.blockListStrategy)
 	}
 	ignoreDeletionMarkFilter := block.NewIgnoreDeletionMarkFilter(logger, insBkt, time.Duration(conf.ignoreDeletionMarksDelay), conf.blockMetaFetchConcurrency)
+	timePartitionFilter := block.NewTimePartitionMetaFilter(conf.filterConf.MinTime, conf.filterConf.MaxTime)
 	filters := []block.MetadataFilter{
-		block.NewTimePartitionMetaFilter(conf.filterConf.MinTime, conf.filterConf.MaxTime),
 		block.NewLabelShardedMetaFilter(relabelConfig),
 		block.NewConsistencyDelayMetaFilter(logger, time.Duration(conf.consistencyDelay), extprom.WrapRegistererWithPrefix("thanos_", reg)),
 		ignoreDeletionMarkFilter,
 		block.NewDeduplicateFilter(conf.blockMetaFetchConcurrency),
 		block.NewParquetMigratedMetaFilter(logger),
+	}
+	minBlockResolution := time.Duration(conf.minBlockResolution).Milliseconds()
+	maxBlockResolution := time.Duration(conf.maxBlockResolution).Milliseconds()
+	if minBlockResolution > 0 || maxBlockResolution < downsample.ResLevel2 {
+		uncoveredBlocks := promauto.With(reg).NewGauge(prometheus.GaugeOpts{
+			Name: "thanos_store_resolution_filter_uncovered_blocks",
+			Help: "Number of blocks below the minimum resolution being served because no retained block at the minimum resolution covers them.",
+		})
+		resolutionFilter := block.NewResolutionMetaFilter(logger, minBlockResolution, maxBlockResolution, uncoveredBlocks)
+		// The resolution filter may only count blocks the other filters retained
+		// as coverage for a finer block it hides: a covering block removed later
+		// (too fresh, marked for deletion, parquet-migrated) would leave neither
+		// resolution served. The time partition is the exception and runs after
+		// it, so a finer block straddling the partition boundary still sees its
+		// cover on the far side and is hidden rather than served in full; the
+		// partition then drops that cover as it would anyway. The price is that
+		// the filters ahead of it now see the whole bucket rather than the
+		// window - one deletion-mark lookup per out-of-window block per sync,
+		// same as the compactor pays. The reporter goes last so the uncovered
+		// gauge and log name only blocks actually served.
+		filters = append(filters, resolutionFilter, timePartitionFilter, resolutionFilter.Reporter())
+	} else {
+		filters = append([]block.MetadataFilter{timePartitionFilter}, filters...)
 	}
 
 	metaFetcher, err := block.NewMetaFetcher(logger, conf.blockMetaFetchConcurrency, insBkt, blockLister, dataDir, extprom.WrapRegistererWithPrefix("thanos_", reg), filters)
@@ -460,6 +498,10 @@ func runStore(
 
 	if conf.debugLogging {
 		options = append(options, store.WithDebugLogging())
+	}
+	if minBlockResolution := time.Duration(conf.minBlockResolution).Milliseconds(); minBlockResolution > 0 {
+		options = append(options, store.WithSourceCoverage())
+		level.Info(logger).Log("msg", "serving blocks by resolution; queries requesting finer data need a store retaining that data", "min-block-resolution", conf.minBlockResolution)
 	}
 
 	bs, err := store.NewBucketStore(

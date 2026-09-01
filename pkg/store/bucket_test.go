@@ -2408,7 +2408,7 @@ func createBlockWithOneSeriesWithStep(t testutil.TB, dir string, lbls labels.Lab
 	return storetestutil.CreateBlockFromHead(t, dir, h)
 }
 
-func setupStoreForHintsTest(t *testing.T) (testutil.TB, *BucketStore, []*storepb.Series, []*storepb.Series, ulid.ULID, ulid.ULID, func()) {
+func setupStoreForHintsTest(t *testing.T, opts ...BucketStoreOption) (testutil.TB, *BucketStore, []*storepb.Series, []*storepb.Series, ulid.ULID, ulid.ULID, func()) {
 	tb := testutil.NewTB(t)
 
 	closers := []func(){}
@@ -2481,8 +2481,7 @@ func setupStoreForHintsTest(t *testing.T) (testutil.TB, *BucketStore, []*storepb
 		true,
 		false,
 		0,
-		WithLogger(logger),
-		WithIndexCache(indexCache),
+		append([]BucketStoreOption{WithLogger(logger), WithIndexCache(indexCache)}, opts...)...,
 	)
 	testutil.Ok(tb, err)
 	testutil.Ok(tb, store.SyncBlocks(context.Background()))
@@ -4277,4 +4276,41 @@ func (c *mockBlockLifecycleCallback) PreAdd(meta metadata.Meta) error {
 		return fmt.Errorf("don't add")
 	}
 	return nil
+}
+
+// A store without downsampled coverage serves its retained raw blocks even
+// when queries request finer data than the configured minimum. Configuration
+// notices must not turn complete responses into errors under strict querying.
+func TestBucketStore_Series_RawFallbackDoesNotWarn(t *testing.T) {
+	t.Parallel()
+
+	tb, store, seriesSet1, seriesSet2, block1, block2, close := setupStoreForHintsTest(t, WithSourceCoverage())
+	defer close()
+
+	matchers := []storepb.LabelMatcher{{Type: storepb.LabelMatcher_EQ, Name: "foo", Value: "bar"}}
+	both := append(append([]*storepb.Series{}, seriesSet1...), seriesSet2...)
+	bothBlocks := []hintspb.SeriesResponseHints{{QueriedBlocks: []hintspb.Block{{Id: block1.String()}, {Id: block2.String()}}}}
+	queriedBlocks := func(t testutil.TB, expected, actual hintspb.SeriesResponseHints) {
+		testutil.Equals(t, expected.QueriedBlocks, actual.QueriedBlocks)
+	}
+	storetestutil.TestServerSeries(tb, store,
+		&storetestutil.SeriesCase{
+			Name:             "below the floor: retained raw blocks are served completely",
+			Req:              &storepb.SeriesRequest{MinTime: 0, MaxTime: 3, Matchers: matchers},
+			ExpectedSeries:   both,
+			ExpectedHints:    bothBlocks,
+			HintsCompareFunc: queriedBlocks,
+		},
+		&storetestutil.SeriesCase{
+			Name:             "at the floor: no warning",
+			Req:              &storepb.SeriesRequest{MinTime: 0, MaxTime: 3, Matchers: matchers, MaxResolutionWindow: 300000},
+			ExpectedSeries:   both,
+			ExpectedHints:    bothBlocks,
+			HintsCompareFunc: queriedBlocks,
+		},
+	)
+
+	srv := newStoreSeriesServer(t.Context())
+	testutil.Ok(t, store.Series(&storepb.SeriesRequest{MinTime: 0, MaxTime: 3, Matchers: matchers, PartialResponseDisabled: true}, srv))
+	testutil.Equals(t, 0, len(srv.Warnings))
 }
