@@ -388,7 +388,7 @@ func TestScenarios(t *testing.T) {
 	inputs := map[string]*bucketDump{}
 	corpora := map[string]*corpus{defaultCorpus.name: defaultCorpus}
 
-	for _, sc := range scenarios() {
+	for _, sc := range append(scenarios(), stuckScenarios()...) {
 		t.Run(sc.name, func(t *testing.T) {
 			conf := haNodeConfig()
 			if sc.conf != nil {
@@ -401,7 +401,7 @@ func TestScenarios(t *testing.T) {
 				c = buildCorpus(t, sc.name, sc.tenants)
 				corpora[c.name] = c
 			}
-			key := fmt.Sprintf("%s/%v/%s", c.name, conf.dedupReplicaLabels, conf.dedupFunc)
+			key := fmt.Sprintf("%s/%v/%s/%t", c.name, conf.dedupReplicaLabels, conf.dedupFunc, conf.enableStuckBlockDownsampling)
 			if goldens[key] == nil {
 				goldens[key] = golden(t, c, conf)
 				inputs[key] = inputDump(t, c)

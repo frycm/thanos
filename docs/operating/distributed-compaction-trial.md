@@ -7,6 +7,27 @@ The distributed compactor (`--compact.mode=manager` / `--compact.mode=worker`, e
 
 Stage A is where you establish that B will work, and where you rehearse B's rollback before you need it. Do not skip it: the markers that make B reversible let you *undo* a bad outcome, but only A lets you *prove* a good one.
 
+## Testing downsampling separately
+
+The compactor defaults to `--compact.mode=standalone`. Stuck-block downsampling
+is a separate opt-in, `--downsampling.enable-stuck-blocks`, which defaults to
+`false`. A build containing both changes can therefore be deployed with the
+existing local compaction and downsampling policy. Store gateway resolution
+filtering can be deployed and tested independently of these compactor settings.
+
+To test the changes in stages:
+
+1. Keep the production compactor in standalone mode with stuck-block
+   downsampling off while validating the new build and store gateway behavior.
+2. Test stuck-block downsampling in standalone mode against a trial bucket,
+   then enable it on the production standalone compactor after validation.
+3. Run the distributed trial below with the same downsampling flag value as
+   the standalone reference. Set the flag on the manager; workers need no
+   separate setting for this policy.
+
+Keep each compactor trial in its own bucket. Turning stuck-block downsampling
+off stops new exceptions but does not remove the blocks it already produced.
+
 ## Before Stage A: the fault scenario suite
 
 Before a bucket is involved at all, the failure modes the trial has to survive can be rehearsed in process, in a minute, on a laptop. `pkg/compact/distributed` carries a scenario suite that runs the whole control loop of the binary - sync, grouping, planning, dispatch, verification, garbage collection and both downsampling passes - against a synthetic bucket, with real workers and faults injected between the pieces. It is off by default because it is slow:

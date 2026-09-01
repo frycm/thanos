@@ -784,6 +784,10 @@ Flags:
       --http.config=""        [EXPERIMENTAL] Path to the configuration file
                               that can enable TLS or authentication for all HTTP
                               endpoints.
+      --[no-]downsampling.enable-stuck-blocks
+                              Experimental. Allow downsampling below the normal
+                              minimum block span when permanent index-size
+                              no-compact marks prove that blocks cannot grow.
       --wait-interval=5m      Wait interval between downsample runs.
       --downsample.concurrency=1
                               Number of goroutines to use when downsampling
@@ -800,6 +804,14 @@ Flags:
                               This permits avoiding downloading some files twice
                               albeit at some performance cost. Possible values
                               are: "", "SHA256".
+      --deduplication.replica-label=DEDUPLICATION.REPLICA-LABEL ...
+                              Set to the same value(s) as on the compactor. The
+                              compactor plans against a view with these labels
+                              removed, and the downsample planner has to compute
+                              the same compaction groups to judge which blocks
+                              are permanently stuck below the downsample range;
+                              with different views the two components reach
+                              opposite verdicts for the same bucket.
 
 ```
 

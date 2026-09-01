@@ -64,6 +64,7 @@ import (
 	httpserver "github.com/thanos-io/thanos/pkg/server/http"
 	"github.com/thanos-io/thanos/pkg/shipper"
 	"github.com/thanos-io/thanos/pkg/store"
+	"github.com/thanos-io/thanos/pkg/strutil"
 	"github.com/thanos-io/thanos/pkg/ui"
 	"github.com/thanos-io/thanos/pkg/verifier"
 )
@@ -139,11 +140,13 @@ type bucketReplicateConfig struct {
 }
 
 type bucketDownsampleConfig struct {
-	waitInterval          time.Duration
-	downsampleConcurrency int
-	blockFilesConcurrency int
-	dataDir               string
-	hashFunc              string
+	enableStuckBlockDownsampling bool
+	waitInterval                 time.Duration
+	downsampleConcurrency        int
+	blockFilesConcurrency        int
+	dataDir                      string
+	hashFunc                     string
+	dedupReplicaLabels           []string
 }
 
 type bucketCleanupConfig struct {
@@ -258,6 +261,8 @@ func (tbc *bucketRewriteConfig) registerBucketRewriteFlag(cmd extkingpin.FlagCla
 }
 
 func (tbc *bucketDownsampleConfig) registerBucketDownsampleFlag(cmd extkingpin.FlagClause) *bucketDownsampleConfig {
+	cmd.Flag("downsampling.enable-stuck-blocks", "Experimental. Allow downsampling below the normal minimum block span when permanent index-size no-compact marks prove that blocks cannot grow.").
+		Default("false").BoolVar(&tbc.enableStuckBlockDownsampling)
 	cmd.Flag("wait-interval", "Wait interval between downsample runs.").
 		Default("5m").DurationVar(&tbc.waitInterval)
 	cmd.Flag("downsample.concurrency", "Number of goroutines to use when downsampling blocks.").
@@ -268,6 +273,8 @@ func (tbc *bucketDownsampleConfig) registerBucketDownsampleFlag(cmd extkingpin.F
 		Default("./data").StringVar(&tbc.dataDir)
 	cmd.Flag("hash-func", "Specify which hash function to use when calculating the hashes of produced files. If no function has been specified, it does not happen. This permits avoiding downloading some files twice albeit at some performance cost. Possible values are: \"\", \"SHA256\".").
 		Default("").EnumVar(&tbc.hashFunc, "SHA256", "")
+	cmd.Flag("deduplication.replica-label", "Set to the same value(s) as on the compactor. The compactor plans against a view with these labels removed, and the downsample planner has to compute the same compaction groups to judge which blocks are permanently stuck below the downsample range; with different views the two components reach opposite verdicts for the same bucket.").
+		StringsVar(&tbc.dedupReplicaLabels)
 
 	return tbc
 }
@@ -835,7 +842,8 @@ func registerBucketDownsample(app extkingpin.AppClause, objStoreConfig *extflag.
 
 	cmd.Setup(func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ <-chan struct{}, _ bool) error {
 		return RunDownsample(g, logger, reg, *httpAddr, *httpTLSConfig, time.Duration(*httpGracePeriod), tbc.dataDir,
-			tbc.waitInterval, tbc.downsampleConcurrency, tbc.blockFilesConcurrency, objStoreConfig, component.Downsample, metadata.HashFunc(tbc.hashFunc))
+			tbc.waitInterval, tbc.downsampleConcurrency, tbc.blockFilesConcurrency, objStoreConfig, component.Downsample, metadata.HashFunc(tbc.hashFunc),
+			strutil.ParseFlagLabels(tbc.dedupReplicaLabels), tbc.enableStuckBlockDownsampling)
 	})
 }
 

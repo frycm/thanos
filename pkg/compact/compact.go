@@ -736,10 +736,29 @@ type DownsampleProgressMetrics struct {
 // DownsampleProgressCalculator contains DownsampleMetrics, which are updated during the downsampling simulation process.
 type DownsampleProgressCalculator struct {
 	*DownsampleProgressMetrics
+
+	// The marker getters feed the same stuck-block waiver the real downsample
+	// planner applies, so the gauge counts exactly the work Plan will emit.
+	// Without no-compact marks or opt-in, only the plain span rule applies.
+	noCompactMarked    func() map[ulid.ULID]*metadata.NoCompactMark
+	noDownsampleMarked func() map[ulid.ULID]*metadata.NoDownsampleMark
+	enableStuckBlocks  bool
 }
 
 // NewDownsampleProgressCalculator creates a new DownsampleProgressCalculator.
 func NewDownsampleProgressCalculator(reg prometheus.Registerer) *DownsampleProgressCalculator {
+	return NewDownsampleProgressCalculatorWithMarks(reg, nil, nil, false)
+}
+
+// NewDownsampleProgressCalculatorWithMarks creates a DownsampleProgressCalculator
+// that consults no-compact and no-downsample marks the way the downsample
+// planner does, with the same opt-in for stuck blocks.
+func NewDownsampleProgressCalculatorWithMarks(
+	reg prometheus.Registerer,
+	noCompactMarked func() map[ulid.ULID]*metadata.NoCompactMark,
+	noDownsampleMarked func() map[ulid.ULID]*metadata.NoDownsampleMark,
+	enableStuckBlocks bool,
+) *DownsampleProgressCalculator {
 	return &DownsampleProgressCalculator{
 		DownsampleProgressMetrics: &DownsampleProgressMetrics{
 			NumberOfBlocksDownsampled: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
@@ -747,79 +766,41 @@ func NewDownsampleProgressCalculator(reg prometheus.Registerer) *DownsampleProgr
 				Help: "number of blocks to be downsampled",
 			}),
 		},
+		noCompactMarked:    noCompactMarked,
+		noDownsampleMarked: noDownsampleMarked,
+		enableStuckBlocks:  enableStuckBlocks,
 	}
 }
 
-// ProgressCalculate calculates the number of blocks to be downsampled for the given groups.
+// ProgressCalculate calculates the number of blocks to be downsampled for the
+// given groups. It delegates to downsample.Plan so the number can never drift
+// from what the downsampling pass will actually do - including the waiver for
+// blocks stuck below the downsample range.
 func (ds *DownsampleProgressCalculator) ProgressCalculate(ctx context.Context, groups []*Group) error {
-	sources5m := map[ulid.ULID]struct{}{}
-	sources1h := map[ulid.ULID]struct{}{}
-	groupBlocks := make(map[string]int, len(groups))
-
+	metas := map[ulid.ULID]*metadata.Meta{}
 	for _, group := range groups {
 		for _, m := range group.metasByMinTime {
-			switch m.Thanos.Downsample.Resolution {
-			case downsample.ResLevel0:
-				continue
-			case downsample.ResLevel1:
-				for _, id := range m.Compaction.Sources {
-					sources5m[id] = struct{}{}
-				}
-			case downsample.ResLevel2:
-				for _, id := range m.Compaction.Sources {
-					sources1h[id] = struct{}{}
-				}
-			default:
-				return errors.Errorf("unexpected downsampling resolution %d", m.Thanos.Downsample.Resolution)
-			}
-
+			metas[m.ULID] = m
 		}
 	}
 
-	for _, group := range groups {
-		for _, m := range group.metasByMinTime {
-			switch m.Thanos.Downsample.Resolution {
-			case downsample.ResLevel0:
-				missing := false
-				for _, id := range m.Compaction.Sources {
-					if _, ok := sources5m[id]; !ok {
-						missing = true
-						break
-					}
-				}
-				if !missing {
-					continue
-				}
-
-				if m.MaxTime-m.MinTime < downsample.ResLevel1DownsampleRange {
-					continue
-				}
-				groupBlocks[group.key]++
-			case downsample.ResLevel1:
-				missing := false
-				for _, id := range m.Compaction.Sources {
-					if _, ok := sources1h[id]; !ok {
-						missing = true
-						break
-					}
-				}
-				if !missing {
-					continue
-				}
-
-				if m.MaxTime-m.MinTime < downsample.ResLevel2DownsampleRange {
-					continue
-				}
-				groupBlocks[group.key]++
-			}
-		}
+	var (
+		noCompact    map[ulid.ULID]*metadata.NoCompactMark
+		noDownsample map[ulid.ULID]*metadata.NoDownsampleMark
+	)
+	if ds.noCompactMarked != nil {
+		noCompact = ds.noCompactMarked()
+	}
+	if ds.noDownsampleMarked != nil {
+		noDownsample = ds.noDownsampleMarked()
 	}
 
-	ds.NumberOfBlocksDownsampled.Set(0)
-	for _, blocks := range groupBlocks {
-		ds.NumberOfBlocksDownsampled.Add(float64(blocks))
+	candidates, err := downsample.Plan(metas, noCompact, noDownsample, ds.enableStuckBlocks)
+	if err != nil {
+		return errors.Wrap(err, "plan downsampling for progress")
 	}
 
+	ds.NumberOfBlocksDownsampled.Set(float64(len(candidates)))
 	return nil
 }
 
