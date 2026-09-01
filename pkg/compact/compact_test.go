@@ -821,3 +821,54 @@ func TestCompactExtensions(t *testing.T) {
 		})
 	}
 }
+
+// TestDownsampleProgressCountsStuckBlocks pins down that the progress gauge
+// applies the same stuck-block waiver as downsample.Plan: a short block the
+// compactor is provably done with counts as pending work instead of being
+// silently omitted while the downsampling pass dispatches it.
+func TestDownsampleProgressCountsStuckBlocks(t *testing.T) {
+	t.Parallel()
+
+	logger := log.NewNopLogger()
+
+	stuck := ulid.MustNew(1, nil)
+	meta := &metadata.Meta{
+		BlockMeta: tsdb.BlockMeta{
+			ULID:    stuck,
+			MinTime: 0,
+			MaxTime: downsample.ResLevel1DownsampleRange - 1, // Below the span rule.
+			Compaction: tsdb.BlockMetaCompaction{
+				Sources: []ulid.ULID{stuck},
+			},
+		},
+	}
+	meta.Thanos.Labels = map[string]string{"a": "1"}
+	meta.Thanos.Downsample.Resolution = downsample.ResLevel0
+
+	var bkt objstore.Bucket
+	reg := prometheus.NewRegistry()
+	temp := promauto.With(reg).NewCounter(prometheus.CounterOpts{Name: "test_metric_for_stuck_group", Help: "test"})
+	grouper := NewDefaultGrouper(logger, bkt, false, false, reg, temp, temp, temp, "", 1, 1)
+	groups, err := grouper.Groups(map[ulid.ULID]*metadata.Meta{stuck: meta})
+	testutil.Ok(t, err)
+
+	// Without marks the block waits.
+	plain := NewDownsampleProgressCalculator(prometheus.NewRegistry())
+	testutil.Ok(t, plain.ProgressCalculate(t.Context(), groups))
+	testutil.Equals(t, 0.0, promtestutil.ToFloat64(plain.NumberOfBlocksDownsampled))
+
+	// A permanent no-compact mark only adds work when the feature is enabled.
+	marks := map[ulid.ULID]*metadata.NoCompactMark{
+		stuck: {ID: stuck, Version: metadata.NoCompactMarkVersion1, Reason: metadata.IndexSizeExceedingNoCompactReason},
+	}
+	for _, enabled := range []bool{false, true} {
+		marked := NewDownsampleProgressCalculatorWithMarks(prometheus.NewRegistry(),
+			func() map[ulid.ULID]*metadata.NoCompactMark { return marks }, nil, enabled)
+		testutil.Ok(t, marked.ProgressCalculate(t.Context(), groups))
+		want := 0.0
+		if enabled {
+			want = 1.0
+		}
+		testutil.Equals(t, want, promtestutil.ToFloat64(marked.NumberOfBlocksDownsampled))
+	}
+}

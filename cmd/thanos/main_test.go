@@ -15,6 +15,7 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/oklog/ulid/v2"
+	"github.com/pkg/errors"
 
 	"github.com/prometheus/client_golang/prometheus"
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
@@ -180,7 +181,7 @@ func TestRegression4960_Deadlock(t *testing.T) {
 
 	metas, _, err := metaFetcher.Fetch(ctx)
 	testutil.Ok(t, err)
-	err = downsampleBucket(ctx, logger, metrics, bkt, metas, dir, 1, 1, metadata.NoneFunc, false)
+	err = downsampleBucket(ctx, logger, metrics, bkt, metas, nil, nil, false, dir, 1, 1, metadata.NoneFunc, false)
 	testutil.NotOk(t, err)
 
 	testutil.Assert(t, strings.Contains(err.Error(), "some random error has occurred"))
@@ -220,9 +221,23 @@ func TestCleanupDownsampleCacheFolder(t *testing.T) {
 
 	metas, _, err := metaFetcher.Fetch(ctx)
 	testutil.Ok(t, err)
-	testutil.Ok(t, downsampleBucket(ctx, logger, metrics, bkt, metas, dir, 1, 1, metadata.NoneFunc, false))
+	testutil.Ok(t, downsampleBucket(ctx, logger, metrics, bkt, metas, nil, nil, false, dir, 1, 1, metadata.NoneFunc, false))
 	testutil.Equals(t, 1.0, promtest.ToFloat64(metrics.downsamples.WithLabelValues(meta.Thanos.ResolutionString())))
 
 	_, err = os.Stat(dir)
 	testutil.Assert(t, os.IsNotExist(err), "index cache dir should not exist at the end of execution")
+}
+
+// TestBestEffortMetaFilterSwallowsErrors pins down that the optional
+// no-compact gatherer cannot take the downsample component down: a transient
+// marker-read failure is logged and skipped, never propagated into the fetch.
+func TestBestEffortMetaFilterSwallowsErrors(t *testing.T) {
+	f := bestEffortMetaFilter{logger: log.NewNopLogger(), inner: failingMetaFilter{}}
+	testutil.Ok(t, f.Filter(context.Background(), nil, nil, nil))
+}
+
+type failingMetaFilter struct{}
+
+func (failingMetaFilter) Filter(context.Context, map[ulid.ULID]*metadata.Meta, block.GaugeVec, block.GaugeVec) error {
+	return errors.New("injected: marker read failed")
 }
