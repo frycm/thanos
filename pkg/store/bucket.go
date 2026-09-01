@@ -420,6 +420,12 @@ type BucketStore struct {
 	// Query gate which limits the maximum amount of concurrent queries.
 	queryGate gate.Gate
 
+	// sourceCoverage prevents time-overlapping coarse blocks from hiding
+	// finer blocks retained by the resolution filter for their unique sources.
+	sourceCoverage            bool
+	resolutionFilter          *block.ResolutionMetaFilter
+	resolutionFallbackFilters []block.MetadataFilter
+
 	// chunksLimiterFactory creates a new limiter used to limit the number of chunks fetched by each Series() call.
 	chunksLimiterFactory ChunksLimiterFactory
 	// seriesLimiterFactory creates a new limiter used to limit the number of touched series by each Series() call,
@@ -566,6 +572,24 @@ func WithChunkHashCalculation(enableChunkHashCalculation bool) BucketStoreOption
 func WithSeriesBatchSize(seriesBatchSize int) BucketStoreOption {
 	return func(s *BucketStore) {
 		s.seriesBatchSize = seriesBatchSize
+	}
+}
+
+// WithSourceCoverage enables source-aware query selection for stores using a
+// minimum block resolution. A retained finer block is skipped only when its
+// sources and requested time range are covered by selected coarser blocks.
+func WithSourceCoverage() BucketStoreOption {
+	return func(s *BucketStore) { s.sourceCoverage = true }
+}
+
+// WithResolutionFilter enables source-aware selection and restores finer
+// blocks when their advertised replacement cannot be loaded. Filters following
+// the resolution filter must also constrain the fallback metadata.
+func WithResolutionFilter(f *block.ResolutionMetaFilter, following ...block.MetadataFilter) BucketStoreOption {
+	return func(s *BucketStore) {
+		s.sourceCoverage = true
+		s.resolutionFilter = f
+		s.resolutionFallbackFilters = following
 	}
 }
 
@@ -772,6 +796,9 @@ func (s *BucketStore) SyncBlocks(ctx context.Context) error {
 	if metaFetchErr != nil {
 		return metaFetchErr
 	}
+	if err := s.syncResolutionFallbacks(ctx, metas); err != nil {
+		return err
+	}
 
 	s.mtx.RLock()
 	keys := make([]ulid.ULID, 0, len(s.blocks))
@@ -922,6 +949,7 @@ func (s *BucketStore) addBlock(ctx context.Context, meta *metadata.Meta) (err er
 	set, ok := s.blockSets[h]
 	if !ok {
 		set = newBucketBlockSet(lset)
+		set.sourceCoverage = s.sourceCoverage
 		s.blockSets[h] = set
 	}
 
@@ -2319,10 +2347,11 @@ func (s *BucketStore) LabelValues(ctx context.Context, req *storepb.LabelValuesR
 // bucketBlockSet holds all blocks of an equal label set. It internally splits
 // them up by downsampling resolution and allows querying.
 type bucketBlockSet struct {
-	labels      labels.Labels
-	mtx         sync.RWMutex
-	resolutions []int64          // Available resolution, high to low (in milliseconds).
-	blocks      [][]*bucketBlock // Ordered buckets for the existing resolutions.
+	sourceCoverage bool
+	labels         labels.Labels
+	mtx            sync.RWMutex
+	resolutions    []int64          // Available resolution, high to low (in milliseconds).
+	blocks         [][]*bucketBlock // Ordered buckets for the existing resolutions.
 }
 
 // newBucketBlockSet initializes a new set with the known downsampling windows hard-configured.
@@ -2395,6 +2424,10 @@ func (s *bucketBlockSet) getFor(mint, maxt, maxResolutionMillis int64, blockMatc
 
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
+
+	if s.sourceCoverage {
+		return s.getForSourceCoverage(mint, maxt, maxResolutionMillis, blockMatchers)
+	}
 
 	// Find first matching resolution.
 	i := 0
