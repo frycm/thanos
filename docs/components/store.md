@@ -40,6 +40,32 @@ prefix: ""
 
 In general, an average of 6 MB of local disk space is required per TSDB block stored in the object storage bucket, but for high cardinality blocks with large label set it can even go up to 30MB and more. It is for the pre-computed index, which includes symbols and postings offsets as well as metadata JSON.
 
+## Resolution filtering and failures
+
+`--min-block-resolution` prefers downsampled blocks while retaining finer data
+whose sources and time range are not covered at the minimum resolution. The
+default `0s` minimum preserves the existing behavior. `--max-block-resolution`
+is a hard upper bound; data excluded by that bound must be served elsewhere.
+
+Coverage advertised by metadata is not enough to remove a fallback. The store
+first attempts to load replacements, then loads or retains the finer blocks
+still needed when a replacement fails to load. This also applies on cold start,
+without eagerly loading all raw blocks when replacements load successfully.
+Fallbacks obey the same time partition. When coverage disappears from the
+bucket, retained finer data becomes eligible again on the next successful sync.
+
+Tests exercise source/time coverage, split ranges and gaps, replacement index
+read failures on cold start and during resync, recovery, disappearing coverage,
+and time partitioning. Query integration tests use real raw and aggregate chunks
+and actual replicas for `prometheus_replica`, `receiver_replica`,
+`otelcol_replica`, and `ruler_replica` with penalty deduplication. They check
+counts, sums, counter rates and strict-query failure when fallback chunks cannot
+be read. A fuzz test compares interval coverage with a per-millisecond reference.
+
+This cannot restore blocks already deleted by retention or guarantee successful
+queries during an object-store outage. A strict query must fail when selected
+data cannot be read; it must not silently report an incomplete result as success.
+
 ## Flags
 
 ```$ mdox-exec="thanos store --help"
@@ -196,6 +222,22 @@ Flags:
                                  in RFC3339 format or time duration relative
                                  to current time, such as -1d or 2h45m. Valid
                                  duration units are ms, s, m, h, d, w, y.
+      --min-block-resolution=0s  Minimum downsampling resolution of
+                                 blocks to serve, e.g. 5m. Queries have
+                                 to ask for data at this resolution
+                                 or coarser (max_source_resolution,
+                                 or --query.auto-downsampling on the querier);
+                                 a finer request is answered only from the
+                                 finer blocks this store still serves; it cannot
+                                 substitute coarser data on the client's behalf.
+                                 Blocks of a finer resolution whose data is not
+                                 covered by a retained block at this resolution
+                                 are still served, as hiding those would drop
+                                 the range entirely.
+      --max-block-resolution=1h  Maximum downsampling resolution of blocks to
+                                 serve, e.g. 5m. Blocks of a coarser resolution
+                                 are not served; make sure another store serves
+                                 them.
       --selector.relabel-config-file=<file-path>
                                  Path to YAML file with relabeling
                                  configuration that allows selecting blocks
