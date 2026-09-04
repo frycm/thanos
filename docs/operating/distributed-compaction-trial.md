@@ -9,13 +9,15 @@ Stage A is where you establish that B will work, and where you rehearse B's roll
 
 ## Before Stage A: the fault scenario suite
 
-Before a bucket is involved at all, the failure modes the trial has to survive can be rehearsed in process, in a minute, on a laptop. `pkg/compact/distributed` carries a scenario suite that runs the whole control loop of the binary - sync, grouping, planning, dispatch, verification, garbage collection and both downsampling passes - against a synthetic bucket, with real workers and faults injected between the pieces. It is off by default because it is slow:
+The [failure coverage matrix](distributed-compaction-tests.md) describes the guarantees checked, the represented HA topology, CI coverage and remaining limits.
+
+Before a bucket is involved at all, the failure modes the trial has to survive can be rehearsed in process, without a deployed bucket. `pkg/compact/distributed` carries a scenario suite that runs the whole control loop of the binary - sync, grouping, planning, dispatch, verification, garbage collection and both downsampling passes - against a synthetic bucket, with real workers and faults injected between the pieces. It is off by default because it is slow:
 
 ```bash
-go test ./pkg/compact/distributed/ -run TestScenarios -race -args -distributed.scenarios
+go test -tags slicelabels ./pkg/compact/distributed/ -run TestScenarios -race -args -distributed.scenarios
 ```
 
-The corpus is the deployment this mode exists for: an HA Prometheus pair (`prometheus_replica` as a series label inside the blocks) ingested by receive with replication factor 2 (`receiver_replica` as an external label), so every 2h window is two identical blocks holding both Prometheus replicas' series, plus a small plain tenant so that two groups are always in play. The corpus spans 48h, so 5m downsampling is exercised as well.
+The corpus is the deployment this mode exists for: an HA Prometheus pair (`prometheus_replica` as a series label inside the blocks) ingested by receive with replication factor 2 (`receiver_replica` as an external label), with two copies of most 2h windows and deliberately missing receiver copies in others, plus OTel collector replicas, ruler replicas, native histograms, missing receiver-copy windows and a small plain tenant. Penalty deduplication is configured with all four replica labels. The corpus spans 48h, so 5m downsampling is exercised as well.
 
 The oracle is content, not blocks. The manager keeps several plans for one group in flight, so its intermediate block layout legitimately differs from the standalone compactor's; what must not differ is what a store gateway would serve. Every scenario ends by comparing every series and sample at every resolution, per external label set, against what the standalone compactor produced from the same blocks - the same comparison Stage A makes with `promtool`, without the bucket. On top of that every scenario checks that no served blocks overlap, that no task is left live in the journal, and that every worker-produced block still names sources a rollback could restore.
 
