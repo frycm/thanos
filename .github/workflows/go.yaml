@@ -26,6 +26,25 @@ jobs:
       - name: Run the compact command as a process
         run: go test -tags slicelabels -race -timeout 5m ./cmd/thanos -run TestCompactorStandaloneProcess -count=1
 
+  distributed-failures:
+    runs-on: ubuntu-latest
+    name: Distributed compactor failure tests (Go ${{ matrix.go }})
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ['1.25.x', '1.26.x']
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+      - name: Install Go
+        uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32 # v5.0.2
+        with:
+          go-version: ${{ matrix.go }}
+      - name: Run race tests and fault scenarios
+        run: go test -tags slicelabels -race -timeout 15m ./pkg/compact/distributed -count=1 -args -distributed.scenarios
+      - name: Compare standalone and manager/worker processes
+        run: go test -tags slicelabels -race -timeout 5m ./cmd/thanos -run TestCompactorManagerWorkerProcesses -count=1
+
   unit:
     runs-on: ubuntu-latest
     name: Thanos unit tests
