@@ -166,6 +166,23 @@ Compactor downsampling is done in two passes:
 1) All raw resolution metrics that are older than **40 hours** are downsampled at a 5m resolution
 2) All 5m resolution metrics older than **10 days** are downsampled at a 1h resolution
 
+The experimental `--downsampling.enable-stuck-blocks` flag defaults to `false`.
+When enabled, blocks below the usual minimum time span can also be downsampled
+if permanent index-size no-compact marks prove that they cannot grow. This
+includes an isolated block with such a mark and the last compactable block
+between permanent fences when the reachable window is too short. Overlapping
+blocks, other no-compact reasons, and no-downsample marks still prevent the
+exception. Both raw-to-5m and 5m-to-1h planning use the same policy.
+
+This flag works with `thanos compact` in standalone or manager mode and with
+`thanos tools bucket downsample`. Set it on the manager when using workers;
+workers execute the manager's tasks. The bucket downsampling command must use
+the same `--deduplication.replica-label` values as the compactor for its block
+groups to agree. Leaving the flag off preserves the compactor's existing
+downsampling eligibility; normal downsampling remains enabled unless
+`--downsampling.disable` is set. Disabling the new flag later stops new
+stuck-block exceptions but leaves already produced blocks in the bucket.
+
 > **NOTE:** If retention at each resolution is lower than minimum age for the successive downsampling pass, data will be deleted before downsampling can be completed. As a rule of thumb retention for each downsampling level should be the same, and should be greater than the maximum date range (10 days for 5m to 1h downsampling).
 
 Keep in mind that the initial goal of downsampling is not saving disk or object storage space. In fact, downsampling doesn't save you **any** space but instead, it adds 2 more blocks for each raw block which are only slightly smaller or relatively similar size to raw blocks. This is done by internal downsampling implementation which, to ensure mathematical correctness, holds various aggregations. This means that downsampling can increase the size of your storage a bit (~3x), if you choose to store all resolutions (recommended and enabled by default).
@@ -349,6 +366,12 @@ Flags:
                                 non-downsampled data is not efficient and useful
                                 e.g it is not possible to render all samples for
                                 a human eye anyway
+      --[no-]downsampling.enable-stuck-blocks
+                                Experimental. Allow downsampling below the
+                                normal minimum block span when permanent
+                                index-size no-compact marks prove that blocks
+                                cannot grow. Applies in standalone and manager
+                                modes.
       --block-discovery-strategy="concurrent"
                                 One of concurrent, recursive. When set to
                                 concurrent, stores will concurrently issue

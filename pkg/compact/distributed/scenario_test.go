@@ -506,15 +506,16 @@ const (
 )
 
 type nodeConfig struct {
-	mode               string
-	journalID          string
-	dedupReplicaLabels []string
-	dedupFunc          string
-	leaseTTL           time.Duration
-	maxAttempts        int
-	maxInflight        int
-	maxTaskSeries      uint64
-	deleteDelay        time.Duration
+	enableStuckBlockDownsampling bool
+	mode                         string
+	journalID                    string
+	dedupReplicaLabels           []string
+	dedupFunc                    string
+	leaseTTL                     time.Duration
+	maxAttempts                  int
+	maxInflight                  int
+	maxTaskSeries                uint64
+	deleteDelay                  time.Duration
 }
 
 func (c nodeConfig) withDefaults() nodeConfig {

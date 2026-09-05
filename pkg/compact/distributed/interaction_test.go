@@ -740,7 +740,7 @@ func TestInteractionDownsampleDedup(t *testing.T) {
 
 	testutil.Ok(t, DispatchDownsampling(ctx, c.logger, c.manager, c.sched,
 		map[ulid.ULID]*metadata.Meta{stripped.ULID: &stripped},
-		1, metadata.NoneFunc, 1, false))
+		nil, nil, false, 1, metadata.NoneFunc, 1, false))
 
 	entry := c.journalTask(StateCompleted)
 	testutil.Assert(t, entry != nil, "the journal must record the completed downsample task")

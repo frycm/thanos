@@ -39,6 +39,21 @@ import (
 	httpserver "github.com/thanos-io/thanos/pkg/server/http"
 )
 
+// bestEffortMetaFilter runs a meta filter whose information is optional: a
+// failure is logged and that pass simply proceeds without it, instead of
+// failing the whole fetch.
+type bestEffortMetaFilter struct {
+	logger log.Logger
+	inner  block.MetadataFilter
+}
+
+func (f bestEffortMetaFilter) Filter(ctx context.Context, metas map[ulid.ULID]*metadata.Meta, synced block.GaugeVec, modified block.GaugeVec) error {
+	if err := f.inner.Filter(ctx, metas, synced, modified); err != nil {
+		level.Warn(f.logger).Log("msg", "optional meta filter failed; continuing without its information", "err", err)
+	}
+	return nil
+}
+
 type DownsampleMetrics struct {
 	downsamples        *prometheus.CounterVec
 	downsampleFailures *prometheus.CounterVec
@@ -79,6 +94,8 @@ func RunDownsample(
 	objStoreConfig *extflag.PathOrContent,
 	comp component.Component,
 	hashFunc metadata.HashFunc,
+	dedupReplicaLabels []string,
+	enableStuckBlocks bool,
 ) error {
 	confContentYaml, err := objStoreConfig.Content()
 	if err != nil {
@@ -91,12 +108,29 @@ func RunDownsample(
 	}
 	insBkt := objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(bkt, extprom.WrapRegistererWithPrefix("thanos_", reg), bkt.Name()))
 
-	// While fetching blocks, filter out blocks that were marked for no downsample.
+	// Both marker filters only gather; exclusion decisions belong to the
+	// downsample planner, which needs the marked blocks' metadata for fences
+	// and coverage when stuck-block downsampling is enabled.
 	baseBlockIDsFetcher := block.NewConcurrentLister(logger, insBkt)
-	metaFetcher, err := block.NewMetaFetcher(logger, block.FetcherConcurrency, insBkt, baseBlockIDsFetcher, "", extprom.WrapRegistererWithPrefix("thanos_", reg), []block.MetadataFilter{
+	noDownsampleMarkerFilter := downsample.NewGatherNoDownsampleMarkFilter(logger, insBkt, block.FetcherConcurrency)
+	noCompactMarkerFilter := compact.NewGatherNoCompactionMarkFilter(logger, insBkt, block.FetcherConcurrency)
+	filters := []block.MetadataFilter{
+		// The compactor plans against a replica-stripped view; the downsample
+		// planner has to see the same groups or its stuck-block verdicts
+		// diverge from what compaction will actually do.
+		block.NewReplicaLabelRemover(logger, dedupReplicaLabels),
 		block.NewDeduplicateFilter(block.FetcherConcurrency),
-		downsample.NewGatherNoDownsampleMarkFilter(logger, insBkt, block.FetcherConcurrency),
-	})
+		noDownsampleMarkerFilter,
+	}
+	if enableStuckBlocks {
+		// Best effort: the no-compact marks only make stuck-block waivers
+		// possible, and a missing mark is always the conservative direction
+		// (fewer fences, fewer waivers). Failing the whole fetch - and with it
+		// this component - over one transient marker read would be a new hard
+		// dependency this command never had.
+		filters = append(filters, bestEffortMetaFilter{logger: logger, inner: noCompactMarkerFilter})
+	}
+	metaFetcher, err := block.NewMetaFetcher(logger, block.FetcherConcurrency, insBkt, baseBlockIDsFetcher, "", extprom.WrapRegistererWithPrefix("thanos_", reg), filters)
 	if err != nil {
 		return errors.Wrap(err, "create meta fetcher")
 	}
@@ -135,7 +169,7 @@ func RunDownsample(
 					metrics.downsamples.WithLabelValues(resolutionLabel)
 					metrics.downsampleFailures.WithLabelValues(resolutionLabel)
 				}
-				if err := downsampleBucket(ctx, logger, metrics, insBkt, metas, dataDir, downsampleConcurrency, blockFilesConcurrency, hashFunc, false); err != nil {
+				if err := downsampleBucket(ctx, logger, metrics, insBkt, metas, noCompactMarkerFilter.NoCompactMarkedBlocks(), noDownsampleMarkerFilter.NoDownsampleMarkedBlocks(), enableStuckBlocks, dataDir, downsampleConcurrency, blockFilesConcurrency, hashFunc, false); err != nil {
 					return errors.Wrap(err, "downsampling failed")
 				}
 
@@ -144,7 +178,7 @@ func RunDownsample(
 				if err != nil {
 					return errors.Wrap(err, "sync before second pass of downsampling")
 				}
-				if err := downsampleBucket(ctx, logger, metrics, insBkt, metas, dataDir, downsampleConcurrency, blockFilesConcurrency, hashFunc, false); err != nil {
+				if err := downsampleBucket(ctx, logger, metrics, insBkt, metas, noCompactMarkerFilter.NoCompactMarkedBlocks(), noDownsampleMarkerFilter.NoDownsampleMarkedBlocks(), enableStuckBlocks, dataDir, downsampleConcurrency, blockFilesConcurrency, hashFunc, false); err != nil {
 					return errors.Wrap(err, "downsampling failed")
 				}
 				return nil
@@ -181,6 +215,9 @@ func downsampleBucket(
 	metrics *DownsampleMetrics,
 	bkt objstore.Bucket,
 	metas map[ulid.ULID]*metadata.Meta,
+	noCompactMarked map[ulid.ULID]*metadata.NoCompactMark,
+	noDownsampleMarked map[ulid.ULID]*metadata.NoDownsampleMark,
+	enableStuckBlocks bool,
 	dir string,
 	downsampleConcurrency int,
 	blockFilesConcurrency int,
@@ -202,7 +239,7 @@ func downsampleBucket(
 		}
 	}()
 
-	candidates, err := downsample.Plan(metas)
+	candidates, err := downsample.Plan(metas, noCompactMarked, noDownsampleMarked, enableStuckBlocks)
 	if err != nil {
 		return err
 	}
