@@ -196,6 +196,22 @@ Flags:
                                  in RFC3339 format or time duration relative
                                  to current time, such as -1d or 2h45m. Valid
                                  duration units are ms, s, m, h, d, w, y.
+      --min-block-resolution=0s  Minimum downsampling resolution of
+                                 blocks to serve, e.g. 5m. Queries have
+                                 to ask for data at this resolution
+                                 or coarser (max_source_resolution,
+                                 or --query.auto-downsampling on the querier);
+                                 a finer request is answered only from the
+                                 finer blocks this store still serves; it cannot
+                                 substitute coarser data on the client's behalf.
+                                 Blocks of a finer resolution whose data is not
+                                 covered by a retained block at this resolution
+                                 are still served, as hiding those would drop
+                                 the range entirely.
+      --max-block-resolution=1h  Maximum downsampling resolution of blocks to
+                                 serve, e.g. 5m. Blocks of a coarser resolution
+                                 are not served; make sure another store serves
+                                 them.
       --selector.relabel-config-file=<file-path>
                                  Path to YAML file with relabeling
                                  configuration that allows selecting blocks
