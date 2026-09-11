@@ -30,3 +30,11 @@ func TestStoreFlags_BlockResolutionDefaults(t *testing.T) {
 	testutil.Equals(t, time.Hour, time.Duration(conf.maxBlockResolution))
 	testutil.Equals(t, downsample.ResLevel2, time.Duration(conf.maxBlockResolution).Milliseconds())
 }
+
+func TestStoreFlags_BlockResolutionValidation(t *testing.T) {
+	testutil.Ok(t, validateBlockResolutions(0, time.Hour))
+	testutil.Ok(t, validateBlockResolutions(5*time.Minute, 5*time.Minute))
+	testutil.NotOk(t, validateBlockResolutions(time.Minute, time.Hour), "a minimum that is not a downsampling level hides nothing and must be refused")
+	testutil.NotOk(t, validateBlockResolutions(0, 2*time.Hour), "a maximum that is not a downsampling level must be refused")
+	testutil.NotOk(t, validateBlockResolutions(time.Hour, 5*time.Minute), "min above max must be refused")
+}

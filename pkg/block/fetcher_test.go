@@ -1703,6 +1703,63 @@ func TestResolutionMetaFilter_UncoveredGaugeAndBoundedLogging(t *testing.T) {
 // block straddling --max-time is still proven covered by the 5m block on the far
 // side of it, and the reporter runs after the partition, so a raw block that is
 // uncovered but not served (out of the window) raises no alarm.
+// TestResolutionMetaFilter_FallbacksTrustCoversBeyondTheView pins down what
+// FallbacksFor counts as coverage: a retained cover only once the store
+// confirms it usable, and a cover a later filter dropped from the view - the
+// far side of the time partition - unconditionally, as another store's to
+// serve. Only the blocks that hid something are covers at all.
+func TestResolutionMetaFilter_FallbacksTrustCoversBeyondTheView(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	const res5m, res1h = int64(300000), int64(3600000)
+	t1 := map[string]string{"tenant": "1"}
+	timed := func(m *metadata.Meta, mint, maxt int64) *metadata.Meta {
+		m.MinTime, m.MaxTime = mint, maxt
+		return m
+	}
+	f := NewResolutionMetaFilter(log.NewNopLogger(), res5m, res1h, nil)
+	mint := time.Unix(0, 0)
+	maxt := time.Unix(0, 100*time.Millisecond.Nanoseconds())
+	partition := NewTimePartitionMetaFilter(model.TimeOrDurationValue{Time: &mint}, model.TimeOrDurationValue{Time: &maxt})
+
+	input := map[ulid.ULID]*metadata.Meta{
+		// Raw block straddling --max-time, hidden by the two covers below.
+		ULID(1): timed(resFilterMeta(0, t1, ULIDs(1, 2)...), 50, 150),
+		ULID(2): timed(resFilterMeta(res5m, t1, ULIDs(1, 2)...), 50, 101),
+		ULID(3): timed(resFilterMeta(res5m, t1, ULIDs(1, 2)...), 101, 150),
+		// A 5m block hiding nothing is not a cover and is never verified.
+		ULID(4): timed(resFilterMeta(res5m, t1, ULIDs(7)...), 0, 50),
+	}
+	for id, m := range input {
+		m.ULID = id // Covers are identified by the ULID the metadata carries.
+	}
+	m := newTestFetcherMetrics()
+	testutil.Ok(t, f.Filter(ctx, input, m.Synced, nil))
+	testutil.Ok(t, partition.Filter(ctx, input, m.Synced, nil))
+	testutil.Equals(t, map[ulid.ULID]*metadata.Meta{ULID(2): input[ULID(2)], ULID(4): input[ULID(4)]}, input)
+	testutil.Equals(t, true, f.Replaces(ULID(2)))
+	testutil.Equals(t, true, f.Replaces(ULID(3)))
+	testutil.Equals(t, false, f.Replaces(ULID(4)))
+
+	var asked []ulid.ULID
+	usable := func(ok bool) func(*metadata.Meta) bool {
+		return func(m *metadata.Meta) bool {
+			asked = append(asked, m.ULID)
+			return ok
+		}
+	}
+	// The in-window cover loaded: nothing falls back, and only that cover was
+	// checked - the far-side cover is out of view and trusted, block 4 hides
+	// nothing.
+	testutil.Equals(t, 0, len(f.FallbacksFor(input, usable(true))))
+	testutil.Equals(t, []ulid.ULID{ULID(2)}, asked)
+	// The in-window cover failed to load: the raw block comes back.
+	asked = nil
+	testutil.Equals(t, map[ulid.ULID]*metadata.Meta{ULID(1): f.fallbacks[ULID(1)]}, f.FallbacksFor(input, usable(false)))
+	testutil.Equals(t, []ulid.ULID{ULID(2)}, asked)
+}
+
 func TestResolutionMetaFilter_CoverageAcrossTheTimePartition(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()

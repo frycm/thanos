@@ -6,6 +6,7 @@ package metadata
 import (
 	"testing"
 
+	"github.com/efficientgo/core/testutil"
 	"github.com/oklog/ulid/v2"
 )
 
@@ -51,4 +52,29 @@ func FuzzSourceCoverage(f *testing.F) {
 			}
 		}
 	})
+}
+
+func TestSourceCoverageCoveringBlocks(t *testing.T) {
+	src1, src2 := ulid.MustNew(1, nil), ulid.MustNew(2, nil)
+	block := func(id uint64, mint, maxt int64, sources ...ulid.ULID) *Meta {
+		m := &Meta{}
+		m.ULID = ulid.MustNew(id, nil)
+		m.MinTime, m.MaxTime = mint, maxt
+		m.Compaction.Sources = sources
+		return m
+	}
+	coverage := SourceCoverage{}
+	a, b, c, d := block(10, 0, 50, src1), block(11, 50, 100, src1, src2), block(12, 100, 150, src2), block(13, 0, 100, ulid.MustNew(3, nil))
+	for _, m := range []*Meta{a, b, c, d} {
+		coverage.Add(m)
+	}
+
+	raw := block(20, 0, 150, src1, src2)
+	// Every block sharing a source and touching the range, once each, and
+	// nothing from an unrelated lineage.
+	testutil.Equals(t, []ulid.ULID{a.ULID, b.ULID, c.ULID}, coverage.CoveringBlocks(raw, raw.MinTime, raw.MaxTime-1))
+	testutil.Equals(t, []ulid.ULID{a.ULID}, coverage.CoveringBlocks(raw, 0, 49))
+	testutil.Equals(t, []ulid.ULID{b.ULID, c.ULID}, coverage.CoveringBlocks(raw, 50, 149))
+	testutil.Equals(t, 0, len(coverage.CoveringBlocks(raw, 200, 300)))
+	testutil.Equals(t, 0, len(coverage.CoveringBlocks(block(21, 0, 150, ulid.MustNew(4, nil)), 0, 149)))
 }

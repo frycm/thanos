@@ -425,6 +425,9 @@ type BucketStore struct {
 	sourceCoverage            bool
 	resolutionFilter          *block.ResolutionMetaFilter
 	resolutionFallbackFilters []block.MetadataFilter
+	// replacementsVerified holds the loaded blocks whose index header was read
+	// successfully because they hide a finer block. Guarded by mtx.
+	replacementsVerified map[ulid.ULID]struct{}
 
 	// chunksLimiterFactory creates a new limiter used to limit the number of chunks fetched by each Series() call.
 	chunksLimiterFactory ChunksLimiterFactory
@@ -699,6 +702,7 @@ func NewBucketStore(
 		chunkPool:                       pool.NoopPool[byte]{},
 		blocks:                          map[ulid.ULID]*bucketBlock{},
 		blockSets:                       map[uint64]*bucketBlockSet{},
+		replacementsVerified:            map[ulid.ULID]struct{}{},
 		blockSyncConcurrency:            blockSyncConcurrency,
 		queryGate:                       gate.NewNoop(),
 		chunksLimiterFactory:            chunksLimiterFactory,
@@ -925,10 +929,15 @@ func (s *BucketStore) addBlock(ctx context.Context, meta *metadata.Meta) (err er
 	// replacement before making it selectable or using it to retire a finer
 	// fallback. An unreadable replacement must follow the normal addBlock
 	// failure path, allowing syncResolutionFallbacks to retain usable data.
-	if s.resolutionFilter != nil && meta.Thanos.Downsample.Resolution == s.resolutionFilter.MinimumResolution() {
+	// Only blocks that actually hide a finer block are read here; the rest
+	// keep their configured lazy loading, so a cold start does not pull the
+	// index header of every block at the minimum resolution.
+	verifiedReplacement := false
+	if s.resolutionFilter != nil && s.resolutionFilter.Replaces(meta.ULID) {
 		if _, err := indexHeaderReader.IndexVersion(); err != nil {
 			return errors.Wrap(err, "load resolution replacement index header")
 		}
+		verifiedReplacement = true
 	}
 
 	b, err := newBucketBlock(
@@ -967,6 +976,9 @@ func (s *BucketStore) addBlock(ctx context.Context, meta *metadata.Meta) (err er
 		return errors.Wrap(err, "add block to set")
 	}
 	s.blocks[b.meta.ULID] = b
+	if verifiedReplacement {
+		s.replacementsVerified[b.meta.ULID] = struct{}{}
+	}
 
 	s.metrics.blocksLoaded.Inc()
 	s.metrics.lastLoadedBlock.SetToCurrentTime()
@@ -980,6 +992,7 @@ func (s *BucketStore) removeBlock(id ulid.ULID) error {
 		lset := labels.FromMap(b.meta.Thanos.Labels)
 		s.blockSets[lset.Hash()].remove(id)
 		delete(s.blocks, id)
+		delete(s.replacementsVerified, id)
 	}
 	s.mtx.Unlock()
 

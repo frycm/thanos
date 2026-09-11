@@ -806,7 +806,12 @@ type ResolutionMetaFilter struct {
 	logger                       log.Logger
 	minResolution, maxResolution int64
 	mu                           sync.Mutex
-	fallbacks                    map[ulid.ULID]*metadata.Meta
+	// fallbacks are the finer blocks the latest Filter hid; covers are the
+	// blocks at the minimum resolution whose data hid at least one of them.
+	// Only covers need their index verified before a fallback is retired:
+	// every other block at the minimum resolution hides nothing.
+	fallbacks map[ulid.ULID]*metadata.Meta
+	covers    map[ulid.ULID]*metadata.Meta
 
 	// uncoveredBlocks, if set, reports how many blocks below the minimum
 	// resolution are being served for lack of coverage - the alertable form of
@@ -846,7 +851,7 @@ func (f *ResolutionMetaFilter) Reporter() MetadataFilter {
 func (f *ResolutionMetaFilter) Filter(_ context.Context, metas map[ulid.ULID]*metadata.Meta, synced GaugeVec, modified GaugeVec) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.fallbacks = nil
+	f.fallbacks, f.covers = nil, nil
 	if f.minResolution <= 0 && f.maxResolution >= coarsestResolution {
 		// Every possible resolution is in range: nothing to hide, and no
 		// coverage bookkeeping to pay for on every sync.
@@ -867,19 +872,7 @@ func (f *ResolutionMetaFilter) Filter(_ context.Context, metas map[ulid.ULID]*me
 	// them, which is the transient, safe direction.
 	var minLevelSources map[string]metadata.SourceCoverage
 	if f.minResolution > 0 {
-		minLevelSources = map[string]metadata.SourceCoverage{}
-		for _, m := range metas {
-			if m.Thanos.Downsample.Resolution != f.minResolution {
-				continue
-			}
-			key := labels.FromMap(m.Thanos.Labels).String()
-			sources, ok := minLevelSources[key]
-			if !ok {
-				sources = metadata.SourceCoverage{}
-				minLevelSources[key] = sources
-			}
-			sources.Add(m)
-		}
+		minLevelSources = coverageAtResolution(metas, f.minResolution)
 	}
 
 	for id, m := range metas {
@@ -889,14 +882,21 @@ func (f *ResolutionMetaFilter) Filter(_ context.Context, metas map[ulid.ULID]*me
 			// Hidden unconditionally: the finer blocks it was built from are
 			// served elsewhere.
 		case res < f.minResolution:
-			if !minLevelSources[labels.FromMap(m.Thanos.Labels).String()].Covers(m, m.MinTime, m.MaxTime-1) {
+			sources := minLevelSources[labels.FromMap(m.Thanos.Labels).String()]
+			if !sources.Covers(m, m.MinTime, m.MaxTime-1) {
 				// Kept and served; Reporter accounts for it.
 				continue
 			}
 			if f.fallbacks == nil {
 				f.fallbacks = map[ulid.ULID]*metadata.Meta{}
+				f.covers = map[ulid.ULID]*metadata.Meta{}
 			}
 			f.fallbacks[id] = m
+			for _, cover := range sources.CoveringBlocks(m, m.MinTime, m.MaxTime-1) {
+				if c, ok := metas[cover]; ok {
+					f.covers[cover] = c
+				}
+			}
 		default:
 			continue
 		}
@@ -906,16 +906,12 @@ func (f *ResolutionMetaFilter) Filter(_ context.Context, metas map[ulid.ULID]*me
 	return nil
 }
 
-// FallbacksFor returns finer blocks hidden by the latest fetch whose coverage
-// failed to load. Metadata alone must not evict a usable finer block. Callers
-// must apply filters that follow this filter (in particular time partitioning)
-// before loading these fallbacks.
-func (f *ResolutionMetaFilter) FallbacksFor(loaded map[ulid.ULID]*metadata.Meta) map[ulid.ULID]*metadata.Meta {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+// coverageAtResolution indexes the sources of the blocks at exactly the given
+// resolution, per external label set.
+func coverageAtResolution(metas map[ulid.ULID]*metadata.Meta, resolution int64) map[string]metadata.SourceCoverage {
 	coverage := map[string]metadata.SourceCoverage{}
-	for _, m := range loaded {
-		if m.Thanos.Downsample.Resolution != f.minResolution {
+	for _, m := range metas {
+		if m.Thanos.Downsample.Resolution != resolution {
 			continue
 		}
 		key := labels.FromMap(m.Thanos.Labels).String()
@@ -924,8 +920,49 @@ func (f *ResolutionMetaFilter) FallbacksFor(loaded map[ulid.ULID]*metadata.Meta)
 		}
 		coverage[key].Add(m)
 	}
+	return coverage
+}
+
+// Replaces reports whether the block, at the minimum resolution, hid at least
+// one finer block in the latest fetch. Only those blocks have to be verified
+// before they are relied on; the rest hide nothing.
+func (f *ResolutionMetaFilter) Replaces(id ulid.ULID) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.covers[id]
+	return ok
+}
+
+// FallbacksFor returns the finer blocks hidden by the latest fetch whose
+// coverage cannot be relied on. Metadata alone must not evict a usable finer
+// block: a cover the store retained (present in retained, the metadata that
+// survived every filter) counts only when usable reports it loaded and
+// readable. A cover that a later filter removed from retained - the time
+// partition dropping the far side of a block straddling its boundary - still
+// counts: it is another store's to serve, and this store serves the range in
+// question from the cover it did retain. Callers must apply the filters that
+// follow this filter, in particular the time partition, before loading the
+// fallbacks.
+func (f *ResolutionMetaFilter) FallbacksFor(retained map[ulid.ULID]*metadata.Meta, usable func(*metadata.Meta) bool) map[ulid.ULID]*metadata.Meta {
+	f.mu.Lock()
+	covers := make([]*metadata.Meta, 0, len(f.covers))
+	for _, m := range f.covers {
+		covers = append(covers, m)
+	}
+	hidden := make(map[ulid.ULID]*metadata.Meta, len(f.fallbacks))
+	maps.Copy(hidden, f.fallbacks)
+	f.mu.Unlock()
+
+	// usable may load an index header, so it runs without the filter's lock.
+	trusted := map[ulid.ULID]*metadata.Meta{}
+	for _, m := range covers {
+		if _, inView := retained[m.ULID]; !inView || usable(m) {
+			trusted[m.ULID] = m
+		}
+	}
+	coverage := coverageAtResolution(trusted, f.minResolution)
 	fallbacks := map[ulid.ULID]*metadata.Meta{}
-	for id, m := range f.fallbacks {
+	for id, m := range hidden {
 		if !coverage[labels.FromMap(m.Thanos.Labels).String()].Covers(m, m.MinTime, m.MaxTime-1) {
 			fallbacks[id] = m
 		}

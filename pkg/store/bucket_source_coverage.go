@@ -8,6 +8,7 @@ import (
 	"context"
 	"slices"
 
+	"github.com/go-kit/log/level"
 	"github.com/oklog/ulid/v2"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
@@ -16,26 +17,27 @@ import (
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 )
 
+// fallbackFilterGauge receives the counts of the filters re-run on fallback
+// metadata. They are not exported: the fetcher's counters describe its
+// metadata pass, and the reporter describes the served fallbacks.
+var fallbackFilterGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "fallback_filter"}, []string{"state"})
+
 // Try replacements first, then load only the fallbacks still needed. This
 // avoids loading all historical raw blocks on every cold start and preserves
 // the old blocks until a replacement was actually added to the store.
+//
+// A fallback that fails to load is tolerated the way SyncBlocks tolerates any
+// other block: the failure is logged and the sync goes on, so one unreadable
+// block neither keeps the store from becoming ready nor stops outdated blocks
+// from being dropped. The next sync retries it.
 func (s *BucketStore) syncResolutionFallbacks(ctx context.Context, metas map[ulid.ULID]*metadata.Meta) error {
 	if s.resolutionFilter == nil {
 		return nil
 	}
-	loaded := map[ulid.ULID]*metadata.Meta{}
-	for id, m := range metas {
-		if s.getBlock(id) != nil {
-			loaded[id] = m
-		}
-	}
-	fallbacks := s.resolutionFilter.FallbacksFor(loaded)
+	fallbacks := s.resolutionFilter.FallbacksFor(metas, s.usableReplacement)
 	if len(fallbacks) > 0 {
-		// These counters are not exported: the fetcher's counters describe
-		// its metadata pass; the reporter below describes the served fallback.
-		gauge := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "fallback_filter"}, []string{"state"})
 		for _, filter := range s.resolutionFallbackFilters {
-			if err := filter.Filter(ctx, fallbacks, gauge, gauge); err != nil {
+			if err := filter.Filter(ctx, fallbacks, fallbackFilterGauge, fallbackFilterGauge); err != nil {
 				return errors.Wrap(err, "filter resolution fallbacks")
 			}
 		}
@@ -45,14 +47,47 @@ func (s *BucketStore) syncResolutionFallbacks(ctx context.Context, metas map[uli
 				continue
 			}
 			if err := s.blockLifecycleCallback.PreAdd(*m); err != nil {
-				return errors.Wrap(err, "prepare resolution fallback")
+				level.Warn(s.logger).Log("msg", "resolution fallback rejected by the block lifecycle callback", "block", id, "err", err)
+				continue
 			}
 			if err := s.addBlock(ctx, m); err != nil {
-				return errors.Wrap(err, "load resolution fallback")
+				level.Warn(s.logger).Log("msg", "loading resolution fallback failed; its range stays unserved until the next sync", "block", id, "err", err)
+				continue
 			}
 		}
 	}
 	return s.resolutionFilter.Reporter().Filter(ctx, metas, nil, nil)
+}
+
+// usableReplacement reports whether a cover is loaded and its index header
+// readable, so a finer block may be retired behind it. Blocks that hid
+// something when they were added were verified then; a block loaded before
+// it became a cover is verified now, once. One that fails is dropped from the
+// store so it is not selected, and the sync that re-adds it verifies again.
+func (s *BucketStore) usableReplacement(m *metadata.Meta) bool {
+	b := s.getBlock(m.ULID)
+	if b == nil {
+		return false
+	}
+	s.mtx.RLock()
+	_, verified := s.replacementsVerified[m.ULID]
+	s.mtx.RUnlock()
+	if verified {
+		return true
+	}
+	if _, err := b.indexHeaderReader.IndexVersion(); err != nil {
+		level.Warn(s.logger).Log("msg", "resolution replacement has an unreadable index header; serving the finer blocks instead", "block", m.ULID, "err", err)
+		if err := s.removeBlock(m.ULID); err != nil {
+			level.Warn(s.logger).Log("msg", "drop of unreadable resolution replacement failed", "block", m.ULID, "err", err)
+		}
+		return false
+	}
+	s.mtx.Lock()
+	if _, stillLoaded := s.blocks[m.ULID]; stillLoaded {
+		s.replacementsVerified[m.ULID] = struct{}{}
+	}
+	s.mtx.Unlock()
+	return true
 }
 
 // getForSourceCoverage runs under s.mtx. The resolution filter can retain a
