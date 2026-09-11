@@ -73,3 +73,14 @@ Use the [trial procedure](distributed-compaction-trial.md) before production
 cutover. Query old and new data through the production-style store/query path,
 including counter resets, replica gaps, native histograms if used and any
 backfill/out-of-order ingestion configuration.
+
+## Opt-in stuck-block downsampling
+
+The shared publication, recovery, native-histogram and process tests above also
+run on this stack. `--downsampling.enable-stuck-blocks` remains off by default.
+Planner tests cover eligibility at both resolution levels, marker reasons,
+permanent fences, overlapping replicas, target-resolution overlap and the
+flag-off policy. The fault scenarios exercise the stuck corpus with the flag
+off and on. `TestPlanStuckBlockLateArrival` checks that late input first waits
+for compaction and is then included in replacement downsampled coverage; an
+older downsample must not hide the newly arrived source.

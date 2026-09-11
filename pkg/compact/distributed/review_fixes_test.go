@@ -565,7 +565,7 @@ func TestDispatchDownsamplingRecordsFailures(t *testing.T) {
 
 	failures := prometheus.NewCounterVec(prometheus.CounterOpts{Name: "test_ds_failures"}, []string{"resolution"})
 	err = DispatchDownsampling(context.Background(), log.NewNopLogger(), bkt, sched,
-		map[ulid.ULID]*metadata.Meta{m.ULID: m}, 1, metadata.NoneFunc, 1, false, nil, failures)
+		map[ulid.ULID]*metadata.Meta{m.ULID: m}, nil, nil, false, 1, metadata.NoneFunc, 1, false, nil, failures)
 	testutil.NotOk(t, err)
 	testutil.Equals(t, 1.0, promtestutil.ToFloat64(failures.WithLabelValues(m.Thanos.ResolutionString())))
 }
@@ -781,7 +781,7 @@ func TestDispatchDownsamplingRefusesOversizedBlocks(t *testing.T) {
 	// No worker exists; if the gate failed, Dispatch would hang on Submit's
 	// result channel, so returning at all proves the refusal.
 	testutil.Ok(t, DispatchDownsampling(context.Background(), log.NewNopLogger(), bkt, sched,
-		map[ulid.ULID]*metadata.Meta{m.ULID: m}, 1, metadata.NoneFunc, 1, false, nil, nil))
+		map[ulid.ULID]*metadata.Meta{m.ULID: m}, nil, nil, false, 1, metadata.NoneFunc, 1, false, nil, nil))
 
 	j, err := ReadJournal(context.Background(), bkt, "shard-ds-big")
 	testutil.Ok(t, err)
