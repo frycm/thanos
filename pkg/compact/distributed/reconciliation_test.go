@@ -119,6 +119,127 @@ func TestWorkerResourceErrorsDoNotHaltManager(t *testing.T) {
 	}
 	outcome, _ := ClassifyError(compact.NewHaltError(errors.New("invalid index")))
 	testutil.Equals(t, OutcomeFailedHalt, outcome)
+
+	// A path error is not evidence of a sick worker: a source block whose
+	// index object is missing or truncated fails with ENOENT or EINVAL from
+	// the bucket's side, and that has to stay the halt the compactor raised,
+	// or the group is silently replanned every pass instead of being seen.
+	for _, err := range []error{
+		&os.PathError{Op: "open", Path: "index", Err: syscall.ENOENT},
+		syscall.EINVAL,
+		&os.PathError{Op: "mmap", Path: "index", Err: syscall.EINVAL},
+	} {
+		outcome, _ := ClassifyError(compact.NewHaltError(err))
+		testutil.Equals(t, OutcomeFailedHalt, outcome)
+	}
+}
+
+// TestLeaseExpiredDuringPersistLeavesNoDuplicateQueueEntry pins down that a
+// lease requeued by expiry while its own journal write is still in flight ends
+// up in the queue exactly once. The Lease call releases the state lock for the
+// write, so expiry can run in between; a second copy of the id would never be
+// removed and would inflate the queue metrics forever.
+func TestLeaseExpiredDuringPersistLeavesNoDuplicateQueueEntry(t *testing.T) {
+	bkt := &hookBucket{Bucket: objstore.NewInMemBucket()}
+	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
+		JournalID:   "shard-dup",
+		LeaseTTL:    20 * time.Millisecond,
+		MaxAttempts: 3,
+	})
+	testutil.Ok(t, err)
+	_, err = sched.Submit(context.Background(), Task{ID: "t-dup", Type: TaskCompaction})
+	testutil.Ok(t, err)
+
+	uploadStarted := make(chan struct{}, 1)
+	release := make(chan struct{})
+	bkt.mtx.Lock()
+	bkt.onUpload = func(_ context.Context, name string) error {
+		if strings.HasPrefix(name, JournalPrefix) {
+			select {
+			case uploadStarted <- struct{}{}:
+			default:
+			}
+			<-release
+		}
+		return nil
+	}
+	bkt.mtx.Unlock()
+
+	leased := make(chan error, 1)
+	go func() {
+		_, err := sched.Lease(context.Background(), LeaseRequest{WorkerID: "w1", Accepts: []TaskType{TaskCompaction}})
+		leased <- err
+	}()
+	<-uploadStarted
+
+	// The lease lapses while its journal write hangs; the next maintenance
+	// pass requeues the task behind the writer's back.
+	time.Sleep(50 * time.Millisecond)
+	maintained := make(chan error, 1)
+	go func() { maintained <- sched.Maintain() }()
+	// Maintain's own journal write queues up behind the hanging one.
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	testutil.Ok(t, <-maintained)
+
+	err = <-leased
+	testutil.NotOk(t, err)
+	testutil.Assert(t, compact.IsRetryError(err), "a lease that changed underneath its persist must be retryable, got %v", err)
+
+	sched.mtx.Lock()
+	defer sched.mtx.Unlock()
+	testutil.Equals(t, []string{"t-dup"}, sched.queue)
+	testutil.Equals(t, StatePending, sched.tasks["t-dup"].entry.State)
+}
+
+// TestWorkerShutdownAbortsAreNotChargedOrBackedOff pins down that a graceful
+// worker shutdown neither eats into the abort budget nor delays the requeue:
+// the operator restarted the worker, the task did nothing wrong, and a
+// long-running task must survive an arbitrary number of rolling restarts.
+func TestWorkerShutdownAbortsAreNotChargedOrBackedOff(t *testing.T) {
+	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), objstore.NewInMemBucket(), prometheus.NewRegistry(), ManagerConfig{
+		JournalID:   "shard-restart",
+		LeaseTTL:    time.Hour, // Any backoff would be visible as an unleaseable task.
+		MaxAttempts: 3,
+	})
+	testutil.Ok(t, err)
+	resultCh, err := sched.Submit(context.Background(), Task{ID: "t-restart", Type: TaskCompaction})
+	testutil.Ok(t, err)
+
+	for range abortCapFor(3) + 1 {
+		task, err := sched.Lease(context.Background(), LeaseRequest{WorkerID: "w1", Accepts: []TaskType{TaskCompaction}})
+		testutil.Ok(t, err)
+		testutil.Assert(t, task != nil, "the task must be leaseable again immediately after a shutdown abort")
+		testutil.Ok(t, sched.Report(context.Background(), Result{
+			TaskID: task.ID, LeaseToken: task.LeaseToken, Generation: task.Generation,
+			Outcome: OutcomeAbortedWorkerShutdown, ErrorMessage: "rolling restart",
+		}))
+	}
+	select {
+	case res := <-resultCh:
+		t.Fatalf("shutdown aborts must not fail the task, got %v", res)
+	default:
+	}
+	sched.mtx.Lock()
+	entry := sched.tasks["t-restart"].entry
+	testutil.Equals(t, 0, entry.Aborts)
+	testutil.Equals(t, 0, entry.Attempts)
+	testutil.Equals(t, StatePending, entry.State)
+	sched.mtx.Unlock()
+
+	// Every other abort kind still counts and backs off.
+	task, err := sched.Lease(context.Background(), LeaseRequest{WorkerID: "w1", Accepts: []TaskType{TaskCompaction}})
+	testutil.Ok(t, err)
+	testutil.Ok(t, sched.Report(context.Background(), Result{
+		TaskID: task.ID, LeaseToken: task.LeaseToken, Generation: task.Generation,
+		Outcome: OutcomeAbortedStoreUnreachable, ErrorMessage: "journal unreadable",
+	}))
+	task, err = sched.Lease(context.Background(), LeaseRequest{WorkerID: "w1", Accepts: []TaskType{TaskCompaction}})
+	testutil.Ok(t, err)
+	testutil.Assert(t, task == nil, "a store-unreachable abort must back the task off")
+	sched.mtx.Lock()
+	testutil.Equals(t, 1, sched.tasks["t-restart"].entry.Aborts)
+	sched.mtx.Unlock()
 }
 
 func TestParkedSourcesRemainParkedWhenPlanGrows(t *testing.T) {

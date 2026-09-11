@@ -299,7 +299,7 @@ func (s *Scheduler) Submit(ctx context.Context, task Task) (<-chan Result, error
 	}
 	s.journal.Tasks[task.ID] = entry
 	s.tasks[task.ID] = pending
-	s.queue = append(s.queue, task.ID)
+	s.enqueueLocked(task.ID)
 
 	// The state lock is released while the journal is written, so by the time
 	// the write returns, the task may have been leased, and other tasks may
@@ -398,6 +398,12 @@ func (s *Scheduler) Lease(ctx context.Context, req LeaseRequest) (*Task, error) 
 		p.entry.UpdatedAt = now
 		p.leasedAt = now
 		s.m.tasksInFlight.WithLabelValues(string(p.entry.Task.Type)).Inc()
+		// Leave the queue before the lock is released: a lease that expires
+		// while the journal is being written is requeued by expireLeasesLocked,
+		// and that must not find a stale copy of the id still in the queue.
+		if qi := slices.Index(s.queue, id); qi >= 0 {
+			s.queue = slices.Delete(s.queue, qi, qi+1)
+		}
 
 		if err := s.persistLocked(ctx); err != nil {
 			if s.tasks[id] == p && p.entry.State == StateLeased && p.entry.Lease != nil && p.entry.Lease.Token == token {
@@ -405,17 +411,12 @@ func (s *Scheduler) Lease(ctx context.Context, req LeaseRequest) (*Task, error) 
 				p.entry.Attempts--
 				p.entry.Lease = nil
 				s.m.tasksInFlight.WithLabelValues(string(p.entry.Task.Type)).Dec()
+				s.enqueueLocked(id)
 			}
 			return nil, err
 		}
 		if s.tasks[id] != p || p.entry.State != StateLeased || p.entry.Lease == nil || p.entry.Lease.Token != token {
 			return nil, compact.NewRetryError(errors.New("lease changed while persisting it"))
-		}
-
-		// The lock was released during the persist, so the index may be stale:
-		// remove the id wherever it sits now.
-		if qi := slices.Index(s.queue, id); qi >= 0 {
-			s.queue = slices.Delete(s.queue, qi, qi+1)
 		}
 		s.updateQueueMetricsLocked()
 
@@ -483,17 +484,27 @@ func (s *Scheduler) Report(ctx context.Context, res Result) error {
 		p.entry.State = StateCompleted
 		p.entry.Outputs = res.OutputBlocks
 		p.entry.OutputChecksums = res.OutputChecksums
+	case res.Outcome == OutcomeAbortedWorkerShutdown:
+		// The operator stopped the worker; the task itself did nothing wrong.
+		// It goes straight back to the queue: neither the attempt nor the
+		// abort budget is charged, and there is nothing to back off from. A
+		// fleet that never lives long enough to finish a task is still caught
+		// by lease expiry, which does charge attempts.
+		p.entry.Attempts--
+		p.entry.LastError = &TaskError{Outcome: res.Outcome, Message: res.ErrorMessage}
+		p.entry.State = StatePending
+		s.enqueueLocked(res.TaskID)
 	case res.Outcome.Aborted():
 		// The worker threw its work away, so this is not a failed attempt.
 		p.entry.Attempts--
 		p.entry.Aborts++
 		p.entry.LastError = &TaskError{Outcome: res.Outcome, Message: res.ErrorMessage}
 		if p.entry.Aborts >= abortCapFor(s.conf.MaxAttempts) {
-			// Every abort is benign in isolation, but an unbounded streak means
-			// something structural - a journal the workers cannot read, a fleet
-			// that never lives long enough - and requeueing would retry forever
-			// while the submitter waits with no timeout. Fail the task so the
-			// pass completes and the streak becomes visible.
+			// Every abort is benign in isolation, but this many over the task's
+			// lifetime means something structural - a journal the workers
+			// cannot read, a lease that keeps being lost - and requeueing would
+			// retry forever while the submitter waits with no timeout. Fail the
+			// task so the pass completes and the pattern becomes visible.
 			p.entry.State = StateAbandoned
 			s.m.abandonedTasks.Inc()
 			res = Result{
@@ -501,7 +512,7 @@ func (s *Scheduler) Report(ctx context.Context, res Result) error {
 				LeaseToken: res.LeaseToken,
 				Generation: res.Generation,
 				Outcome:    OutcomeFailedRetryable,
-				ErrorMessage: errors.Errorf("task was aborted %d times in a row without completing (last abort: %s: %s); "+
+				ErrorMessage: errors.Errorf("task was aborted %d times without completing (last abort: %s: %s); "+
 					"investigate why workers keep discarding it", p.entry.Aborts, p.entry.LastError.Outcome, p.entry.LastError.Message).Error(),
 			}
 			p.entry.LastError = &TaskError{Outcome: res.Outcome, Message: res.ErrorMessage}
@@ -510,7 +521,7 @@ func (s *Scheduler) Report(ctx context.Context, res Result) error {
 			// Back off before handing it out again, so a task that is aborted
 			// the moment it is leased does not churn through the fleet.
 			p.notBefore = now.Add(abortRequeueBackoff(p.entry.Aborts, s.conf.LeaseTTL))
-			s.queue = append(s.queue, res.TaskID)
+			s.enqueueLocked(res.TaskID)
 		}
 	case res.Outcome == OutcomeFailedRetryable:
 		p.entry.LastError = &TaskError{Outcome: res.Outcome, Block: res.OffendingBlock, Message: res.ErrorMessage}
@@ -518,7 +529,7 @@ func (s *Scheduler) Report(ctx context.Context, res Result) error {
 			p.entry.State = StateFailed
 		} else {
 			p.entry.State = StatePending
-			s.queue = append(s.queue, res.TaskID)
+			s.enqueueLocked(res.TaskID)
 		}
 	default:
 		// Halt, issue347 and out-of-order-chunks are not transient: each demands
@@ -546,8 +557,19 @@ func (s *Scheduler) Report(ctx context.Context, res Result) error {
 		// manager's control loop would verify the result and keep compacting a
 		// shard somebody else manages. Only ordinary write failures get the
 		// best-effort delivery above.
-		p.entry.State = StateFailed
-		s.m.tasksTotal.WithLabelValues(string(p.entry.Task.Type), string(OutcomeFailedHalt)).Inc()
+		//
+		// The lock was released during the persist: the task may have been
+		// re-leased or finished meanwhile, so only touch it if it is still the
+		// entry this report was for, and give back the in-flight slot a new
+		// lease took.
+		if s.tasks[res.TaskID] == p {
+			if p.entry.State == StateLeased {
+				s.m.tasksInFlight.WithLabelValues(string(p.entry.Task.Type)).Dec()
+			}
+			p.entry.State = StateFailed
+			p.entry.Lease = nil
+			s.m.tasksTotal.WithLabelValues(string(p.entry.Task.Type), string(OutcomeFailedHalt)).Inc()
+		}
 		s.finishLocked(res.TaskID, Result{
 			TaskID:       res.TaskID,
 			Outcome:      OutcomeFailedHalt,
@@ -620,6 +642,17 @@ func (s *Scheduler) SourcesParked(sources []string) bool {
 	return false
 }
 
+// enqueueLocked appends a task to the queue unless it is already waiting. The
+// state lock is released while the journal is written, so a task can be
+// requeued by lease expiry while the Lease that took it out is still
+// persisting; without this guard the id would sit in the queue twice and the
+// second copy would never be removed.
+func (s *Scheduler) enqueueLocked(id string) {
+	if !slices.Contains(s.queue, id) {
+		s.queue = append(s.queue, id)
+	}
+}
+
 // finishLocked delivers a terminal result to the submitter and forgets the task.
 func (s *Scheduler) finishLocked(taskID string, res Result) {
 	p, ok := s.tasks[taskID]
@@ -671,7 +704,7 @@ func (s *Scheduler) expireLeasesLocked() {
 		}
 
 		p.entry.State = StatePending
-		s.queue = append(s.queue, id)
+		s.enqueueLocked(id)
 	}
 
 	if dirty {
