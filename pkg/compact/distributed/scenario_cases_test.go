@@ -240,6 +240,12 @@ func scenarios() []scenario {
 				// The operator raises the limit and unparks.
 				c := s.conf
 				c.maxTaskSeries = 0
+				// This is an orderly configuration change, not the concurrent
+				// takeover exercised by the separate split-brain scenarios. Drain
+				// the old journal writer before constructing its successor.
+				old := s.currentManager()
+				old.stop()
+				<-old.maintenanceDone
 				s.replaceManager(c)
 				testutil.Assert(t, unparkAll(t, s) > 0, "nothing to unpark")
 				s.waitFor("the parked entries to be dropped", func() bool { return len(s.tasksInState(StateOversized)) == 0 })

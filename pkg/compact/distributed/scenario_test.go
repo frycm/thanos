@@ -598,6 +598,9 @@ type node struct {
 	// halted is set when the maintenance loop found a halt condition, which
 	// ends the binary's process.
 	halted atomic.Bool
+	// Closed after the maintenance writer exits, so an orderly configuration
+	// change can obey the same single-manager contract as a deployment.
+	maintenanceDone chan struct{}
 
 	// ctx is the node's lifetime; stop ends it, and with it any pass.
 	ctx  context.Context
@@ -688,7 +691,9 @@ func newNode(t *testing.T, shared objstore.Bucket, handler *switchableHandler, c
 
 		// The maintenance loop of the binary: expire leases, prune, unpark.
 		// A halt found here ends the manager, as it ends the process.
+		n.maintenanceDone = make(chan struct{})
 		go func() {
+			defer close(n.maintenanceDone)
 			_ = runutil.Repeat(conf.leaseTTL/4, ctx.Done(), func() error {
 				err := n.sched.Maintain()
 				if err == nil {
