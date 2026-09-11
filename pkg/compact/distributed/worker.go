@@ -50,13 +50,18 @@ type WorkerConfig struct {
 	HeartbeatInterval time.Duration
 }
 
+// DefaultWorkerID is the worker identity used when none is configured: the
+// host name, which is unique per pod, with a random fallback.
+func DefaultWorkerID() string {
+	if host, err := os.Hostname(); err == nil && host != "" {
+		return host
+	}
+	return ulid.Make().String()
+}
+
 func (c *WorkerConfig) applyDefaults() {
 	if c.WorkerID == "" {
-		if host, err := os.Hostname(); err == nil {
-			c.WorkerID = host
-		} else {
-			c.WorkerID = ulid.Make().String()
-		}
+		c.WorkerID = DefaultWorkerID()
 	}
 	if c.PollInterval <= 0 {
 		c.PollInterval = 5 * time.Second
@@ -410,8 +415,10 @@ func (w *Worker) execute(ctx context.Context, task Task, acknowledged *atomic.Bo
 	return w.completeResult(ctx, res, compIDs, acknowledged)
 }
 
-// DataDir belongs to one worker process. Only its ULID task directories are
-// removed on startup; unrelated files and symlinks are left alone.
+// DataDir belongs to one worker process - the command scopes it by worker ID
+// under the shared data directory, so two workers or a co-located manager
+// never see each other's files. Only its ULID task directories are removed on
+// startup; unrelated files and symlinks are left alone.
 func (w *Worker) cleanTaskDirectories() error {
 	entries, err := os.ReadDir(w.conf.DataDir)
 	if os.IsNotExist(err) {
