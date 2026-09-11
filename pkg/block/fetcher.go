@@ -827,6 +827,11 @@ func NewResolutionMetaFilter(logger log.Logger, minResolution, maxResolution int
 	return &ResolutionMetaFilter{logger: logger, minResolution: minResolution, maxResolution: maxResolution, uncoveredBlocks: uncoveredBlocks}
 }
 
+// MinimumResolution is the resolution whose blocks may replace finer fallbacks.
+func (f *ResolutionMetaFilter) MinimumResolution() int64 {
+	return f.minResolution
+}
+
 // Reporter returns the filter that reports (gauge and log) the blocks below
 // the minimum resolution still being served. It removes nothing. It has to run
 // LAST, after the time partition in particular: the resolution filter keeps a

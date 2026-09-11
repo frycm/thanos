@@ -921,6 +921,16 @@ func (s *BucketStore) addBlock(ctx context.Context, meta *metadata.Meta) (err er
 		}
 	}()
 
+	// A lazy reader can be constructed without reading the index. Verify a
+	// replacement before making it selectable or using it to retire a finer
+	// fallback. An unreadable replacement must follow the normal addBlock
+	// failure path, allowing syncResolutionFallbacks to retain usable data.
+	if s.resolutionFilter != nil && meta.Thanos.Downsample.Resolution == s.resolutionFilter.MinimumResolution() {
+		if _, err := indexHeaderReader.IndexVersion(); err != nil {
+			return errors.Wrap(err, "load resolution replacement index header")
+		}
+	}
+
 	b, err := newBucketBlock(
 		ctx,
 		s.metrics,

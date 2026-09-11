@@ -22,6 +22,7 @@ import (
 	"github.com/thanos-io/objstore"
 
 	"github.com/thanos-io/thanos/pkg/block"
+	"github.com/thanos-io/thanos/pkg/block/indexheader"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/compact/downsample"
 	"github.com/thanos-io/thanos/pkg/logutil"
@@ -72,53 +73,71 @@ func (b *unavailableIndexBucket) GetRange(ctx context.Context, name string, off,
 }
 
 func TestResolutionFallbackSurvivesReplacementLoadFailure(t *testing.T) {
-	for _, warm := range []bool{false, true} {
-		t.Run(map[bool]string{false: "cold start", true: "already serving raw"}[warm], func(t *testing.T) {
-			ctx := t.Context()
-			logger := log.NewNopLogger()
-			fault := &unavailableIndexBucket{Bucket: objstore.NewInMemBucket()}
-			bkt := objstore.WithNoopInstr(fault)
-			dir := t.TempDir()
-			id, err := e2eutil.CreateBlock(ctx, dir, []labels.Labels{labels.FromStrings("__name__", "up")}, 20,
-				0, 3600000, labels.FromStrings("tenant", "one"), 0, metadata.NoneFunc, nil)
-			testutil.Ok(t, err)
-			testutil.Ok(t, block.Upload(ctx, logger, bkt, filepath.Join(dir, id.String()), metadata.NoneFunc))
-			m, err := metadata.ReadFromDir(filepath.Join(dir, id.String()))
-			testutil.Ok(t, err)
-			input, err := tsdb.OpenBlock(logutil.GoKitLogToSlog(logger), filepath.Join(dir, id.String()), nil, nil)
-			testutil.Ok(t, err)
-			coarseID, err := downsample.Downsample(ctx, logger, m, input, dir, downsample.ResLevel1)
-			testutil.Ok(t, err)
-			testutil.Ok(t, input.Close())
+	for _, reader := range []struct {
+		name     string
+		lazy     bool
+		download indexheader.LazyDownloadIndexHeaderFunc
+	}{
+		{"eager", false, indexheader.AlwaysEagerDownloadIndexHeader},
+		{"lazy mmap", true, indexheader.AlwaysEagerDownloadIndexHeader},
+		{"lazy download", true, indexheader.AlwaysLazyDownloadIndexHeader},
+	} {
+		t.Run(reader.name, func(t *testing.T) {
+			for _, warm := range []bool{false, true} {
+				t.Run(map[bool]string{false: "cold start", true: "already serving raw"}[warm], func(t *testing.T) {
+					ctx := t.Context()
+					logger := log.NewNopLogger()
+					fault := &unavailableIndexBucket{Bucket: objstore.NewInMemBucket()}
+					bkt := objstore.WithNoopInstr(fault)
+					dir := t.TempDir()
+					id, err := e2eutil.CreateBlock(ctx, dir, []labels.Labels{labels.FromStrings("__name__", "up")}, 20,
+						0, 3600000, labels.FromStrings("tenant", "one"), 0, metadata.NoneFunc, nil)
+					testutil.Ok(t, err)
+					testutil.Ok(t, block.Upload(ctx, logger, bkt, filepath.Join(dir, id.String()), metadata.NoneFunc))
+					m, err := metadata.ReadFromDir(filepath.Join(dir, id.String()))
+					testutil.Ok(t, err)
+					input, err := tsdb.OpenBlock(logutil.GoKitLogToSlog(logger), filepath.Join(dir, id.String()), nil, nil)
+					testutil.Ok(t, err)
+					coarseID, err := downsample.Downsample(ctx, logger, m, input, dir, downsample.ResLevel1)
+					testutil.Ok(t, err)
+					testutil.Ok(t, input.Close())
 
-			filter := block.NewResolutionMetaFilter(logger, downsample.ResLevel1, downsample.ResLevel2, nil)
-			fetcher, err := block.NewMetaFetcher(logger, 1, bkt, block.NewConcurrentLister(logger, bkt), "", nil, []block.MetadataFilter{filter})
-			testutil.Ok(t, err)
-			fault.prefix, fault.fail = coarseID.String()+"/", true
-			s, err := NewBucketStore(bkt, fetcher, t.TempDir(), NewChunksLimiterFactory(1000), NewSeriesLimiterFactory(0), NewBytesLimiterFactory(0),
-				NewGapBasedPartitioner(PartitionerMaxGapSize), 1, false, DefaultPostingOffsetInMemorySampling, false, false, 0,
-				WithResolutionFilter(filter))
-			testutil.Ok(t, err)
-			t.Cleanup(func() { testutil.Ok(t, s.Close()) })
-			if warm {
-				testutil.Ok(t, s.SyncBlocks(ctx))
-				testutil.Assert(t, s.getBlock(id) != nil, "raw must initially be served")
+					filter := block.NewResolutionMetaFilter(logger, downsample.ResLevel1, downsample.ResLevel2, nil)
+					fetcher, err := block.NewMetaFetcher(logger, 1, bkt, block.NewConcurrentLister(logger, bkt), "", nil, []block.MetadataFilter{filter})
+					testutil.Ok(t, err)
+					fault.prefix, fault.fail = coarseID.String()+"/", true
+					s, err := NewBucketStore(bkt, fetcher, t.TempDir(), NewChunksLimiterFactory(1000), NewSeriesLimiterFactory(0), NewBytesLimiterFactory(0),
+						NewGapBasedPartitioner(PartitionerMaxGapSize), 1, false, DefaultPostingOffsetInMemorySampling, false, reader.lazy, 0,
+						WithIndexHeaderLazyDownloadStrategy(reader.download), WithResolutionFilter(filter))
+					testutil.Ok(t, err)
+					t.Cleanup(func() { testutil.Ok(t, s.Close()) })
+					if warm {
+						testutil.Ok(t, s.SyncBlocks(ctx))
+						testutil.Assert(t, s.getBlock(id) != nil, "raw must initially be served")
+					}
+					testutil.Ok(t, block.Upload(ctx, logger, bkt, filepath.Join(dir, coarseID.String()), metadata.NoneFunc))
+					testutil.Ok(t, s.SyncBlocks(ctx))
+					testutil.Assert(t, s.getBlock(coarseID) == nil, "replacement load must fail")
+					testutil.Assert(t, fault.hits > 0, "the replacement index read must fail")
+					testutil.Assert(t, s.getBlock(id) != nil, "a failed replacement must not hide available raw samples")
+					fallback := s.getBlock(id)
+					_, err = fallback.indexHeaderReader.IndexVersion()
+					testutil.Ok(t, err)
+					selected := s.blockSets[fallback.extLset.Hash()].getFor(0, 3599999, downsample.ResLevel1, nil)
+					testutil.Equals(t, 1, len(selected))
+					testutil.Equals(t, id, selected[0].meta.ULID)
+
+					fault.fail = false
+					testutil.Ok(t, s.SyncBlocks(ctx))
+					testutil.Assert(t, s.getBlock(coarseID) != nil, "replacement must load after recovery")
+					testutil.Ok(t, s.SyncBlocks(ctx))
+					testutil.Assert(t, s.getBlock(id) == nil, "loaded coverage may now replace raw")
+					// Losing the replacement must bring the still-retained raw block back.
+					testutil.Ok(t, block.Delete(ctx, logger, bkt, coarseID))
+					testutil.Ok(t, s.SyncBlocks(ctx))
+					testutil.Assert(t, s.getBlock(id) != nil, "raw must return when downsampled coverage disappears")
+				})
 			}
-			testutil.Ok(t, block.Upload(ctx, logger, bkt, filepath.Join(dir, coarseID.String()), metadata.NoneFunc))
-			testutil.Ok(t, s.SyncBlocks(ctx))
-			testutil.Assert(t, s.getBlock(coarseID) == nil, "replacement load must fail")
-			testutil.Assert(t, fault.hits > 0, "the replacement index read must fail")
-			testutil.Assert(t, s.getBlock(id) != nil, "a failed replacement must not hide available raw samples")
-
-			fault.fail = false
-			testutil.Ok(t, s.SyncBlocks(ctx))
-			testutil.Assert(t, s.getBlock(coarseID) != nil, "replacement must load after recovery")
-			testutil.Ok(t, s.SyncBlocks(ctx))
-			testutil.Assert(t, s.getBlock(id) == nil, "loaded coverage may now replace raw")
-			// Losing the replacement must bring the still-retained raw block back.
-			testutil.Ok(t, block.Delete(ctx, logger, bkt, coarseID))
-			testutil.Ok(t, s.SyncBlocks(ctx))
-			testutil.Assert(t, s.getBlock(id) != nil, "raw must return when downsampled coverage disappears")
 		})
 	}
 }

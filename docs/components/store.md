@@ -51,6 +51,9 @@ Coverage advertised by metadata is not enough to remove a fallback. The store
 first attempts to load replacements, then loads or retains the finer blocks
 still needed when a replacement fails to load. This also applies on cold start,
 without eagerly loading all raw blocks when replacements load successfully.
+Blocks at the configured minimum resolution have their index headers checked
+before becoming selectable, including when lazy index downloading is enabled.
+Other blocks retain their configured lazy-loading behavior.
 Fallbacks obey the same time partition. When coverage disappears from the
 bucket, retained finer data becomes eligible again on the next successful sync.
 
