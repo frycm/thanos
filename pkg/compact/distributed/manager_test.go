@@ -123,7 +123,15 @@ func TestSchedulerAbortedResultDoesNotCountAsAttempt(t *testing.T) {
 
 			again, err := s.Lease(ctx, LeaseRequest{WorkerID: "w2"})
 			testutil.Ok(t, err)
+			if outcome == OutcomeAbortedWorkerShutdown {
+				// A restarted worker is the operator's doing, not the task's:
+				// no backoff, and the abort budget is untouched.
+				testutil.Assert(t, again != nil, "a task aborted by a worker shutdown must be available again at once")
+				testutil.Equals(t, 0, j.Tasks["t1"].Aborts)
+				return
+			}
 			testutil.Assert(t, again == nil, "aborted tasks must back off before requeueing")
+			testutil.Equals(t, 1, j.Tasks["t1"].Aborts)
 			s.mtx.Lock()
 			s.tasks["t1"].notBefore = time.Time{}
 			s.mtx.Unlock()

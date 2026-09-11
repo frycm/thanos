@@ -4,13 +4,36 @@
 package distributed
 
 import (
-	"github.com/oklog/ulid/v2"
-	"github.com/pkg/errors"
 	"os"
 	"syscall"
 
+	"github.com/oklog/ulid/v2"
+	"github.com/pkg/errors"
+
 	"github.com/thanos-io/thanos/pkg/compact"
 )
+
+// isLocalResourceError reports whether the error chain bottoms out in a
+// condition of the worker's own machine - a full or read-only disk, exhausted
+// file descriptors or memory - rather than in the data it was given. Only
+// those are safe to retry elsewhere: a missing or truncated index also
+// surfaces as a path error (ENOENT, EINVAL from mmap), but that is the
+// bucket's problem and has to keep the halt class the compactor gave it.
+func isLocalResourceError(err error) bool {
+	var errno syscall.Errno
+	if !errors.As(err, &errno) {
+		var pathErr *os.PathError
+		if !errors.As(err, &pathErr) || !errors.As(pathErr.Err, &errno) {
+			return false
+		}
+	}
+	switch errno {
+	case syscall.ENOSPC, syscall.EDQUOT, syscall.EROFS, syscall.EIO,
+		syscall.EMFILE, syscall.ENFILE, syscall.ENOMEM, syscall.EAGAIN:
+		return true
+	}
+	return false
+}
 
 // ClassifyError maps an error raised while executing a task onto the outcome
 // reported to the manager. The classes mirror the compact package's own error
@@ -19,11 +42,9 @@ func ClassifyError(err error) (Outcome, string) {
 	if err == nil {
 		return OutcomeCompleted, ""
 	}
-	// Local filesystem/resource failures can be wrapped as halts by TSDB.
-	// Retry them on a worker instead of halting the entire shard.
-	var pathErr *os.PathError
-	var errno syscall.Errno
-	if errors.As(err, &pathErr) || errors.As(err, &errno) {
+	// A full disk or an exhausted process on one worker is wrapped as a halt
+	// by TSDB. Retry it on another worker instead of halting the whole shard.
+	if isLocalResourceError(err) {
 		return OutcomeFailedRetryable, ""
 	}
 

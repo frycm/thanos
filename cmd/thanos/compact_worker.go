@@ -102,7 +102,14 @@ func runCompactWorker(
 		return errors.Wrap(err, "create compactor")
 	}
 
-	workerDir := path.Join(conf.dataDir, "compact")
+	// Every worker gets its own directory: the startup cleanup removes stale
+	// task directories in it, which must never reach another worker's
+	// in-flight downloads or a co-located manager's compact/ directory.
+	workerID := conf.workerID
+	if workerID == "" {
+		workerID = distributed.DefaultWorkerID()
+	}
+	workerDir := path.Join(conf.dataDir, "compact-worker", workerID)
 	if err := os.MkdirAll(workerDir, os.ModePerm); err != nil {
 		cancel()
 		return errors.Wrap(err, "create working directory")
@@ -116,7 +123,7 @@ func runCompactWorker(
 	client := distributed.NewHTTPClient(logger, dnsProvider, conf.workerManagerAddress, 0)
 
 	worker, err := distributed.NewWorker(logger, insBkt, client, comp, reg, distributed.WorkerConfig{
-		WorkerID:           conf.workerID,
+		WorkerID:           workerID,
 		JournalID:          conf.managerJournalID,
 		DedupFunc:          conf.dedupFunc,
 		DedupReplicaLabels: strutil.ParseFlagLabels(conf.dedupReplicaLabels),
