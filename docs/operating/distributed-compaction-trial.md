@@ -60,6 +60,12 @@ thanos compact --compact.mode=worker \
 
 A store gateway and a querier on the trial bucket are enough for spot checks; the query frontend adds nothing to correctness.
 
+The manager refills a group's worker slots as individual plans finish. Parked
+plans and conflicting time ranges do not stop the search for independent work.
+Completed and deferred ranges remain reserved until the next metadata sync;
+only then can their replacements participate in further compaction. The limit
+controls concurrent plans, and does not split a single large plan across workers.
+
 ### What to verify
 
 **1. The output is identical to production's.** The shadow runs on the same inputs with the same compaction code, so for any time window its compacted block must hold *exactly* the same series and samples as the block production's standalone compactor produced for that window; only the ULIDs differ. `promtool` can show that for raw and compacted blocks, with two things to get right:
