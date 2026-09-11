@@ -183,10 +183,10 @@ func (sc *storeConfig) registerFlag(cmd extkingpin.FlagClause) {
 	cmd.Flag("max-time", "End of time range limit to serve. Thanos Store will serve only blocks, which happened earlier than this value. Option can be a constant time in RFC3339 format or time duration relative to current time, such as -1d or 2h45m. Valid duration units are ms, s, m, h, d, w, y.").
 		Default("9999-12-31T23:59:59Z").SetValue(&sc.filterConf.MaxTime)
 
-	cmd.Flag("min-block-resolution", "Minimum downsampling resolution of blocks to serve, e.g. 5m. Queries have to ask for data at this resolution or coarser (max_source_resolution, or --query.auto-downsampling on the querier); a finer request is answered only from the finer blocks this store still serves, since a store cannot substitute coarser data on the client's behalf. Blocks of a finer resolution whose data is not covered by a retained block at this resolution are still served, as hiding those would drop the range entirely.").
+	cmd.Flag("min-block-resolution", "Minimum downsampling resolution of blocks to serve, one of 0s, 5m or 1h. Queries have to ask for data at this resolution or coarser (max_source_resolution, or --query.auto-downsampling on the querier); a finer request is answered only from the finer blocks this store still serves, since a store cannot substitute coarser data on the client's behalf. Blocks of a finer resolution whose data is not covered by a retained block at this resolution are still served, as hiding those would drop the range entirely.").
 		Default(commonmodel.Duration(time.Duration(downsample.ResLevel0) * time.Millisecond).String()).HintAction(listResLevel).SetValue(&sc.minBlockResolution)
 
-	cmd.Flag("max-block-resolution", "Maximum downsampling resolution of blocks to serve, e.g. 5m. Blocks of a coarser resolution are not served; make sure another store serves them.").
+	cmd.Flag("max-block-resolution", "Maximum downsampling resolution of blocks to serve, one of 0s, 5m or 1h. Blocks of a coarser resolution are not served; make sure another store serves them.").
 		Default(commonmodel.Duration(time.Duration(downsample.ResLevel2) * time.Millisecond).String()).HintAction(listResLevel).SetValue(&sc.maxBlockResolution)
 
 	cmd.Flag("debug.advertise-compatibility-label", "If true, Store Gateway in addition to other labels, will advertise special \"@thanos_compatibility_store_type=store\" label set. This makes store Gateway compatible with Querier before 0.8.0").
@@ -246,6 +246,23 @@ func (sc *storeConfig) registerFlag(cmd extkingpin.FlagClause) {
 }
 
 // registerStore registers a store command.
+// validateBlockResolutions rejects resolution bounds that do not name a level
+// the compactor produces: an unknown minimum would hide nothing, load every
+// raw block and report all of them as uncovered, silently.
+func validateBlockResolutions(minResolution, maxResolution time.Duration) error {
+	levels := map[int64]struct{}{downsample.ResLevel0: {}, downsample.ResLevel1: {}, downsample.ResLevel2: {}}
+	for name, value := range map[string]time.Duration{"--min-block-resolution": minResolution, "--max-block-resolution": maxResolution} {
+		if _, ok := levels[value.Milliseconds()]; !ok {
+			return errors.Errorf("invalid argument: %s '%s' is not a downsampling level; use one of %s", name, value, strings.Join(listResLevel(), ", "))
+		}
+	}
+	if minResolution > maxResolution {
+		return errors.Errorf("invalid argument: --min-block-resolution '%s' can't be greater than --max-block-resolution '%s'",
+			minResolution, maxResolution)
+	}
+	return nil
+}
+
 func registerStore(app *extkingpin.App) {
 	cmd := app.Command(component.Store.String(), "Store node giving access to blocks in a bucket provider. Now supported GCS, S3, Azure, Swift, Tencent COS and Aliyun OSS.")
 
@@ -258,9 +275,8 @@ func registerStore(app *extkingpin.App) {
 				conf.filterConf.MinTime, conf.filterConf.MaxTime)
 		}
 
-		if conf.minBlockResolution > conf.maxBlockResolution {
-			return errors.Errorf("invalid argument: --min-block-resolution '%s' can't be greater than --max-block-resolution '%s'",
-				conf.minBlockResolution, conf.maxBlockResolution)
+		if err := validateBlockResolutions(time.Duration(conf.minBlockResolution), time.Duration(conf.maxBlockResolution)); err != nil {
+			return err
 		}
 
 		httpLogOpts, err := logging.ParseHTTPOptions(conf.reqLogConfig)

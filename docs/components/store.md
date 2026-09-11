@@ -51,8 +51,14 @@ Coverage advertised by metadata is not enough to remove a fallback. The store
 first attempts to load replacements, then loads or retains the finer blocks
 still needed when a replacement fails to load. This also applies on cold start,
 without eagerly loading all raw blocks when replacements load successfully.
-Blocks at the configured minimum resolution have their index headers checked
-before becoming selectable, including when lazy index downloading is enabled.
+Blocks at the configured minimum resolution that hide a finer block have their
+index headers checked before becoming selectable, including when lazy index
+downloading is enabled; blocks that hide nothing keep their configured lazy
+loading. A finer block straddling a `--min-time`/`--max-time` boundary counts
+the cover on the far side of that boundary as served by the store responsible
+for it. A fallback that cannot be loaded is logged and retried on the next
+sync, like any other block. Both flags accept only the resolutions the
+compactor produces: `0s`, `5m` and `1h`.
 Other blocks retain their configured lazy-loading behavior.
 Fallbacks obey the same time partition. When coverage disappears from the
 bucket, retained finer data becomes eligible again on the next successful sync.
@@ -225,8 +231,8 @@ Flags:
                                  in RFC3339 format or time duration relative
                                  to current time, such as -1d or 2h45m. Valid
                                  duration units are ms, s, m, h, d, w, y.
-      --min-block-resolution=0s  Minimum downsampling resolution of
-                                 blocks to serve, e.g. 5m. Queries have
+      --min-block-resolution=0s  Minimum downsampling resolution of blocks to
+                                 serve, one of 0s, 5m or 1h. Queries have
                                  to ask for data at this resolution
                                  or coarser (max_source_resolution,
                                  or --query.auto-downsampling on the querier);
@@ -238,7 +244,7 @@ Flags:
                                  are still served, as hiding those would drop
                                  the range entirely.
       --max-block-resolution=1h  Maximum downsampling resolution of blocks to
-                                 serve, e.g. 5m. Blocks of a coarser resolution
+                                 serve, one of 0s, 5m or 1h. Blocks of a coarser resolution
                                  are not served; make sure another store serves
                                  them.
       --selector.relabel-config-file=<file-path>
