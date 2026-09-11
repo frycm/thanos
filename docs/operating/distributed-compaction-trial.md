@@ -180,7 +180,7 @@ Together they make `thanos tools bucket rollback-distributed-compaction` precise
 
 1. **Stop the standalone compactor of the shard.** Nothing protects against a standalone compactor and a manager running on the same shard at once; the journal detects a second *manager*, not a standalone compactor, and the first symptom would be an overlap halt. Never run both.
 2. Start the manager with the shard's production flags plus `--compact.mode=manager --compact.manager.journal-id=<shard name>`, then the workers.
-3. Watch the same metrics as in stage A. A halt (`thanos_compact_halted=1`) is the expected failure mode, not a disaster: it wedges the shard with the bucket intact, and you roll back at leisure. The fail-closed worker design means the bad outcomes are "the backlog grows", not "data is lost".
+3. Watch the same metrics as in stage A. A halt (`thanos_compact_halted=1`) is the expected failure mode, not a disaster: it wedges the shard with the bucket intact, and you roll back at leisure. A halted manager also freezes its fleet: it revokes every lease, so workers discard what they were doing, fails the queued tasks in the journal with the halt as their reason, and hands out nothing until it is restarted. The fail-closed worker design means the bad outcomes are "the backlog grows", not "data is lost".
 
 ### Rolling back
 
