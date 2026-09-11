@@ -88,13 +88,13 @@ func TestCheckOwnershipFailsClosed(t *testing.T) {
 		{"task is gone", "gone", "tok", 3, OwnershipLost},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, _ := CheckOwnership(ctx, bkt, "shard-a", tc.taskID, tc.token, tc.generation)
+			got, _ := CheckOwnership(ctx, bkt, "shard-a", tc.taskID, tc.token, tc.generation, 0)
 			testutil.Equals(t, tc.expect, got)
 		})
 	}
 
 	t.Run("journal unreachable is not a lost lease", func(t *testing.T) {
-		got, err := CheckOwnership(ctx, failingBucket{bkt}, "shard-a", "t1", "tok", 3)
+		got, err := CheckOwnership(ctx, failingBucket{bkt}, "shard-a", "t1", "tok", 3, 0)
 		testutil.NotOk(t, err)
 		testutil.Equals(t, OwnershipUnknown, got)
 	})
@@ -102,7 +102,7 @@ func TestCheckOwnershipFailsClosed(t *testing.T) {
 	t.Run("task no longer leased", func(t *testing.T) {
 		j.Tasks["t1"].State = StateCompleted
 		testutil.Ok(t, WriteJournal(ctx, bkt, j))
-		got, _ := CheckOwnership(ctx, bkt, "shard-a", "t1", "tok", 3)
+		got, _ := CheckOwnership(ctx, bkt, "shard-a", "t1", "tok", 3, 0)
 		testutil.Equals(t, OwnershipLost, got)
 	})
 }

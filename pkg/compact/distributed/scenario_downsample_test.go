@@ -22,7 +22,7 @@ func (n *node) downsample(ctx context.Context, metas map[ulid.ULID]*metadata.Met
 		delete(metas, id)
 	}
 	if n.sched != nil {
-		return DispatchDownsampling(ctx, n.logger, n.bkt, n.sched, metas, 2, metadata.NoneFunc, 1, false)
+		return DispatchDownsampling(ctx, n.logger, n.bkt, n.sched, metas, 2, metadata.NoneFunc, 1, false, nil, nil)
 	}
 	candidates, err := downsample.Plan(metas)
 	if err != nil {

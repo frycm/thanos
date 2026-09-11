@@ -85,7 +85,7 @@ func TestWorkerShutdownAtExecutionStages(t *testing.T) {
 				}
 				w, err := NewWorker(c.logger, bkt, nil, executor, prometheus.NewRegistry(), WorkerConfig{JournalID: journalID, DataDir: t.TempDir()})
 				testutil.Ok(t, err)
-				result := w.execute(ctx, *leased, newAtomicBool(true))
+				result := w.execute(ctx, *leased, testAtomicBool(true))
 				testutil.Equals(t, OutcomeAbortedWorkerShutdown, result.Outcome)
 				testutil.Ok(t, ReconstructError(result))
 				testutil.Ok(t, c.sched.Report(t.Context(), result))

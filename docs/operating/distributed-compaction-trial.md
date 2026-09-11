@@ -157,7 +157,7 @@ Afterwards the trial bucket holds only the raw blocks that were replicated into 
 
 Two guardrails show up in the journal rather than in worker deaths:
 
-* **Parked tasks.** A task that burned its whole attempt budget without a single report is recorded as `abandoned`; a plan whose source blocks exceed `--compact.manager.max-task-series` or `--compact.manager.max-task-index-size` is recorded as `oversized` and never dispatched. Either way the exact source block set is withheld from planning - the journal entry says why - until you release it by writing one empty object at `compact-manager/<journal id>/unpark/<task id>`, or the entry ages out of `--compact.manager.journal-retention`. Watch `thanos_compact_manager_parked_tasks`.
+* **Parked tasks.** A task that burned its whole attempt budget without a single report, or reached three times that budget in aborted executions, is recorded as `abandoned`; a plan whose source blocks exceed `--compact.manager.max-task-series` or `--compact.manager.max-task-index-size` is recorded as `oversized` and never dispatched. Either way, every plan containing one of those source blocks is withheld from planning - the journal entry says why - until you release it by writing one empty object at `compact-manager/<journal id>/unpark/<task id>`, or the entry ages out of `--compact.manager.journal-retention`. Watch `thanos_compact_manager_parked_tasks`.
 * **Refused workers.** A worker states its journal ID and its deduplication configuration when it asks for work, and the manager refuses a mismatch with an error naming the flag to fix - a worker on another shard's journal or merging with another function would otherwise fail invisibly or, worse, produce blocks that carry no trace of the difference.
 
 ## Stage B: the cutover
@@ -197,3 +197,27 @@ The tool first verifies that every original source is still present and can be r
 If rollback is interrupted, rerun the dry run and inspect it before applying again. An interrupted block deletion can leave files without `meta.json`; `--allow-unreadable-blocks` can be used once those remnants are confirmed to be unrelated to the remaining source graph. It does not override the requirement that every source needed for restoration exists.
 
 The tool refuses to apply while the journal was written within `--manager-liveness-window` (15m by default; a running manager writes its journal at least once per `--compact.manager.lease-ttl`, even when idle), and it refuses to plan at all while any block's metadata cannot be read, since such a block might be a marked source it could not restore. Both refusals have explicit overrides, `--force` and `--allow-unreadable-blocks`; use them only once you have confirmed by other means that nothing is running and that the unreadable blocks are unrelated.
+
+### Reconciled scheduler and worker failure handling
+
+Journal reads and writes run outside the scheduler state lock, so an object-store
+stall does not block heartbeats. Snapshots are serialized before publication;
+callers recheck task ownership before rolling back a failed write.
+
+Aborted tasks retain their execution-attempt budget but have a separate cap of
+three times `--compact.manager.max-attempts`. Each abort delays requeueing by
+30 seconds times the abort count, capped at the lease TTL. Reaching the cap parks
+the sources; new blocks in the same plan do not reset that protection.
+
+Workers heartbeat immediately and at most every third of the lease TTL. A worker
+cancels its task if no heartbeat is acknowledged within the TTL. Local filesystem
+errors, including disk exhaustion, are retryable worker failures rather than
+shard-wide halts. Correct the resource problem before releasing parked work.
+
+Each worker needs an exclusive data directory. Startup removes abandoned ULID
+task directories left by crashes; other directories and symlinks are preserved.
+Task IDs received from the manager must be canonical ULIDs before filesystem use.
+
+Result metadata reads are retried three times, with a five-second timeout per
+read and short delays. Verification still precedes all source retirement, and
+the remote executor honors the same deletion veto as the local executor.
