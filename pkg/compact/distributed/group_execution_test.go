@@ -79,7 +79,7 @@ func TestParkedPlanDoesNotStarveDisjointWork(t *testing.T) {
 	task, err := CompactionTask(cg, first, overlap)
 	testutil.Ok(t, err)
 	sched.MarkOversized(task, "review: parked first plan")
-	executor := NewRemotePlanExecutor(logger, bkt, sched, planner, 1)
+	executor := NewRemotePlanExecutor(logger, bkt, sched, planner, 1, nil)
 	// Independently show the real planner can produce the healthy [48h,96h) plan.
 	exclude := map[ulid.ULID]struct{}{}
 	for i := uint64(1); i <= 6; i++ {
@@ -149,7 +149,7 @@ func schedulingFixture(t *testing.T, slots int) (*compact.Group, *Scheduler, *Re
 	}
 	planner := compact.NewTSDBBasedPlanner(logger, []int64{2000, 4000, 8000})
 	sched := testScheduler(t, bkt, ManagerConfig{})
-	executor := NewRemotePlanExecutor(logger, bkt, sched, planner, slots)
+	executor := NewRemotePlanExecutor(logger, bkt, sched, planner, slots, nil)
 
 	return cg, sched, executor
 }

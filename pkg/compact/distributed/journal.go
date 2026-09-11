@@ -36,7 +36,7 @@ const (
 	StateCompleted TaskState = "completed"
 	// StateFailed exhausted its attempts with a reported failure.
 	StateFailed TaskState = "failed"
-	// StateAbandoned repeatedly lost its worker without ever reporting. It is not
+	// StateAbandoned repeatedly lost workers or exhausted its abort budget. It is not
 	// retried automatically, so that a task that kills workers cannot spin
 	// forever; an operator decides what to do with it.
 	StateAbandoned TaskState = "abandoned"
@@ -48,7 +48,7 @@ const (
 
 // Terminal reports whether no further work will happen for a task in this state.
 func (s TaskState) Terminal() bool {
-	return s == StateCompleted || s == StateFailed || s.Parked()
+	return s == StateCompleted || s == StateFailed || s == StateAbandoned || s == StateOversized
 }
 
 // Parked reports whether the task's source blocks are deliberately withheld
@@ -83,7 +83,12 @@ type TaskEntry struct {
 	Outputs         []string          `json:"outputs,omitempty"`
 	OutputChecksums map[string]string `json:"output_checksums,omitempty"`
 
-	Attempts  int        `json:"attempts"`
+	Attempts int `json:"attempts"`
+	// Aborts counts, separately from Attempts, how often a worker discarded the
+	// task without completing it. Aborts are benign in isolation - a lost
+	// lease, a store blip, a shutdown - so they do not consume attempts, but an
+	// unbounded streak of them would retry the task forever.
+	Aborts    int        `json:"aborts,omitzero"`
 	LastError *TaskError `json:"last_error,omitempty"`
 
 	CreatedAt time.Time `json:"created_at"`
@@ -140,9 +145,10 @@ func JournalPath(journalID string) string {
 	return path.Join(JournalPrefix, journalID, "journal.json")
 }
 
-// UnparkPrefix is the directory of unpark requests: one empty object under it,
-// named by task ID, releases that parked task. The manager drops the parked
-// entry, so its source blocks are planned again, and removes the object.
+// UnparkPrefix returns the object storage directory under which an operator
+// asks a shard's manager to release parked tasks, one empty object named after
+// each task ID. The manager drops the parked entry, so its source blocks are
+// planned again, and removes the object.
 func UnparkPrefix(journalID string) string {
 	return path.Join(JournalPrefix, journalID, "unpark") + "/"
 }
@@ -177,6 +183,12 @@ func ReadJournal(ctx context.Context, bkt objstore.Bucket, journalID string) (*J
 	if j.Version > JournalVersion {
 		return nil, errors.Errorf("journal version %d is newer than supported version %d", j.Version, JournalVersion)
 	}
+	if j.JournalID != journalID {
+		// A journal copied under another shard's path - by an operator moving
+		// a trial, say - would otherwise be taken over as that shard's, and
+		// every write would then go to the path its body names.
+		return nil, errors.Errorf("journal at %s says it is journal %q", JournalPath(journalID), j.JournalID)
+	}
 	if j.Tasks == nil {
 		j.Tasks = map[string]*TaskEntry{}
 	}
@@ -188,7 +200,7 @@ func WriteJournal(ctx context.Context, bkt objstore.Bucket, j *Journal) error {
 	j.Version = JournalVersion
 	j.UpdatedAt = time.Now()
 
-	body, err := json.MarshalIndent(j, "", "\t")
+	body, err := json.Marshal(j)
 	if err != nil {
 		return errors.Wrap(err, "marshal journal")
 	}
@@ -247,7 +259,14 @@ func (o Ownership) String() string {
 // CheckOwnership re-reads the journal and reports whether the given lease is
 // still the one recorded for the task. Workers call this immediately before
 // making their work visible, and fail closed on anything but a confirmation.
-func CheckOwnership(ctx context.Context, bkt objstore.Bucket, journalID, taskID, token string, generation uint64) (Ownership, error) {
+//
+// grace bounds how stale the recorded lease expiry may be. The manager extends
+// leases in memory and persists at least once per lease TTL, so for a healthy
+// worker the recorded expiry is at most one TTL behind; a recorded expiry more
+// than grace in the past means the worker has been partitioned from the manager
+// (whose in-memory revocations it cannot see) or the manager itself is gone.
+// Pass the lease TTL as grace; zero disables the check.
+func CheckOwnership(ctx context.Context, bkt objstore.Bucket, journalID, taskID, token string, generation uint64, grace time.Duration) (Ownership, error) {
 	j, err := ReadJournal(ctx, bkt, journalID)
 	if err != nil {
 		return OwnershipUnknown, errors.Wrap(err, "read journal for ownership check")
@@ -268,6 +287,11 @@ func CheckOwnership(ctx context.Context, bkt objstore.Bucket, journalID, taskID,
 	}
 	if e.Lease == nil || e.Lease.Token != token {
 		return OwnershipLost, errors.Errorf("task %s is leased to somebody else", taskID)
+	}
+	if grace > 0 && time.Now().After(e.Lease.ExpiresAt.Add(grace)) {
+		return OwnershipLost, errors.Errorf(
+			"the journal's lease on task %s expired at %s and was never refreshed; the manager no longer vouches for us",
+			taskID, e.Lease.ExpiresAt.Format(time.RFC3339))
 	}
 	return OwnershipConfirmed, nil
 }

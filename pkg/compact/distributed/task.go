@@ -44,6 +44,10 @@ type GroupSpec struct {
 	// bucket still carries them, so the worker has to remove them the same way
 	// before it can validate the blocks against the group.
 	DedupReplicaLabels []string `json:"dedup_replica_labels,omitempty"`
+	// DedupFunc is the vertical merge function the manager was configured with
+	// (--deduplication.func). Which one compacted the block is invisible in the
+	// output, so a worker checks it against its own before doing the work.
+	DedupFunc string `json:"dedup_func,omitempty"`
 }
 
 // Task is one atomic unit of work handed to a worker.
@@ -67,15 +71,16 @@ type Task struct {
 	// planning time. Only possible with vertical compaction enabled.
 	OverlappingBlocks bool `json:"overlapping_blocks"`
 
-	// ExpectedSeries and ExpectedIndexBytes estimate how big executing this
-	// task is, summed from what the source blocks report about themselves.
-	// The manager refuses tasks over its configured worker capacity instead
-	// of watching workers die on them.
-	ExpectedSeries     uint64 `json:"expected_series,omitempty"`
-	ExpectedIndexBytes int64  `json:"expected_index_bytes,omitempty"`
-
 	// TargetResolution is set for TaskDownsample only.
-	TargetResolution int64 `json:"target_resolution,omitempty"`
+	TargetResolution int64 `json:"target_resolution,omitzero"`
+
+	// ExpectedSeries and ExpectedIndexBytes estimate how big executing this
+	// task is, summed from the source blocks' own metadata. They exist so the
+	// manager can refuse a task no worker could survive, and so an operator
+	// reading the journal sees how big a task was. Zero means the sources did
+	// not report the figure; an absent figure is never held against a task.
+	ExpectedSeries     uint64 `json:"expected_series,omitzero"`
+	ExpectedIndexBytes int64  `json:"expected_index_bytes,omitzero"`
 
 	LeaseToken string        `json:"lease_token"`
 	LeaseTTL   time.Duration `json:"lease_ttl"`
@@ -95,25 +100,28 @@ const (
 	OutcomeFailedIssue347  Outcome = "failed_issue347"
 	OutcomeFailedOOOChunks Outcome = "failed_out_of_order_chunks"
 
-	// The worker could not finish because of lease, storage, or lifecycle
-	// events. These are not failures of the data being compacted.
+	// The worker discarded its work before making it visible. None of these is
+	// a compaction failure: the task simply has to be executed again.
 	OutcomeAbortedOwnershipLost    Outcome = "aborted_ownership_lost"
 	OutcomeAbortedStoreUnreachable Outcome = "aborted_store_unreachable"
-	OutcomeAbortedWorkerShutdown   Outcome = "aborted_worker_shutdown"
+	// OutcomeAbortedWorkerShutdown means the worker was asked to shut down
+	// (SIGTERM, rolling restart) while executing the task. Reporting it
+	// distinctly matters: the underlying error is a context cancellation that
+	// would otherwise be classified through the compaction error taxonomy and
+	// halt the manager.
+	OutcomeAbortedWorkerShutdown Outcome = "aborted_worker_shutdown"
 
 	// OutcomeAbandoned is not reported by workers: the manager synthesizes it
-	// for a task that burned its whole attempt budget without a single report,
-	// and parks the task's source blocks.
+	// when a task repeatedly lost its worker without ever reporting.
 	OutcomeAbandoned Outcome = "abandoned"
-
-	// OutcomeOversized is recorded by the manager itself for a task it refused
-	// to dispatch because it exceeds the configured worker capacity. No worker
-	// ever sees such a task.
+	// OutcomeOversized is not reported by workers either: the manager
+	// synthesizes it for a task it refused to dispatch because its expected
+	// size exceeds the configured worker capacity.
 	OutcomeOversized Outcome = "oversized"
 )
 
-// Aborted reports whether execution was interrupted without a data failure.
-// Partially uploaded outputs may still be discovered by metadata synchronization.
+// Aborted reports whether the outcome means the worker threw its work away, or
+// at least never confirmed that anything became visible.
 func (o Outcome) Aborted() bool {
 	return o == OutcomeAbortedOwnershipLost || o == OutcomeAbortedStoreUnreachable || o == OutcomeAbortedWorkerShutdown
 }
@@ -137,24 +145,19 @@ type Result struct {
 }
 
 // LeaseRequest asks the manager for a task to work on.
-//
-// It carries the worker's configuration alongside its identity: the parts
-// that must match the manager's for the produced blocks to be correct, and
-// that leave no trace in the blocks when they do not. The manager refuses to
-// lease to a worker whose configuration does not match, loudly, instead of
-// letting the mismatch run.
 type LeaseRequest struct {
 	WorkerID string     `json:"worker_id"`
 	Accepts  []TaskType `json:"accepts"`
-
-	// JournalID is the journal the worker verifies its ownership against. A
-	// worker on another journal would abort every task at its ownership check:
-	// an invisible livelock, refused here instead.
+	// JournalID is the journal the worker was configured for. The manager
+	// refuses the lease on a mismatch: nothing else ties the two flags
+	// together, and a worker verifying its ownership against a different
+	// journal than the one scheduling it would abort every task forever.
 	JournalID string `json:"journal_id,omitempty"`
 	// DedupFunc and DedupReplicaLabels are the worker's merge configuration
-	// (--deduplication.func and --deduplication.replica-label). The merge
-	// function is baked into the worker's compactor and invisible in its
-	// output, so a mismatch has to be caught before any task is handed out.
+	// (--deduplication.func and --deduplication.replica-label). The manager
+	// refuses the lease when they differ from its own: the worker's compactor
+	// is built from them and would silently merge the sources differently
+	// than the manager planned for.
 	DedupFunc          string   `json:"dedup_func,omitempty"`
 	DedupReplicaLabels []string `json:"dedup_replica_labels,omitempty"`
 }
@@ -169,7 +172,6 @@ type HeartbeatRequest struct {
 	TaskID     string `json:"task_id"`
 	LeaseToken string `json:"lease_token"`
 	Generation uint64 `json:"generation"`
-	Stage      string `json:"stage,omitempty"`
 }
 
 // HeartbeatResponse tells the worker whether it still owns the task. A worker

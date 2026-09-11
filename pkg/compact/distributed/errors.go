@@ -6,6 +6,8 @@ package distributed
 import (
 	"github.com/oklog/ulid/v2"
 	"github.com/pkg/errors"
+	"os"
+	"syscall"
 
 	"github.com/thanos-io/thanos/pkg/compact"
 )
@@ -16,6 +18,13 @@ import (
 func ClassifyError(err error) (Outcome, string) {
 	if err == nil {
 		return OutcomeCompleted, ""
+	}
+	// Local filesystem/resource failures can be wrapped as halts by TSDB.
+	// Retry them on a worker instead of halting the entire shard.
+	var pathErr *os.PathError
+	var errno syscall.Errno
+	if errors.As(err, &pathErr) || errors.As(err, &errno) {
+		return OutcomeFailedRetryable, ""
 	}
 
 	switch {

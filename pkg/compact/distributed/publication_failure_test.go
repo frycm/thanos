@@ -11,6 +11,7 @@ import (
 	"path"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/efficientgo/core/testutil"
 	"github.com/oklog/ulid/v2"
@@ -86,7 +87,8 @@ func TestWorkerPublicationFailuresPreserveData(t *testing.T) {
 					name = kind + "/" + stage + "/lost-acknowledgement"
 				}
 				t.Run(name, func(t *testing.T) {
-					c := newTestCluster(t)
+					// These tests execute directly, without the worker heartbeat loop.
+					c := newTestClusterConf(t, ManagerConfig{LeaseTTL: time.Minute})
 					cg, metas := c.makeGroup(labels.FromStrings("tenant", "one"))
 					comp, err := tsdb.NewLeveledCompactor(t.Context(), nil, logutil.GoKitLogToSlog(c.logger), []int64{1000, 3000}, downsample.NewPool(), nil)
 					testutil.Ok(t, err)
@@ -105,7 +107,7 @@ func TestWorkerPublicationFailuresPreserveData(t *testing.T) {
 					if kind != "compaction" {
 						m := metas[0]
 						if kind == "5m-to-1h" {
-							prepared := w.execute(t.Context(), lease(DownsampleTask(m, downsample.ResLevel1, metadata.NoneFunc, 1, false, nil)), newAtomicBool(true))
+							prepared := w.execute(t.Context(), lease(DownsampleTask(m, downsample.ResLevel1, metadata.NoneFunc, 1, false, nil)), testAtomicBool(true))
 							testutil.Equals(t, OutcomeCompleted, prepared.Outcome)
 							testutil.Ok(t, c.sched.Report(t.Context(), prepared))
 							meta, err := block.DownloadMeta(t.Context(), c.logger, c.shared, ulid.MustParse(prepared.OutputBlocks[0]))
@@ -131,13 +133,13 @@ func TestWorkerPublicationFailuresPreserveData(t *testing.T) {
 					testutil.Ok(t, err)
 					testutil.Ok(t, WriteJournal(t.Context(), clean, j))
 					w.bkt = clean
-					golden := w.execute(t.Context(), task, newAtomicBool(true))
+					golden := w.execute(t.Context(), task, testAtomicBool(true))
 					testutil.Equals(t, OutcomeCompleted, golden.Outcome)
 					want := resultContent(t, clean, golden)
 
 					fault := &publicationFault{Bucket: c.shared, stage: stage, after: after}
 					w.bkt = fault
-					failed := w.execute(t.Context(), task, newAtomicBool(true))
+					failed := w.execute(t.Context(), task, testAtomicBool(true))
 					testutil.Assert(t, fault.hits > 0, "failure injection must fire")
 					testutil.Assert(t, failed.Outcome != OutcomeCompleted, "failed publication was accepted")
 					testutil.Equals(t, before, sourceObjects(t, c.shared, task.SourceBlocks))
@@ -147,7 +149,7 @@ func TestWorkerPublicationFailuresPreserveData(t *testing.T) {
 						testutil.Assert(t, !exists, "worker must never delete a source")
 					}
 					w.bkt = c.shared
-					retried := w.execute(t.Context(), task, newAtomicBool(true))
+					retried := w.execute(t.Context(), task, testAtomicBool(true))
 					testutil.Equals(t, OutcomeCompleted, retried.Outcome)
 					testutil.Equals(t, before, sourceObjects(t, c.shared, task.SourceBlocks))
 					assertSameContent(t, want, resultContent(t, c.shared, retried), "publication retry")
@@ -160,7 +162,8 @@ func TestWorkerPublicationFailuresPreserveData(t *testing.T) {
 func TestSourceDeletionFailureCanBeRetried(t *testing.T) {
 	for _, after := range []bool{false, true} {
 		t.Run(map[bool]string{false: "before write", true: "lost acknowledgement"}[after], func(t *testing.T) {
-			c := newTestCluster(t)
+			// These tests execute directly, without the worker heartbeat loop.
+			c := newTestClusterConf(t, ManagerConfig{LeaseTTL: time.Minute})
 			cg, metas := c.makeGroup(labels.FromStrings("tenant", "one"))
 			task, err := CompactionTask(cg, metas, false)
 			testutil.Ok(t, err)
@@ -173,13 +176,13 @@ func TestSourceDeletionFailureCanBeRetried(t *testing.T) {
 			w, err := NewWorker(c.logger, c.shared, nil, comp, prometheus.NewRegistry(), WorkerConfig{JournalID: journalID, DataDir: t.TempDir()})
 			testutil.Ok(t, err)
 			before := sourceObjects(t, c.shared, task.SourceBlocks)
-			result := w.execute(t.Context(), *leased, newAtomicBool(true))
+			result := w.execute(t.Context(), *leased, testAtomicBool(true))
 			testutil.Equals(t, OutcomeCompleted, result.Outcome)
 			want := resultContent(t, c.shared, result)
 
 			fault := &publicationFault{Bucket: c.shared, stage: metadata.DeletionMarkFilename, after: after}
-			executor := NewRemotePlanExecutor(c.logger, fault, c.sched, nil, 1)
-			_, err = executor.verifyAndFinalize(t.Context(), cg, metas, result)
+			executor := NewRemotePlanExecutor(c.logger, fault, c.sched, nil, 1, nil)
+			_, err = executor.verifyAndFinalize(t.Context(), cg, metas, result, false)
 			testutil.NotOk(t, err)
 			testutil.Assert(t, fault.hits > 0, "deletion failure must be reached after verification")
 			afterFailure := sourceObjects(t, c.shared, task.SourceBlocks)
@@ -188,7 +191,7 @@ func TestSourceDeletionFailureCanBeRetried(t *testing.T) {
 			}
 			assertSameContent(t, want, resultContent(t, c.shared, result), "source deletion failure cannot damage the replacement")
 			executor.bkt = c.shared
-			ids, err := executor.verifyAndFinalize(t.Context(), cg, metas, result)
+			ids, err := executor.verifyAndFinalize(t.Context(), cg, metas, result, false)
 			testutil.Ok(t, err)
 			testutil.Equals(t, 1, len(ids))
 			for _, m := range metas {
@@ -196,7 +199,7 @@ func TestSourceDeletionFailureCanBeRetried(t *testing.T) {
 			}
 			// A lost acknowledgement may cause the same successful finalization
 			// to run again; it must be idempotent.
-			_, err = executor.verifyAndFinalize(t.Context(), cg, metas, result)
+			_, err = executor.verifyAndFinalize(t.Context(), cg, metas, result, false)
 			testutil.Ok(t, err)
 			assertSameContent(t, want, resultContent(t, c.shared, result), "repeated finalization")
 		})

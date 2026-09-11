@@ -123,6 +123,12 @@ func TestSchedulerAbortedResultDoesNotCountAsAttempt(t *testing.T) {
 
 			again, err := s.Lease(ctx, LeaseRequest{WorkerID: "w2"})
 			testutil.Ok(t, err)
+			testutil.Assert(t, again == nil, "aborted tasks must back off before requeueing")
+			s.mtx.Lock()
+			s.tasks["t1"].notBefore = time.Time{}
+			s.mtx.Unlock()
+			again, err = s.Lease(ctx, LeaseRequest{WorkerID: "w2"})
+			testutil.Ok(t, err)
 			testutil.Assert(t, again != nil, "expected the task to be available again")
 		})
 	}
@@ -181,7 +187,7 @@ func TestSchedulerTakeoverVoidsOldLeases(t *testing.T) {
 	testutil.Assert(t, !carried, "an unfinished task must not survive a takeover")
 
 	// The worker of the previous manager can no longer prove it owns the task.
-	got, _ := CheckOwnership(ctx, bkt, "shard-a", "t1", leased.LeaseToken, leased.Generation)
+	got, _ := CheckOwnership(ctx, bkt, "shard-a", "t1", leased.LeaseToken, leased.Generation, 0)
 	testutil.Equals(t, OwnershipLost, got)
 }
 
