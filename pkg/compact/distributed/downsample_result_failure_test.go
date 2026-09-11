@@ -34,7 +34,7 @@ func TestDispatchDownsamplingRejectsInvalidResults(t *testing.T) {
 			source.Thanos.Labels = map[string]string{"tenant": "one"}
 			done := make(chan error, 1)
 			go func() {
-				done <- DispatchDownsampling(ctx, log.NewNopLogger(), bkt, s, map[ulid.ULID]*metadata.Meta{source.ULID: source}, 1, metadata.NoneFunc, 1, false)
+				done <- DispatchDownsampling(ctx, log.NewNopLogger(), bkt, s, map[ulid.ULID]*metadata.Meta{source.ULID: source}, 1, metadata.NoneFunc, 1, false, nil, nil)
 			}()
 			var task *Task
 			for task == nil && ctx.Err() == nil {

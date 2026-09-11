@@ -43,7 +43,7 @@ func TestPlanGroupMixedSizePlansDoNotOverlap(t *testing.T) {
 			testutil.Ok(t, err)
 			first := firstPlan.Sources
 			testutil.Equals(t, 4, len(first))
-			e := NewRemotePlanExecutor(logger, bkt, testScheduler(t, bkt, ManagerConfig{}), planner, 4)
+			e := NewRemotePlanExecutor(logger, bkt, testScheduler(t, bkt, ManagerConfig{}), planner, 4, nil)
 			plans := e.planGroup(t.Context(), cg, first)
 			testutil.Equals(t, 1, len(plans)) // The next plan would enclose [8h,16h).
 		}
@@ -67,6 +67,6 @@ func TestPlanGroupDispatchesTimeDisjointPlans(t *testing.T) {
 	firstPlan, err := cg.Plan(t.Context(), planner, make(chan error, 1))
 	first := firstPlan.Sources
 	testutil.Ok(t, err)
-	plans := NewRemotePlanExecutor(logger, bkt, testScheduler(t, bkt, ManagerConfig{}), planner, 4).planGroup(t.Context(), cg, first)
+	plans := NewRemotePlanExecutor(logger, bkt, testScheduler(t, bkt, ManagerConfig{}), planner, 4, nil).planGroup(t.Context(), cg, first)
 	testutil.Equals(t, 4, len(plans))
 }

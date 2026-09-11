@@ -181,6 +181,9 @@ func runCompact(
 	if conf.mode == compactModeWorker {
 		return runCompactWorker(g, logger, reg, component, conf)
 	}
+	if conf.mode == compactModeManager && conf.managerLeaseTTL <= 0 {
+		return errors.New("--compact.manager.lease-ttl must be positive")
+	}
 	if conf.mode == compactModeManager && conf.managerJournalID == "" {
 		return errors.New("--compact.manager.journal-id is required in manager mode")
 	}
@@ -420,7 +423,7 @@ func runCompact(
 		if err != nil {
 			return errors.Wrap(err, "create compaction scheduler")
 		}
-		planExecutor = distributed.NewRemotePlanExecutor(logger, insBkt, scheduler, planner, conf.managerMaxInflightPerGroup)
+		planExecutor = distributed.NewRemotePlanExecutor(logger, insBkt, scheduler, planner, conf.managerMaxInflightPerGroup, nil)
 	}
 
 	compactor, err := compact.NewBucketCompactorWithExecutor(
@@ -1008,6 +1011,8 @@ func runDownsampling(
 			metadata.HashFunc(conf.hashFunc),
 			conf.blockFilesConcurrency,
 			conf.acceptMalformedIndex,
+			downsampleMetrics.downsamples,
+			downsampleMetrics.downsampleFailures,
 		)
 	}
 	return downsampleBucket(

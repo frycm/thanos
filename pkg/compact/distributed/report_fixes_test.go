@@ -233,7 +233,7 @@ func TestVerifyAndFinalizeAcceptsTheRealResult(t *testing.T) {
 	compIDs, err := e.verifyAndFinalize(context.Background(), cg, toCompact, Result{
 		TaskID: "t1", Outcome: OutcomeCompleted,
 		OutputBlocks: []string{id}, OutputChecksums: map[string]string{id: sum},
-	})
+	}, false)
 	testutil.Ok(t, err)
 	testutil.Equals(t, 1, len(compIDs))
 	testutil.Equals(t, true, deletionMarked(t, bkt, toCompact[0].ULID))
@@ -279,7 +279,7 @@ func TestVerifyAndFinalizeRefusesForeignBlocks(t *testing.T) {
 			_, err := e.verifyAndFinalize(context.Background(), cg, toCompact, Result{
 				TaskID: "t1", Outcome: OutcomeCompleted,
 				OutputBlocks: []string{id}, OutputChecksums: map[string]string{id: sum},
-			})
+			}, false)
 			testutil.NotOk(t, err)
 			testutil.Equals(t, true, compact.IsRetryError(err))
 			testutil.Equals(t, false, deletionMarked(t, bkt, toCompact[0].ULID))
@@ -300,7 +300,7 @@ func TestVerifyAndFinalizeRefusesChecksumMismatch(t *testing.T) {
 	_, err := e.verifyAndFinalize(context.Background(), cg, toCompact, Result{
 		TaskID: "t1", Outcome: OutcomeCompleted,
 		OutputBlocks: []string{id}, OutputChecksums: map[string]string{id: "sha256:not-what-was-uploaded"},
-	})
+	}, false)
 	testutil.NotOk(t, err)
 	testutil.Equals(t, false, deletionMarked(t, bkt, toCompact[0].ULID))
 }
@@ -317,7 +317,7 @@ func TestVerifyAndFinalizeEmptyResult(t *testing.T) {
 			m.Stats.NumSamples = 0
 		}
 
-		compIDs, err := e.verifyAndFinalize(context.Background(), cg, toCompact, Result{TaskID: "t1", Outcome: OutcomeCompleted})
+		compIDs, err := e.verifyAndFinalize(context.Background(), cg, toCompact, Result{TaskID: "t1", Outcome: OutcomeCompleted}, false)
 		testutil.Ok(t, err)
 		testutil.Equals(t, 0, len(compIDs))
 		testutil.Equals(t, true, deletionMarked(t, bkt, toCompact[0].ULID))
@@ -328,7 +328,7 @@ func TestVerifyAndFinalizeEmptyResult(t *testing.T) {
 		e, bkt, cg, toCompact := provenanceFixture(t)
 		toCompact[0].Stats.NumSamples = 0
 
-		_, err := e.verifyAndFinalize(context.Background(), cg, toCompact, Result{TaskID: "t1", Outcome: OutcomeCompleted})
+		_, err := e.verifyAndFinalize(context.Background(), cg, toCompact, Result{TaskID: "t1", Outcome: OutcomeCompleted}, false)
 		testutil.NotOk(t, err)
 		testutil.Equals(t, true, compact.IsRetryError(err))
 		testutil.Equals(t, false, deletionMarked(t, bkt, toCompact[0].ULID))
@@ -389,7 +389,7 @@ func TestVerifyAndFinalizeRefusesMissingChecksum(t *testing.T) {
 	_, err := e.verifyAndFinalize(context.Background(), cg, toCompact, Result{
 		TaskID: "t1", Outcome: OutcomeCompleted,
 		OutputBlocks: []string{id},
-	})
+	}, false)
 	testutil.NotOk(t, err)
 	testutil.Equals(t, true, compact.IsRetryError(err))
 	testutil.Equals(t, false, deletionMarked(t, bkt, toCompact[0].ULID))
@@ -462,7 +462,7 @@ func TestVerifyAndFinalizeRequiresProvenance(t *testing.T) {
 			_, err := e.verifyAndFinalize(context.Background(), cg, toCompact, Result{
 				TaskID: "t1", Outcome: OutcomeCompleted,
 				OutputBlocks: []string{id}, OutputChecksums: map[string]string{id: sum},
-			})
+			}, false)
 			testutil.NotOk(t, err)
 			testutil.Equals(t, true, compact.IsRetryError(err))
 			testutil.Equals(t, false, deletionMarked(t, bkt, toCompact[0].ULID))
@@ -558,7 +558,8 @@ func TestSchedulerParksOversizedTasks(t *testing.T) {
 	testutil.Assert(t, entry != nil && entry.State == StateOversized, "the refusal must be in the journal")
 	testutil.Equals(t, OutcomeOversized, entry.LastError.Outcome)
 	testutil.Equals(t, true, s.SourcesParked([]string{"b", "a"}))
-	testutil.Equals(t, false, s.SourcesParked([]string{"a"}))
+	testutil.Equals(t, true, s.SourcesParked([]string{"a"}))
+	testutil.Equals(t, false, s.SourcesParked([]string{"unrelated"}))
 
 	// Parked entries survive a manager restart: they are terminal, and what
 	// they say - do not plan these blocks - must outlive the process.

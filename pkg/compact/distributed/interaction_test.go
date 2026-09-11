@@ -153,7 +153,9 @@ func (c *testCluster) newScheduler() *Scheduler {
 	c.t.Helper()
 	conf := c.conf
 	conf.JournalID = journalID
-	conf.LeaseTTL = 250 * time.Millisecond
+	if conf.LeaseTTL <= 0 {
+		conf.LeaseTTL = 250 * time.Millisecond
+	}
 	conf.MaxAttempts = 3
 	sched, err := NewScheduler(context.Background(), c.logger, c.manager, prometheus.NewRegistry(), conf)
 	testutil.Ok(c.t, err)
@@ -267,7 +269,7 @@ func (c *testCluster) execute(cg *compact.Group, toCompact []*metadata.Meta) <-c
 // replica labels configured, as a manager running with
 // --deduplication.replica-label would.
 func (c *testCluster) executeOpts(cg *compact.Group, toCompact []*metadata.Meta, overlapping bool) <-chan executeOutcome {
-	e := NewRemotePlanExecutor(c.logger, c.manager, c.sched, nil, 1)
+	e := NewRemotePlanExecutor(c.logger, c.manager, c.sched, nil, 1, nil)
 	ch := make(chan executeOutcome, 1)
 	go func() {
 		ids, err := e.Execute(context.Background(), "", cg, compact.Plan{Sources: toCompact, OverlappingBlocks: overlapping})
@@ -740,7 +742,7 @@ func TestInteractionDownsampleDedup(t *testing.T) {
 
 	testutil.Ok(t, DispatchDownsampling(ctx, c.logger, c.manager, c.sched,
 		map[ulid.ULID]*metadata.Meta{stripped.ULID: &stripped},
-		1, metadata.NoneFunc, 1, false))
+		1, metadata.NoneFunc, 1, false, nil, nil))
 
 	entry := c.journalTask(StateCompleted)
 	testutil.Assert(t, entry != nil, "the journal must record the completed downsample task")
@@ -781,3 +783,5 @@ func (c crashableClient) Report(ctx context.Context, res Result) error {
 	}
 	return c.TaskClient.Report(ctx, res)
 }
+
+func testAtomicBool(value bool) *atomic.Bool { b := &atomic.Bool{}; b.Store(value); return b }

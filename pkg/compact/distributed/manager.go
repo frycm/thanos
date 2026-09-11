@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-kit/log"
@@ -26,6 +27,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/thanos-io/objstore"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
@@ -168,8 +170,9 @@ type pendingTask struct {
 	entry  *TaskEntry
 	result chan Result
 
-	leasedAt time.Time
-	queuedAt time.Time
+	leasedAt  time.Time
+	queuedAt  time.Time
+	notBefore time.Time
 }
 
 // Scheduler owns the task queue and the leases. It is the only writer of the
@@ -191,8 +194,14 @@ type Scheduler struct {
 	queue      []string
 	workerSeen map[string]time.Time
 
+	// persistSeq and lastPersist are protected by mtx.
+	persistSeq  uint64
+	lastPersist time.Time
+	// Bucket I/O is serialized separately, without holding mtx. These two
+	// persistence bookkeeping fields are protected by persistMtx.
+	persistMtx              sync.Mutex
+	persistedSeq            uint64
 	journalUnavailableSince time.Time
-	lastPersist             time.Time
 }
 
 // NewScheduler takes ownership of the shard's journal, bumping its generation so
@@ -274,6 +283,7 @@ func (s *Scheduler) Submit(ctx context.Context, task Task) (<-chan Result, error
 
 	task.Generation = s.journal.Generation
 	task.LeaseTTL = s.conf.LeaseTTL
+	task.Group.DedupFunc = s.conf.DedupFunc
 
 	now := time.Now()
 	entry := &TaskEntry{
@@ -282,22 +292,45 @@ func (s *Scheduler) Submit(ctx context.Context, task Task) (<-chan Result, error
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-	s.journal.Tasks[task.ID] = entry
-	s.tasks[task.ID] = &pendingTask{
+	pending := &pendingTask{
 		entry:    entry,
 		result:   make(chan Result, 1),
 		queuedAt: now,
 	}
+	s.journal.Tasks[task.ID] = entry
+	s.tasks[task.ID] = pending
 	s.queue = append(s.queue, task.ID)
 
+	// The state lock is released while the journal is written, so by the time
+	// the write returns, the task may have been leased, and other tasks may
+	// have been queued behind or removed ahead of it. Nothing about the queue
+	// or the task can be assumed from before the write.
 	if err := s.persistLocked(ctx); err != nil {
+		if compact.IsHaltError(err) {
+			return nil, err
+		}
+		if s.tasks[task.ID] != pending || entry.State != StatePending {
+			// The task went out to a worker while the write was in flight,
+			// and every journal write from here on carries it. What the
+			// failed write could not record was the task waiting, which it
+			// no longer is; the submitter has a live task to wait for.
+			level.Warn(s.logger).Log("msg", "journal write failed while the task was being leased; the task stays", "task", task.ID, "err", err)
+			s.updateQueueMetricsLocked()
+			return pending.result, nil
+		}
 		delete(s.journal.Tasks, task.ID)
 		delete(s.tasks, task.ID)
-		s.queue = s.queue[:len(s.queue)-1]
-		return nil, err
+		if i := slices.Index(s.queue, task.ID); i >= 0 {
+			s.queue = slices.Delete(s.queue, i, i+1)
+		}
+		// A journal blip inside the tolerance window must surface as
+		// retryable: a plain error would fall through the compactor's wait
+		// loop and exit the whole manager process, while the same failure in
+		// Report or Maintain is tolerated by design.
+		return nil, compact.NewRetryError(err)
 	}
 	s.updateQueueMetricsLocked()
-	return s.tasks[task.ID].result, nil
+	return pending.result, nil
 }
 
 // Lease hands a queued task to a worker, if there is one it accepts.
@@ -319,7 +352,7 @@ func (s *Scheduler) Lease(ctx context.Context, req LeaseRequest) (*Task, error) 
 		// no trace in the blocks it produces, so a mismatch would go unnoticed
 		// while the workers merge the sources differently than planned.
 		return nil, errors.Errorf(
-			"worker %s deduplicates with %s but this manager plans for %s; "+
+			"worker %s deduplicates with %q but this manager plans for %q; "+
 				"--deduplication.func has to match on both", req.WorkerID, describeDedupFunc(req.DedupFunc), describeDedupFunc(s.conf.DedupFunc))
 	}
 	if !sameSet(req.DedupReplicaLabels, s.conf.DedupReplicaLabels) {
@@ -329,19 +362,23 @@ func (s *Scheduler) Lease(ctx context.Context, req LeaseRequest) (*Task, error) 
 	}
 
 	s.expireLeasesLocked()
-	s.workerSeen[req.WorkerID] = time.Now()
+	now := time.Now()
+	s.workerSeen[req.WorkerID] = now
 
 	accepts := map[TaskType]bool{}
 	for _, t := range req.Accepts {
 		accepts[t] = true
 	}
 
-	for i, id := range s.queue {
+	for _, id := range s.queue {
 		p, ok := s.tasks[id]
 		if !ok || p.entry.State != StatePending {
 			continue
 		}
 		if len(accepts) > 0 && !accepts[p.entry.Task.Type] {
+			continue
+		}
+		if now.Before(p.notBefore) {
 			continue
 		}
 
@@ -360,16 +397,26 @@ func (s *Scheduler) Lease(ctx context.Context, req LeaseRequest) (*Task, error) 
 		}
 		p.entry.UpdatedAt = now
 		p.leasedAt = now
+		s.m.tasksInFlight.WithLabelValues(string(p.entry.Task.Type)).Inc()
 
 		if err := s.persistLocked(ctx); err != nil {
-			p.entry.State = StatePending
-			p.entry.Attempts--
-			p.entry.Lease = nil
+			if s.tasks[id] == p && p.entry.State == StateLeased && p.entry.Lease != nil && p.entry.Lease.Token == token {
+				p.entry.State = StatePending
+				p.entry.Attempts--
+				p.entry.Lease = nil
+				s.m.tasksInFlight.WithLabelValues(string(p.entry.Task.Type)).Dec()
+			}
 			return nil, err
 		}
+		if s.tasks[id] != p || p.entry.State != StateLeased || p.entry.Lease == nil || p.entry.Lease.Token != token {
+			return nil, compact.NewRetryError(errors.New("lease changed while persisting it"))
+		}
 
-		s.queue = append(s.queue[:i], s.queue[i+1:]...)
-		s.m.tasksInFlight.WithLabelValues(string(p.entry.Task.Type)).Inc()
+		// The lock was released during the persist, so the index may be stale:
+		// remove the id wherever it sits now.
+		if qi := slices.Index(s.queue, id); qi >= 0 {
+			s.queue = slices.Delete(s.queue, qi, qi+1)
+		}
 		s.updateQueueMetricsLocked()
 
 		task := p.entry.Task
@@ -438,10 +485,33 @@ func (s *Scheduler) Report(ctx context.Context, res Result) error {
 		p.entry.OutputChecksums = res.OutputChecksums
 	case res.Outcome.Aborted():
 		// The worker threw its work away, so this is not a failed attempt.
-		p.entry.State = StatePending
 		p.entry.Attempts--
+		p.entry.Aborts++
 		p.entry.LastError = &TaskError{Outcome: res.Outcome, Message: res.ErrorMessage}
-		s.queue = append(s.queue, res.TaskID)
+		if p.entry.Aborts >= abortCapFor(s.conf.MaxAttempts) {
+			// Every abort is benign in isolation, but an unbounded streak means
+			// something structural - a journal the workers cannot read, a fleet
+			// that never lives long enough - and requeueing would retry forever
+			// while the submitter waits with no timeout. Fail the task so the
+			// pass completes and the streak becomes visible.
+			p.entry.State = StateAbandoned
+			s.m.abandonedTasks.Inc()
+			res = Result{
+				TaskID:     res.TaskID,
+				LeaseToken: res.LeaseToken,
+				Generation: res.Generation,
+				Outcome:    OutcomeFailedRetryable,
+				ErrorMessage: errors.Errorf("task was aborted %d times in a row without completing (last abort: %s: %s); "+
+					"investigate why workers keep discarding it", p.entry.Aborts, p.entry.LastError.Outcome, p.entry.LastError.Message).Error(),
+			}
+			p.entry.LastError = &TaskError{Outcome: res.Outcome, Message: res.ErrorMessage}
+		} else {
+			p.entry.State = StatePending
+			// Back off before handing it out again, so a task that is aborted
+			// the moment it is leased does not churn through the fleet.
+			p.notBefore = now.Add(abortRequeueBackoff(p.entry.Aborts, s.conf.LeaseTTL))
+			s.queue = append(s.queue, res.TaskID)
+		}
 	case res.Outcome == OutcomeFailedRetryable:
 		p.entry.LastError = &TaskError{Outcome: res.Outcome, Block: res.OffendingBlock, Message: res.ErrorMessage}
 		if p.entry.Attempts >= s.conf.MaxAttempts {
@@ -466,6 +536,7 @@ func (s *Scheduler) Report(ctx context.Context, res Result) error {
 	// re-report cannot reach it, since the task is no longer leased. A stale
 	// journal entry merely means this manager's successor drops it at takeover
 	// and replans.
+	terminal := p.entry.State.Terminal()
 	persistErr := s.persistLocked(ctx)
 	s.updateQueueMetricsLocked()
 
@@ -485,7 +556,7 @@ func (s *Scheduler) Report(ctx context.Context, res Result) error {
 		return persistErr
 	}
 
-	if p.entry.State.Terminal() {
+	if terminal {
 		s.m.tasksTotal.WithLabelValues(string(p.entry.Task.Type), string(res.Outcome)).Inc()
 		s.m.taskAttempts.Observe(float64(p.entry.Attempts))
 		s.finishLocked(res.TaskID, res)
@@ -535,33 +606,14 @@ func oversizedReason(task Task, conf ManagerConfig) string {
 	return ""
 }
 
-// SourcesParked reports whether the journal still holds a parked - abandoned
-// or oversized - task over exactly these source blocks. Planning consults this
-// so a parked task's blocks are not replanned into a fresh task, which for an
-// abandoned set would repeat the worker-killing cycle forever and for an
-// oversized one would spam the journal with a new refusal every pass. The
-// block set stays parked until an operator releases it (see UnparkPath) or it
-// ages out of the journal retention.
+// SourcesParked reports whether any source belongs to an abandoned or oversized
+// task. New uploads must not reset a poison plan's retry budget. The operator
+// can release the sources with an unpark request or journal retention expiry.
 func (s *Scheduler) SourcesParked(sources []string) bool {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
-
-	want := make(map[string]struct{}, len(sources))
-	for _, b := range sources {
-		want[b] = struct{}{}
-	}
 	for _, e := range s.journal.Tasks {
-		if !e.State.Parked() || len(e.Task.SourceBlocks) != len(want) {
-			continue
-		}
-		match := true
-		for _, b := range e.Task.SourceBlocks {
-			if _, ok := want[b]; !ok {
-				match = false
-				break
-			}
-		}
-		if match {
+		if e.State.Parked() && slices.ContainsFunc(sources, func(id string) bool { return slices.Contains(e.Task.SourceBlocks, id) }) {
 			return true
 		}
 	}
@@ -584,6 +636,7 @@ func (s *Scheduler) finishLocked(taskID string, res Result) {
 // expireLeasesLocked requeues tasks whose worker stopped heartbeating.
 func (s *Scheduler) expireLeasesLocked() {
 	now := time.Now()
+	dirty := false
 	for id, p := range s.tasks {
 		if p.entry.State != StateLeased || p.entry.Lease == nil {
 			continue
@@ -599,59 +652,36 @@ func (s *Scheduler) expireLeasesLocked() {
 
 		p.entry.Lease = nil
 		p.entry.UpdatedAt = now
+		dirty = true
 
 		// A task that keeps losing its worker without ever reporting is treated as
 		// poisonous: retrying it forever would take the whole fleet down with it.
 		if p.entry.Attempts >= s.conf.MaxAttempts {
 			p.entry.State = StateAbandoned
-			p.entry.LastError = &TaskError{Outcome: OutcomeAbandoned, Message: "task abandoned after repeatedly losing its worker"}
+			p.entry.LastError = &TaskError{
+				Outcome: OutcomeAbandoned,
+				Message: "task abandoned after repeatedly losing its worker without a report; the source blocks are untouched",
+			}
 			s.m.abandonedTasks.Inc()
 			s.m.tasksTotal.WithLabelValues(string(p.entry.Task.Type), string(OutcomeAbandoned)).Inc()
 			level.Error(s.logger).Log("msg", "giving up on task after repeatedly losing its worker; "+
-				"its source blocks are parked, investigate before unparking", "task", id, "attempts", p.entry.Attempts)
-			s.finishLocked(id, Result{TaskID: id, Outcome: OutcomeAbandoned, ErrorMessage: "task abandoned after repeatedly losing its worker"})
+				"the source blocks are untouched, investigate before retrying", "task", id, "attempts", p.entry.Attempts)
+			s.finishLocked(id, Result{TaskID: id, Outcome: OutcomeAbandoned, ErrorMessage: p.entry.LastError.Message})
 			continue
 		}
 
 		p.entry.State = StatePending
 		s.queue = append(s.queue, id)
 	}
-}
 
-// persistLocked writes the journal, verifying first that no other manager has
-// taken it over.
-func (s *Scheduler) persistLocked(ctx context.Context) error {
-	current, err := ReadJournal(ctx, s.bkt, s.conf.JournalID)
-	if err == nil && current != nil && (current.Generation != s.journal.Generation || current.Owner != s.ownerID) {
-		// Another manager owns this journal now. The owner ID matters as much as
-		// the generation: two managers starting at the same time both bump the
-		// same generation, so only the owner tells them apart. Two managers
-		// writing the same journal is a misconfiguration this design cannot
-		// recover from, so stop.
-		return compact.NewHaltError(errors.Errorf(
-			"journal %s was taken over by another manager (generation %d owner %q, ours is %d owner %q); "+
-				"only one compactor manager may run per shard",
-			s.conf.JournalID, current.Generation, current.Owner, s.journal.Generation, s.ownerID))
-	}
-
-	if err == nil {
-		err = WriteJournal(ctx, s.bkt, s.journal)
-	}
-	if err != nil {
-		s.m.journalWriteFails.Inc()
-		if s.journalUnavailableSince.IsZero() {
-			s.journalUnavailableSince = time.Now()
+	if dirty {
+		if err := s.persistLocked(context.Background()); err != nil {
+			// Best effort: the transition is applied in memory either way, and
+			// the journal catches up on the next write. A takeover surfaces
+			// again, fatally, on the next regular persist.
+			level.Warn(s.logger).Log("msg", "could not persist expired leases; the journal catches up on the next write", "err", err)
 		}
-		if time.Since(s.journalUnavailableSince) > s.conf.JournalUnavailableTimeout {
-			return compact.NewHaltError(errors.Wrapf(err, "journal has been unwritable for %s", s.conf.JournalUnavailableTimeout))
-		}
-		return errors.Wrap(err, "write journal")
 	}
-
-	s.journalUnavailableSince = time.Time{}
-	s.lastPersist = time.Now()
-	s.m.journalWrites.Inc()
-	return nil
 }
 
 func (s *Scheduler) updateQueueMetricsLocked() {
@@ -683,7 +713,11 @@ func (s *Scheduler) updateQueueMetricsLocked() {
 	}
 
 	active := 0
-	for _, seen := range s.workerSeen {
+	for id, seen := range s.workerSeen {
+		if time.Since(seen) > 10*s.conf.LeaseTTL {
+			delete(s.workerSeen, id)
+			continue
+		}
 		if time.Since(seen) <= s.conf.LeaseTTL {
 			active++
 		}
@@ -820,6 +854,7 @@ type RemotePlanExecutor struct {
 	// maxInflightPerGroup bounds how many plans for one group are worked on at
 	// the same time.
 	maxInflightPerGroup int
+	deletableChecker    compact.BlockDeletableChecker
 
 	// journalID names this manager in the deletion marks it writes.
 	journalID string
@@ -831,7 +866,10 @@ type RemotePlanExecutor struct {
 // the first plan is still running. That is what lets a single block stream be
 // compacted by several workers at once, which one process cannot do because a
 // compaction job is single threaded.
-func NewRemotePlanExecutor(logger log.Logger, bkt objstore.Bucket, sched *Scheduler, planner compact.Planner, maxInflightPerGroup int) *RemotePlanExecutor {
+func NewRemotePlanExecutor(logger log.Logger, bkt objstore.Bucket, sched *Scheduler, planner compact.Planner, maxInflightPerGroup int, deletableChecker compact.BlockDeletableChecker) *RemotePlanExecutor {
+	if deletableChecker == nil {
+		deletableChecker = compact.DefaultBlockDeletableChecker{}
+	}
 	if maxInflightPerGroup <= 0 {
 		maxInflightPerGroup = 1
 	}
@@ -841,6 +879,7 @@ func NewRemotePlanExecutor(logger log.Logger, bkt objstore.Bucket, sched *Schedu
 		sched:               sched,
 		planner:             planner,
 		maxInflightPerGroup: maxInflightPerGroup,
+		deletableChecker:    deletableChecker,
 		journalID:           sched.conf.JournalID,
 	}
 }
@@ -888,15 +927,8 @@ func (e *RemotePlanExecutor) runPlan(ctx context.Context, cg *compact.Group, toC
 	if err := ReconstructError(res); err != nil {
 		return nil, err
 	}
-	if res.Outcome.Aborted() {
-		// The worker discarded its work, so there is nothing to verify and nothing
-		// went wrong with the compaction itself. Reporting no blocks and no error
-		// lets the compactor move on and pick the work up again on the next pass.
-		level.Info(e.logger).Log("msg", "worker discarded task without uploading", "task", task.ID, "outcome", res.Outcome)
-		return nil, nil
-	}
 
-	return e.verifyAndFinalize(ctx, cg, toCompact, res)
+	return e.verifyAndFinalize(ctx, cg, toCompact, res, overlappingBlocks)
 }
 
 // verifyAndFinalize checks that what a worker claims to have uploaded is really
@@ -908,7 +940,12 @@ func (e *RemotePlanExecutor) runPlan(ctx context.Context, cg *compact.Group, toC
 // a block that merely exists is not good enough. It has to carry this group's
 // labels and resolution, sit inside the plan's time range, and together the
 // outputs have to account for every source in the plan.
-func (e *RemotePlanExecutor) verifyAndFinalize(ctx context.Context, cg *compact.Group, toCompact []*metadata.Meta, res Result) ([]ulid.ULID, error) {
+func (e *RemotePlanExecutor) verifyAndFinalize(ctx context.Context, cg *compact.Group, toCompact []*metadata.Meta, res Result, overlappingBlocks bool) ([]ulid.ULID, error) {
+	checker := e.deletableChecker
+	if checker == nil {
+		checker = compact.DefaultBlockDeletableChecker{}
+	}
+
 	// An output block records the union of its parents' sources, not the
 	// parents' ULIDs, so that union is what the outputs must account for.
 	expected := map[ulid.ULID]struct{}{}
@@ -934,7 +971,7 @@ func (e *RemotePlanExecutor) verifyAndFinalize(ctx context.Context, cg *compact.
 			return nil, compact.NewRetryError(errors.Wrapf(err, "worker reported an unparseable block ID %q", raw))
 		}
 
-		rawMeta, err := readRawMeta(ctx, e.bkt, id)
+		rawMeta, err := readRawMetaWithRetry(ctx, e.bkt, id)
 		if err != nil {
 			return nil, compact.NewRetryError(errors.Wrapf(err, "verify result block %s reported by worker", id))
 		}
@@ -1004,6 +1041,9 @@ func (e *RemotePlanExecutor) verifyAndFinalize(ctx context.Context, cg *compact.
 		}
 		level.Info(e.logger).Log("msg", "task produced no blocks, deleting empty source blocks", "task", res.TaskID, "group", cg.Key())
 		for _, meta := range toCompact {
+			if !checker.CanDelete(cg, meta.ULID) {
+				continue
+			}
 			if err := block.MarkForDeletion(ctx, e.logger, e.bkt, meta.ULID, DeletionDetails(e.journalID, res.TaskID), cg.BlocksMarkedForDeletion()); err != nil {
 				return nil, compact.NewRetryError(errors.Wrapf(err, "mark empty source block %s for deletion", meta.ULID))
 			}
@@ -1029,12 +1069,18 @@ func (e *RemotePlanExecutor) verifyAndFinalize(ctx context.Context, cg *compact.
 		return nil, compact.NewRetryError(err)
 	}
 
+	cg.RecordCompaction(overlappingBlocks)
+
 	// Mark the sources for deletion now that the result is known to be in the
 	// bucket, so the next planning cycle does not pick them up again.
 	for _, meta := range toCompact {
+		if !checker.CanDelete(cg, meta.ULID) {
+			continue
+		}
 		if err := block.MarkForDeletion(ctx, e.logger, e.bkt, meta.ULID, DeletionDetails(e.journalID, res.TaskID), cg.BlocksMarkedForDeletion()); err != nil {
 			return nil, compact.NewRetryError(errors.Wrapf(err, "mark source block %s for deletion", meta.ULID))
 		}
+		cg.RecordSourceGarbageCollected()
 	}
 	return compIDs, nil
 }
@@ -1047,6 +1093,30 @@ func readRawMeta(ctx context.Context, bkt objstore.Bucket, id ulid.ULID) ([]byte
 	}
 	defer func() { _ = r.Close() }()
 	return io.ReadAll(r)
+}
+
+// Retry only the read, before any verification or source retirement. A brief
+// object-store failure should not discard a completed compaction pass.
+func readRawMetaWithRetry(ctx context.Context, bkt objstore.Bucket, id ulid.ULID) ([]byte, error) {
+	var err error
+	for attempt := range 3 {
+		if attempt > 0 {
+			if err := sleep(ctx, time.Duration(attempt)*100*time.Millisecond); err != nil {
+				return nil, err
+			}
+		}
+		readCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		var raw []byte
+		raw, err = readRawMeta(readCtx, bkt, id)
+		cancel()
+		if err == nil {
+			return raw, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+	}
+	return nil, err
 }
 
 // checksumOf returns the checksum of meta.json bytes in the form workers report.
@@ -1206,6 +1276,8 @@ func DispatchDownsampling(
 	hashFunc metadata.HashFunc,
 	blockFilesConcurrency int,
 	acceptMalformedIndex bool,
+	downsamples *prometheus.CounterVec,
+	downsampleFailures *prometheus.CounterVec,
 ) error {
 	candidates, err := downsample.Plan(metas)
 	if err != nil {
@@ -1220,12 +1292,19 @@ func DispatchDownsampling(
 
 	level.Info(logger).Log("msg", "dispatching downsampling to workers", "blocks", len(candidates))
 
-	var (
-		wg       sync.WaitGroup
-		sem      = make(chan struct{}, concurrency)
-		mtx      sync.Mutex
-		firstErr error
-	)
+	// The counters are the same per-resolution series the in-process
+	// downsampler feeds, so alerts on downsample failures keep firing when a
+	// deployment flips to manager mode. Nil vectors keep this callable from
+	// tests without metrics.
+	inc := func(vec *prometheus.CounterVec, resolution string) {
+		if vec != nil {
+			vec.WithLabelValues(resolution).Inc()
+		}
+	}
+
+	var g errgroup.Group
+	g.SetLimit(concurrency)
+	var failed atomic.Bool
 
 	for _, c := range candidates {
 		if sched.SourcesParked([]string{c.Meta.ULID.String()}) {
@@ -1241,41 +1320,35 @@ func DispatchDownsampling(
 			sched.MarkOversized(task, reason)
 			continue
 		}
-		wg.Add(1)
-		go func(task Task, c downsample.Candidate) {
-			defer wg.Done()
-
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-ctx.Done():
-				return
+		g.Go(func() error {
+			// Fail fast: once anything failed, no further tasks are submitted.
+			// What is already in flight is still awaited, so no task is left
+			// behind in the scheduler without a submitter.
+			if failed.Load() {
+				return nil
 			}
+			resolution := c.Meta.Thanos.ResolutionString()
 
 			resultCh, err := sched.Submit(ctx, task)
 			if err != nil {
-				recordErr(&mtx, &firstErr, errors.Wrap(err, "submit downsample task"))
-				return
+				failed.Store(true)
+				return errors.Wrap(err, "submit downsample task")
 			}
 
 			var res Result
 			select {
 			case <-ctx.Done():
-				recordErr(&mtx, &firstErr, ctx.Err())
-				return
+				failed.Store(true)
+				return ctx.Err()
 			case res = <-resultCh:
 			}
 
+			// Aborted outcomes never reach the submitter: the scheduler requeues
+			// them, and past the abort cap it fails the task.
 			if err := ReconstructError(res); err != nil {
-				recordErr(&mtx, &firstErr, errors.Wrapf(err, "downsample block %s", c.Meta.ULID))
-				return
-			}
-			if res.Outcome.Aborted() {
-				// Nothing was uploaded; the block is simply picked up again on the
-				// next pass.
-				level.Info(logger).Log("msg", "worker discarded downsample task without uploading",
-					"task", res.TaskID, "block", c.Meta.ULID, "outcome", res.Outcome)
-				return
+				failed.Store(true)
+				inc(downsampleFailures, resolution)
+				return errors.Wrapf(err, "downsample block %s", c.Meta.ULID)
 			}
 
 			// Confirm the downsampled block really is in the bucket, and really
@@ -1284,51 +1357,32 @@ func DispatchDownsampling(
 			// lose data the way it could for compaction, but accepting it would
 			// leave this block silently never downsampled.
 			if len(res.OutputBlocks) != 1 {
-				recordErr(&mtx, &firstErr, errors.Errorf("downsample task %s reported %d output blocks; expected exactly one", res.TaskID, len(res.OutputBlocks)))
-				return
+				failed.Store(true)
+				inc(downsampleFailures, resolution)
+				return compact.NewRetryError(errors.Errorf("downsample task %s reported %d output blocks; expected exactly one", res.TaskID, len(res.OutputBlocks)))
 			}
 			for _, raw := range res.OutputBlocks {
-				id, err := ulid.Parse(raw)
+				outMeta, err := fetchVerifiedMeta(ctx, bkt, raw, res.OutputChecksums)
 				if err != nil {
-					recordErr(&mtx, &firstErr, errors.Wrapf(err, "worker reported an unparseable block ID %q", raw))
-					return
+					failed.Store(true)
+					inc(downsampleFailures, resolution)
+					return compact.NewRetryError(errors.Wrapf(err, "downsample of %s", c.Meta.ULID))
 				}
-				rawMeta, err := readRawMeta(ctx, bkt, id)
-				if err != nil {
-					recordErr(&mtx, &firstErr, errors.Wrapf(err, "verify downsampled block %s", id))
-					return
-				}
-				sum, ok := res.OutputChecksums[raw]
-				if !ok || sum == "" {
-					recordErr(&mtx, &firstErr, errors.Errorf("worker reported no checksum for downsampled block %s", id))
-					return
-				}
-				if got := checksumOf(rawMeta); got != sum {
-					recordErr(&mtx, &firstErr, errors.Errorf(
-						"downsampled block %s metadata does not match the checksum the worker reported: got %s, reported %s", id, got, sum))
-					return
-				}
-				var outMeta metadata.Meta
-				if err := json.Unmarshal(rawMeta, &outMeta); err != nil {
-					recordErr(&mtx, &firstErr, errors.Wrapf(err, "unmarshal metadata of downsampled block %s", id))
-					return
-				}
-				if outMeta.ULID != id {
-					recordErr(&mtx, &firstErr, errors.Errorf("downsampled block %s holds metadata for %s", id, outMeta.ULID))
-					return
-				}
-				if err := verifyDownsampledBlock(&outMeta, c, Provenance{
+				if err := verifyDownsampledBlock(outMeta, c, Provenance{
 					TaskID: res.TaskID, TaskType: TaskDownsample, JournalID: sched.conf.JournalID, Generation: res.Generation,
+					Sources: []string{c.Meta.ULID.String()},
 				}); err != nil {
-					recordErr(&mtx, &firstErr, errors.Wrapf(err, "downsampled block %s reported for %s", id, c.Meta.ULID))
-					return
+					failed.Store(true)
+					inc(downsampleFailures, resolution)
+					return compact.NewRetryError(errors.Wrapf(err, "downsampled block %s reported for %s", outMeta.ULID, c.Meta.ULID))
 				}
 			}
-		}(task, c)
-	}
-	wg.Wait()
 
-	return firstErr
+			inc(downsamples, resolution)
+			return nil
+		})
+	}
+	return g.Wait()
 }
 
 // verifyDownsampledBlock checks that a block a worker reported is the
@@ -1363,10 +1417,41 @@ func verifyDownsampledBlock(outMeta *metadata.Meta, c downsample.Candidate, want
 	return nil
 }
 
-func recordErr(mtx *sync.Mutex, dst *error, err error) {
-	mtx.Lock()
-	defer mtx.Unlock()
-	if *dst == nil {
-		*dst = err
+func abortCapFor(maxAttempts int) int {
+	return 3 * maxAttempts
+}
+
+func abortRequeueBackoff(aborts int, leaseTTL time.Duration) time.Duration {
+	return min(time.Duration(aborts)*30*time.Second, leaseTTL)
+}
+
+func fetchVerifiedMeta(ctx context.Context, bkt objstore.Bucket, raw string, checksums map[string]string) (*metadata.Meta, error) {
+	id, err := ulid.Parse(raw)
+	if err != nil {
+		return nil, errors.Wrapf(err, "worker reported an unparseable block ID %q", raw)
 	}
+	rawMeta, err := readRawMetaWithRetry(ctx, bkt, id)
+	if err != nil {
+		return nil, errors.Wrapf(err, "verify result block %s reported by worker", id)
+	}
+	sum, ok := checksums[raw]
+	if !ok || sum == "" {
+		// The checksum is what binds the reported result to the metadata the
+		// worker observed after its upload; without it the block in the
+		// bucket could be anything. Workers always report it, so its absence
+		// is a verification failure, not a matter of degree.
+		return nil, errors.Errorf("worker reported no checksum for result block %s", id)
+	}
+	if got := checksumOf(rawMeta); got != sum {
+		return nil, errors.Errorf(
+			"result block %s metadata does not match the checksum the worker reported: got %s, reported %s", id, got, sum)
+	}
+	var meta metadata.Meta
+	if err := json.Unmarshal(rawMeta, &meta); err != nil {
+		return nil, errors.Wrapf(err, "unmarshal metadata of result block %s", id)
+	}
+	if meta.ULID.Compare(id) != 0 {
+		return nil, errors.Errorf("result block %s holds metadata for %s", id, meta.ULID)
+	}
+	return &meta, nil
 }

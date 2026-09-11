@@ -436,12 +436,14 @@ func (g *DefaultGrouper) Groups(blocks map[ulid.ULID]*metadata.Meta) (res []*Gro
 // Group captures a set of blocks that have the same origin labels and downsampling resolution.
 // Those blocks generally contain the same series and can thus efficiently be compacted.
 type Group struct {
-	logger                        log.Logger
-	bkt                           objstore.Bucket
-	key                           string
-	labels                        labels.Labels
-	resolution                    int64
-	mtx                           sync.Mutex
+	logger     log.Logger
+	bkt        objstore.Bucket
+	key        string
+	labels     labels.Labels
+	resolution int64
+	mtx        sync.Mutex
+	// compactRunMtx serializes whole runs while allowing the executor to plan under mtx.
+	compactRunMtx                 sync.Mutex
 	metasByMinTime                []*metadata.Meta
 	acceptMalformedIndex          bool
 	enableVerticalCompaction      bool
@@ -958,6 +960,9 @@ func (cg *Group) Compact(ctx context.Context, dir string, planner Planner, comp 
 // CompactWithExecutor plans a single compaction against the group and hands the
 // resulting plan to the given executor.
 func (cg *Group) CompactWithExecutor(ctx context.Context, dir string, planner Planner, executor PlanExecutor) (shouldRerun bool, compIDs []ulid.ULID, rerr error) {
+	cg.compactRunMtx.Lock()
+	defer cg.compactRunMtx.Unlock()
+
 	cg.compactionRunsStarted.Inc()
 
 	subDir := filepath.Join(dir, cg.Key())
@@ -1638,6 +1643,19 @@ func (cg *Group) compact(ctx context.Context, dir string, planner Planner, execu
 
 	// Even if no blocks were produced, because all sources were empty, there may be more work to do.
 	return true, compIDs, nil
+}
+
+// RecordCompaction records a verified remote compaction in the group metrics.
+func (cg *Group) RecordCompaction(overlappingBlocks bool) {
+	cg.compactions.Inc()
+	if overlappingBlocks {
+		cg.verticalCompactions.Inc()
+	}
+}
+
+// RecordSourceGarbageCollected records source retirement by a remote executor.
+func (cg *Group) RecordSourceGarbageCollected() {
+	cg.groupGarbageCollectedBlocks.Inc()
 }
 
 func (cg *Group) deleteBlock(id ulid.ULID, bdir string, blockDeletableChecker BlockDeletableChecker) error {

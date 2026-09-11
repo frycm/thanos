@@ -680,7 +680,7 @@ func newNode(t *testing.T, shared objstore.Bucket, handler *switchableHandler, c
 			MaxTaskSeries:      conf.maxTaskSeries,
 		})
 		testutil.Ok(t, err)
-		executor = NewRemotePlanExecutor(n.logger, n.bkt, n.sched, planner, conf.maxInflight)
+		executor = NewRemotePlanExecutor(n.logger, n.bkt, n.sched, planner, conf.maxInflight, nil)
 
 		mux := http.NewServeMux()
 		RegisterServer(mux, n.logger, n.sched)

@@ -31,7 +31,7 @@ func TestWorkerExecutionErrorDistinguishesCancellation(t *testing.T) {
 				cancel()
 			}
 			w := &Worker{}
-			result := w.triageExecutionError(ctx, Result{TaskID: "t"}, compact.NewHaltError(context.Canceled), tc.aborted, newAtomicBool(tc.acknowledged))
+			result := w.triageExecutionError(ctx, Result{TaskID: "t"}, compact.NewHaltError(context.Canceled), tc.aborted, testAtomicBool(tc.acknowledged))
 			testutil.Equals(t, tc.want, result.Outcome)
 			testutil.Equals(t, "t", result.TaskID)
 		})

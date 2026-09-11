@@ -5,14 +5,15 @@ package distributed
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
-	"io"
+	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
+	"github.com/efficientgo/core/backoff"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/oklog/ulid/v2"
@@ -25,7 +26,6 @@ import (
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/compact"
-	"github.com/thanos-io/thanos/pkg/runutil"
 )
 
 // WorkerConfig configures a compaction worker.
@@ -36,8 +36,9 @@ type WorkerConfig struct {
 	// It has to match the manager's.
 	JournalID string
 	// DedupFunc and DedupReplicaLabels are what the worker's compactor was built
-	// with (--deduplication.func and --deduplication.replica-label). They are
-	// stated when asking for work, and the manager refuses a mismatch.
+	// from (--deduplication.func and --deduplication.replica-label). They have
+	// to match the manager's; the manager refuses to lease to a worker where
+	// they do not, and the worker refuses a task stamped with another function.
 	DedupFunc          string
 	DedupReplicaLabels []string
 	// DataDir is where blocks are downloaded and compacted.
@@ -128,8 +129,11 @@ func NewWorker(logger log.Logger, bkt objstore.Bucket, client TaskClient, comp c
 	}, nil
 }
 
-// Run leases and executes tasks until the context is canceled.
+// Run leases and executes tasks until the context is cancelled.
 func (w *Worker) Run(ctx context.Context) error {
+	if err := w.cleanTaskDirectories(); err != nil {
+		return errors.Wrap(err, "clean abandoned worker task directories")
+	}
 	level.Info(w.logger).Log("msg", "compaction worker started", "worker_id", w.conf.WorkerID, "journal_id", w.conf.JournalID)
 
 	for ctx.Err() == nil {
@@ -172,7 +176,8 @@ func (w *Worker) runTask(ctx context.Context, task Task) {
 
 	// Heartbeat until the task is done. A heartbeat the manager refuses means the
 	// task was taken away, so stop working on it immediately.
-	acknowledged := newAtomicBool(true)
+	acknowledged := &atomic.Bool{}
+	acknowledged.Store(true)
 	go w.heartbeat(taskCtx, task, acknowledged, cancel)
 
 	start := time.Now()
@@ -183,7 +188,7 @@ func (w *Worker) runTask(ctx context.Context, task Task) {
 	level.Info(w.logger).Log("msg", "finished task", "task", task.ID, "outcome", res.Outcome,
 		"blocks", len(res.OutputBlocks), "duration", time.Since(start))
 
-	// Report on a context that is not tied to the task, so a canceled task still
+	// Report on a context that is not tied to the task, so a cancelled task still
 	// tells the manager what happened.
 	reportCtx, reportCancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer reportCancel()
@@ -205,7 +210,7 @@ func reportWithRetry(ctx context.Context, logger log.Logger, client TaskClient, 
 }
 
 func reportWithBackoff(ctx context.Context, logger log.Logger, client TaskClient, res Result, initial time.Duration) error {
-	backoff := initial
+	b := backoff.New(ctx, backoff.Config{Min: initial, Max: time.Minute})
 
 	var err error
 	for {
@@ -214,55 +219,117 @@ func reportWithBackoff(ctx context.Context, logger log.Logger, client TaskClient
 		}
 		level.Warn(logger).Log("msg", "could not report the result; retrying", "task", res.TaskID, "err", err)
 
-		if sleepErr := sleep(ctx, backoff); sleepErr != nil {
+		if !b.Ongoing() {
 			return err
 		}
-		if backoff < time.Minute {
-			backoff *= 2
-		}
+		b.Wait()
 	}
 }
 
-func (w *Worker) heartbeat(ctx context.Context, task Task, acknowledged *atomicBool, cancel context.CancelFunc) {
-	ticker := time.NewTicker(w.conf.HeartbeatInterval)
-	defer ticker.Stop()
+// effectiveHeartbeatInterval reconciles the worker's configured heartbeat
+// interval with the lease TTL the task actually carries. Nothing validates the
+// two flags against each other - they live on different processes - and a TTL
+// at or below the configured interval would silently guarantee that every
+// task's lease expires before its first heartbeat.
+func effectiveHeartbeatInterval(configured, leaseTTL time.Duration) time.Duration {
+	if leaseTTL > 0 && leaseTTL/3 < configured {
+		return max(leaseTTL/3, time.Nanosecond)
+	}
+	return configured
+}
+
+func (w *Worker) heartbeat(ctx context.Context, task Task, acknowledged *atomic.Bool, cancel context.CancelFunc) {
+	interval := effectiveHeartbeatInterval(w.conf.HeartbeatInterval, task.LeaseTTL)
+	if interval != w.conf.HeartbeatInterval {
+		level.Warn(w.logger).Log("msg", "heartbeat interval is too long for the lease TTL; heartbeating faster",
+			"configured", w.conf.HeartbeatInterval, "lease_ttl", task.LeaseTTL, "effective", interval)
+	}
+	// time.Tick: the ticker lives exactly as long as this goroutine, and since
+	// Go 1.23 an unreferenced ticker is collected without Stop.
+	tick := time.Tick(interval)
+	lastAcknowledged := time.Now()
+	abandon := func() {
+		acknowledged.Store(false)
+		cancel()
+	}
 
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return
-		case <-ticker.C:
 		}
-
-		resp, err := w.client.Heartbeat(ctx, HeartbeatRequest{
+		deadline := lastAcknowledged.Add(task.LeaseTTL)
+		if task.LeaseTTL <= 0 || !time.Now().Before(deadline) {
+			abandon()
+			return
+		}
+		beatCtx, stopBeat := context.WithDeadline(ctx, deadline)
+		// Beat first: an immediate heartbeat pins the lease down right away
+		// instead of leaving the first full interval uncovered.
+		resp, err := w.client.Heartbeat(beatCtx, HeartbeatRequest{
 			TaskID:     task.ID,
 			LeaseToken: task.LeaseToken,
 			Generation: task.Generation,
 		})
-		if err != nil {
-			level.Warn(w.logger).Log("msg", "heartbeat failed", "task", task.ID, "err", err)
-			continue
-		}
-		if !resp.Acknowledged {
-			level.Warn(w.logger).Log("msg", "the manager no longer recognizes our lease; abandoning the task", "task", task.ID)
-			acknowledged.set(false)
-			cancel()
+		stopBeat()
+		if ctx.Err() != nil {
 			return
+		}
+		if !time.Now().Before(deadline) {
+			abandon()
+			return
+		}
+		if err != nil {
+			if ctx.Err() == nil {
+				level.Warn(w.logger).Log("msg", "heartbeat failed", "task", task.ID, "err", err)
+			}
+		} else if !resp.Acknowledged {
+			level.Warn(w.logger).Log("msg", "the manager no longer recognises our lease; abandoning the task", "task", task.ID)
+			abandon()
+			return
+		} else {
+			lastAcknowledged = time.Now()
+		}
+
+		expires := time.NewTimer(time.Until(lastAcknowledged.Add(task.LeaseTTL)))
+		select {
+		case <-ctx.Done():
+			expires.Stop()
+			return
+		case <-expires.C:
+			abandon()
+			return
+		case <-tick:
+			expires.Stop()
 		}
 	}
 }
 
 // execute does the actual work for a task.
-func (w *Worker) execute(ctx context.Context, task Task, acknowledged *atomicBool) Result {
+func (w *Worker) execute(ctx context.Context, task Task, acknowledged *atomic.Bool) Result {
 	res := Result{
 		TaskID:     task.ID,
 		LeaseToken: task.LeaseToken,
 		Generation: task.Generation,
 	}
+	id, err := ulid.ParseStrict(task.ID)
+	if err != nil || id.String() != task.ID {
+		res.Outcome = OutcomeFailedRetryable
+		res.ErrorMessage = "task ID must be a canonical ULID"
+		return res
+	}
 
 	if task.Type != TaskCompaction && task.Type != TaskDownsample {
 		res.Outcome = OutcomeFailedRetryable
 		res.ErrorMessage = "unsupported task type " + string(task.Type)
+		return res
+	}
+	if task.Group.DedupFunc != w.conf.DedupFunc {
+		// The lease-time check covers a live manager; a task stamped by one
+		// configured differently (a journal taken over after a config change)
+		// is still refused, retryable so that a matching worker can pick it up.
+		res.Outcome = OutcomeFailedRetryable
+		res.ErrorMessage = fmt.Sprintf("task was planned for deduplication func %q, this worker deduplicates with %q",
+			describeDedupFunc(task.Group.DedupFunc), describeDedupFunc(w.conf.DedupFunc))
 		return res
 	}
 
@@ -287,13 +354,13 @@ func (w *Worker) execute(ctx context.Context, task Task, acknowledged *atomicBoo
 	// block becomes visible, and fails closed.
 	var aborted Outcome
 	ownershipGate := func(ctx context.Context) error {
-		if !acknowledged.get() {
+		if !acknowledged.Load() {
 			w.m.ownershipCheckFailures.WithLabelValues("lease_not_acknowledged").Inc()
 			aborted = OutcomeAbortedOwnershipLost
 			return errors.New("the manager no longer acknowledges our lease")
 		}
 
-		status, err := CheckOwnership(ctx, w.bkt, w.conf.JournalID, task.ID, task.LeaseToken, task.Generation)
+		status, err := CheckOwnership(ctx, w.bkt, w.conf.JournalID, task.ID, task.LeaseToken, task.Generation, task.LeaseTTL)
 		switch status {
 		case OwnershipConfirmed:
 			return nil
@@ -317,17 +384,7 @@ func (w *Worker) execute(ctx context.Context, task Task, acknowledged *atomicBoo
 		if err != nil {
 			return w.triageExecutionError(ctx, res, err, aborted, acknowledged)
 		}
-		res.Outcome = OutcomeCompleted
-		res.OutputChecksums = map[string]string{}
-		for _, id := range outIDs {
-			res.OutputBlocks = append(res.OutputBlocks, id.String())
-			if sum, err := metaChecksum(ctx, w.bkt, id); err == nil {
-				res.OutputChecksums[id.String()] = sum
-			} else if ctx.Err() != nil {
-				return w.triageExecutionError(ctx, res, err, "", acknowledged)
-			}
-		}
-		return res
+		return w.completeResult(ctx, res, outIDs, acknowledged)
 	}
 
 	executor := compact.LocalPlanExecutor{
@@ -337,6 +394,8 @@ func (w *Worker) execute(ctx context.Context, task Task, acknowledged *atomicBoo
 		// Only the manager touches source blocks.
 		MarkSourcesForDeletion: false,
 		PreUploadCheck: func(ctx context.Context, _ *compact.Group, compIDs []ulid.ULID) error {
+			// The result blocks exist on disk by now but not in the bucket, so
+			// this is where their provenance can be completed with their IDs.
 			if err := w.stampOutputs(task, dir, compIDs); err != nil {
 				return err
 			}
@@ -348,30 +407,43 @@ func (w *Worker) execute(ctx context.Context, task Task, acknowledged *atomicBoo
 	if err != nil {
 		return w.triageExecutionError(ctx, res, err, aborted, acknowledged)
 	}
-
-	res.Outcome = OutcomeCompleted
-	res.OutputChecksums = map[string]string{}
-	for _, id := range compIDs {
-		res.OutputBlocks = append(res.OutputBlocks, id.String())
-		sum, err := metaChecksum(ctx, w.bkt, id)
-		if err != nil {
-			if ctx.Err() != nil {
-				return w.triageExecutionError(ctx, res, err, "", acknowledged)
-			}
-			level.Warn(w.logger).Log("msg", "could not checksum the result block metadata", "block", id, "err", err)
-			continue
-		}
-		res.OutputChecksums[id.String()] = sum
-	}
-	return res
+	return w.completeResult(ctx, res, compIDs, acknowledged)
 }
 
-// triageExecutionError separates lifecycle cancellation from errors in the
-// data. TSDB compaction can wrap context cancellation as a halt error.
-func (w *Worker) triageExecutionError(ctx context.Context, res Result, err error, aborted Outcome, acknowledged *atomicBool) Result {
+// DataDir belongs to one worker process. Only its ULID task directories are
+// removed on startup; unrelated files and symlinks are left alone.
+func (w *Worker) cleanTaskDirectories() error {
+	entries, err := os.ReadDir(w.conf.DataDir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		id, err := ulid.ParseStrict(entry.Name())
+		if err != nil || id.String() != entry.Name() {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(w.conf.DataDir, entry.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// triageExecutionError decides what outcome an execution error really is. The
+// order matters: a failed ownership check and a revoked lease both surface as
+// wrapped context errors, and so does the worker being asked to shut down, so
+// each has to be told apart before the error is classified as a compaction
+// failure.
+func (w *Worker) triageExecutionError(ctx context.Context, res Result, err error, aborted Outcome, acknowledged *atomic.Bool) Result {
 	res.ErrorMessage = err.Error()
 	switch {
-	case !acknowledged.get():
+	case !acknowledged.Load():
 		res.Outcome = OutcomeAbortedOwnershipLost
 	case ctx.Err() != nil:
 		res.Outcome = OutcomeAbortedWorkerShutdown
@@ -383,15 +455,33 @@ func (w *Worker) triageExecutionError(ctx context.Context, res Result, err error
 	return res
 }
 
+// completeResult builds the completed result for uploaded blocks. The manager
+// refuses a completion whose checksums are missing, so if a checksum cannot be
+// read back the worker reports an abort instead: the blocks are in the bucket,
+// but their delivery could not be confirmed. The requeued task's duplicate
+// result is reconciled by block deduplication, exactly as for a lost report.
+func (w *Worker) completeResult(ctx context.Context, res Result, ids []ulid.ULID, acknowledged *atomic.Bool) Result {
+	res.OutputChecksums = map[string]string{}
+	for _, id := range ids {
+		sum, err := metaChecksumRetry(ctx, w.bkt, id)
+		if err != nil {
+			level.Warn(w.logger).Log("msg", "could not checksum an uploaded result block; discarding the report", "block", id, "err", err)
+			res.OutputBlocks, res.OutputChecksums = nil, nil
+			return w.triageExecutionError(ctx, res, errors.Wrapf(err, "confirm the checksum of uploaded result block %s", id), OutcomeAbortedStoreUnreachable, acknowledged)
+		}
+		res.OutputBlocks = append(res.OutputBlocks, id.String())
+		res.OutputChecksums[id.String()] = sum
+	}
+	res.Outcome = OutcomeCompleted
+	return res
+}
+
 // rebuildGroup reconstructs the compaction group from the task, reading the
 // metadata of the source blocks from the bucket rather than trusting what came
 // over the wire.
 func (w *Worker) rebuildGroup(ctx context.Context, task Task) (*compact.Group, []*metadata.Meta, error) {
 	noopCounter := func() prometheus.Counter {
-		return prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "thanos_compact_worker_noop_total",
-			Help: "Never exposed; the group needs counters and the worker's live elsewhere.",
-		})
+		return prometheus.NewCounter(prometheus.CounterOpts{Name: "thanos_compact_worker_noop"})
 	}
 
 	var extensions any
@@ -419,8 +509,9 @@ func (w *Worker) rebuildGroup(ctx context.Context, task Task) (*compact.Group, [
 		return nil, nil, errors.Wrap(err, "rebuild compaction group")
 	}
 
-	// The result block inherits the group's extensions, so stamping them here
-	// is what records on the block which task produced it.
+	// The result blocks inherit the group's extensions. The provenance is
+	// completed per block before upload, see stampOutputs; stamping the group
+	// here makes sure nothing else in the extensions collides with it.
 	stamped, err := w.provenance(task).Stamp(extensions)
 	if err != nil {
 		return nil, nil, err
@@ -468,55 +559,6 @@ func (w *Worker) rebuildGroup(ctx context.Context, task Task) (*compact.Group, [
 	return cg, metas, nil
 }
 
-// stripDedupReplicaLabels removes the manager's deduplication replica labels
-// from fetched block metadata, mirroring what ReplicaLabelRemover did on the
-// manager before grouping - including the placeholder it leaves when a block
-// has no labels left. Without this, blocks of a deduplication deployment could
-// never validate against their group, whose labels are already stripped.
-func stripDedupReplicaLabels(m *metadata.Meta, replicaLabels []string) {
-	if len(replicaLabels) == 0 {
-		return
-	}
-	stripped := make(map[string]string, len(m.Thanos.Labels))
-	for k, v := range m.Thanos.Labels {
-		stripped[k] = v
-	}
-	for _, l := range replicaLabels {
-		delete(stripped, l)
-	}
-	if len(stripped) == 0 {
-		stripped[replicaLabels[0]] = "deduped"
-	}
-	m.Thanos.Labels = stripped
-}
-
-// metaChecksum returns the checksum of a block's meta.json as it is in the
-// bucket, so the manager can verify what the worker claims it uploaded.
-func metaChecksum(ctx context.Context, bkt objstore.Bucket, id ulid.ULID) (string, error) {
-	r, err := bkt.Get(ctx, filepath.Join(id.String(), block.MetaFilename))
-	if err != nil {
-		return "", err
-	}
-	defer runutil.CloseWithLogOnErr(log.NewNopLogger(), r, "close meta reader")
-
-	h := sha256.New()
-	if _, err := io.Copy(h, r); err != nil {
-		return "", err
-	}
-	return "sha256:" + hex.EncodeToString(h.Sum(nil)), nil
-}
-
-func sleep(ctx context.Context, d time.Duration) error {
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-t.C:
-		return nil
-	}
-}
-
 // provenance is the record of this task every block it produces carries,
 // before it is completed for a block with For.
 func (w *Worker) provenance(task Task) Provenance {
@@ -554,4 +596,75 @@ func (w *Worker) stampOutputs(task Task, dir string, compIDs []ulid.ULID) error 
 		}
 	}
 	return nil
+}
+
+// stripDedupReplicaLabels removes the manager's deduplication replica labels
+// from fetched block metadata, mirroring what ReplicaLabelRemover did on the
+// manager before grouping - including the placeholder it leaves when a block
+// has no labels left. Without this, blocks of a deduplication deployment could
+// never validate against their group, whose labels are already stripped.
+func stripDedupReplicaLabels(m *metadata.Meta, replicaLabels []string) {
+	if len(replicaLabels) == 0 {
+		return
+	}
+	stripped := maps.Clone(m.Thanos.Labels)
+	if stripped == nil {
+		stripped = map[string]string{}
+	}
+	for _, l := range replicaLabels {
+		delete(stripped, l)
+	}
+	if len(stripped) == 0 {
+		stripped[replicaLabels[0]] = "deduped"
+	}
+	m.Thanos.Labels = stripped
+}
+
+// metaChecksum returns the checksum of a block's meta.json as it is in the
+// bucket, so the manager can verify what the worker claims it uploaded. The
+// bucket is read back rather than the local file hashed because block.Upload
+// re-encodes the metadata (file stats, upload time) on its way out, so only the
+// bucket holds the bytes the manager will verify against.
+func metaChecksum(ctx context.Context, bkt objstore.Bucket, id ulid.ULID) (string, error) {
+	raw, err := readRawMeta(ctx, bkt, id)
+	if err != nil {
+		return "", err
+	}
+	return checksumOf(raw), nil
+}
+
+// metaChecksumRetryBackoff is the base delay between checksum read-back
+// retries. A variable so tests do not have to wait for real backoffs.
+var metaChecksumRetryBackoff = 2 * time.Second
+
+// metaChecksumRetry is metaChecksum with a few retries, because a completion
+// report without a checksum is worthless: the manager rejects it and the whole
+// task is executed again.
+func metaChecksumRetry(ctx context.Context, bkt objstore.Bucket, id ulid.ULID) (string, error) {
+	var (
+		sum string
+		err error
+	)
+	for attempt := range 3 {
+		if attempt > 0 {
+			if sleepErr := sleep(ctx, time.Duration(attempt)*metaChecksumRetryBackoff); sleepErr != nil {
+				return "", err
+			}
+		}
+		if sum, err = metaChecksum(ctx, bkt, id); err == nil {
+			return sum, nil
+		}
+	}
+	return "", err
+}
+
+func sleep(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
