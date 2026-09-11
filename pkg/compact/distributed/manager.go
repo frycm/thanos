@@ -193,6 +193,10 @@ type Scheduler struct {
 	tasks      map[string]*pendingTask
 	queue      []string
 	workerSeen map[string]time.Time
+	// halted is the error the manager's control loop halted on, once it has.
+	// A halted scheduler hands out nothing and accepts nothing: the shard is
+	// frozen for investigation, as a standalone compactor would be.
+	halted error
 
 	// persistSeq and lastPersist are protected by mtx.
 	persistSeq  uint64
@@ -281,6 +285,10 @@ func (s *Scheduler) Submit(ctx context.Context, task Task) (<-chan Result, error
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
+	if s.halted != nil {
+		return nil, compact.NewHaltError(errors.Wrap(s.halted, "manager is halted"))
+	}
+
 	task.Generation = s.journal.Generation
 	task.LeaseTTL = s.conf.LeaseTTL
 	task.Group.DedupFunc = s.conf.DedupFunc
@@ -337,6 +345,13 @@ func (s *Scheduler) Submit(ctx context.Context, task Task) (<-chan Result, error
 func (s *Scheduler) Lease(ctx context.Context, req LeaseRequest) (*Task, error) {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
+
+	if s.halted != nil {
+		// Nothing to hand out while the shard is frozen; the workers idle
+		// until an operator restarts the manager.
+		s.workerSeen[req.WorkerID] = time.Now()
+		return nil, nil
+	}
 
 	if req.JournalID != "" && req.JournalID != s.conf.JournalID {
 		// A worker on the wrong journal would fail its ownership check against
@@ -640,6 +655,57 @@ func (s *Scheduler) SourcesParked(sources []string) bool {
 		}
 	}
 	return false
+}
+
+// Halt freezes the shard after the manager's control loop halted on cause:
+// every lease is revoked, so the workers holding them fail their next
+// heartbeat or ownership check and discard their work; every queued task is
+// failed with the halt as its reason; and no task is handed out or accepted
+// until the manager is restarted. This mirrors a standalone compactor, which
+// stops everything on a halt - a manager that kept feeding its fleet would
+// leave a halted shard busy producing outputs nobody verifies.
+//
+// The revocation is written to the journal so a worker that has already
+// stopped heartbeating still sees it at its ownership check before upload.
+// Idempotent: a second halt changes nothing.
+func (s *Scheduler) Halt(cause error) {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	if s.halted != nil {
+		return
+	}
+	s.halted = cause
+	msg := errors.Wrap(cause, "manager halted").Error()
+
+	now := time.Now()
+	revoked, failed := 0, 0
+	for id, p := range s.tasks {
+		if p.entry.State == StateLeased {
+			s.m.tasksInFlight.WithLabelValues(string(p.entry.Task.Type)).Dec()
+			revoked++
+		} else {
+			failed++
+		}
+		p.entry.State = StateFailed
+		p.entry.Lease = nil
+		p.entry.UpdatedAt = now
+		p.entry.LastError = &TaskError{Outcome: OutcomeFailedHalt, Message: msg}
+		s.m.tasksTotal.WithLabelValues(string(p.entry.Task.Type), string(OutcomeFailedHalt)).Inc()
+		s.finishLocked(id, Result{TaskID: id, Outcome: OutcomeFailedHalt, ErrorMessage: msg})
+	}
+	s.queue = nil
+	s.updateQueueMetricsLocked()
+	level.Error(s.logger).Log("msg", "manager halted; leases revoked and the queue failed, workers will idle until the manager is restarted",
+		"revoked_leases", revoked, "failed_queued", failed, "cause", cause)
+
+	if err := s.persistLocked(context.Background()); err != nil {
+		// Best effort: the leases are void in memory either way, so the
+		// workers' heartbeats are refused, and the next takeover rewrites
+		// the journal. Only an ownership check racing this write could still
+		// pass, and its output is a same-sources duplicate the dedup filter
+		// reconciles.
+		level.Warn(s.logger).Log("msg", "could not persist the halt to the journal", "err", err)
+	}
 }
 
 // enqueueLocked appends a task to the queue unless it is already waiting. The

@@ -363,3 +363,61 @@ func TestMaintenanceWaitingForJournalDoesNotBlockHeartbeats(t *testing.T) {
 	<-done
 	testutil.Ok(t, <-maintenance)
 }
+
+// TestHaltFreezesTheFleet pins down that a halted manager stops its fleet the
+// way a halt stops a standalone compactor: leases are revoked so heartbeats
+// and ownership checks fail, queued work is failed in the journal with the
+// halt as its reason, and nothing is leased or accepted afterwards.
+func TestHaltFreezesTheFleet(t *testing.T) {
+	ctx := context.Background()
+	bkt := objstore.NewInMemBucket()
+	sched, err := NewScheduler(ctx, log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{JournalID: "shard-halt"})
+	testutil.Ok(t, err)
+
+	leasedCh, err := sched.Submit(ctx, Task{ID: "t-leased", Type: TaskCompaction})
+	testutil.Ok(t, err)
+	queuedCh, err := sched.Submit(ctx, Task{ID: "t-queued", Type: TaskCompaction})
+	testutil.Ok(t, err)
+	leased, err := sched.Lease(ctx, LeaseRequest{WorkerID: "w1", Accepts: []TaskType{TaskCompaction}})
+	testutil.Ok(t, err)
+	testutil.Equals(t, "t-leased", leased.ID)
+
+	sched.Halt(errors.New("pre compaction overlap check"))
+	sched.Halt(errors.New("again")) // Idempotent.
+
+	// The worker holding the lease is cut off, in memory and in the journal.
+	testutil.Equals(t, false, sched.Heartbeat(HeartbeatRequest{TaskID: leased.ID, LeaseToken: leased.LeaseToken, Generation: leased.Generation}).Acknowledged)
+	status, _ := CheckOwnership(ctx, bkt, "shard-halt", leased.ID, leased.LeaseToken, leased.Generation, sched.conf.LeaseTTL)
+	testutil.Equals(t, OwnershipLost, status)
+	testutil.Ok(t, sched.Report(ctx, Result{TaskID: leased.ID, LeaseToken: leased.LeaseToken, Generation: leased.Generation, Outcome: OutcomeCompleted}))
+
+	// Both tasks are failed with the halt as the reason, and their submitters
+	// hear about it.
+	for _, ch := range []<-chan Result{leasedCh, queuedCh} {
+		select {
+		case res := <-ch:
+			testutil.Equals(t, OutcomeFailedHalt, res.Outcome)
+			testutil.Assert(t, strings.Contains(res.ErrorMessage, "manager halted: pre compaction overlap check"), res.ErrorMessage)
+		default:
+			t.Fatal("the halt must be delivered to every submitter")
+		}
+	}
+	j, err := ReadJournal(ctx, bkt, "shard-halt")
+	testutil.Ok(t, err)
+	for _, id := range []string{"t-leased", "t-queued"} {
+		testutil.Equals(t, StateFailed, j.Tasks[id].State)
+		testutil.Assert(t, j.Tasks[id].Lease == nil, "leases must be revoked in the journal")
+		testutil.Equals(t, OutcomeFailedHalt, j.Tasks[id].LastError.Outcome)
+	}
+
+	// Nothing goes out or comes in until a restart.
+	task, err := sched.Lease(ctx, LeaseRequest{WorkerID: "w2", Accepts: []TaskType{TaskCompaction}})
+	testutil.Ok(t, err)
+	testutil.Assert(t, task == nil, "a halted manager hands out nothing")
+	_, err = sched.Submit(ctx, Task{ID: "t-late", Type: TaskCompaction})
+	testutil.Assert(t, compact.IsHaltError(err), "a halted manager accepts nothing, got %v", err)
+	sched.mtx.Lock()
+	testutil.Equals(t, 0, len(sched.queue))
+	testutil.Equals(t, 0, len(sched.tasks))
+	sched.mtx.Unlock()
+}

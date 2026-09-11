@@ -585,6 +585,13 @@ func runCompact(
 				if conf.haltOnError {
 					level.Error(logger).Log("msg", "critical error detected; halting", "err", err)
 					compactMetrics.halted.Set(1)
+					if scheduler != nil {
+						// Freeze the fleet too: the task API keeps serving
+						// while this loop blocks, and without this the
+						// workers would keep executing queued tasks whose
+						// outputs nobody verifies.
+						scheduler.Halt(err)
+					}
 					select {}
 				} else {
 					return errors.Wrap(err, "critical error detected")
