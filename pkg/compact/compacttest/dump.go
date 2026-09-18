@@ -51,7 +51,8 @@ const AggrRaw = downsample.AggrType(math.MaxUint8)
 // AggrTypes are the aggregates read from downsampled blocks.
 var AggrTypes = []downsample.AggrType{downsample.AggrCount, downsample.AggrSum, downsample.AggrMin, downsample.AggrMax, downsample.AggrCounter}
 
-// ServedBlock is one block a store gateway would load from the bucket.
+// ServedBlock is one block a store gateway would load from the bucket. Ext
+// keeps the compactor's shard label, so overlaps are judged per shard.
 type ServedBlock struct {
 	ID      ulid.ULID
 	Ext     string
@@ -161,7 +162,9 @@ func (d *BucketDump) ReadBlock(t *testing.T, ctx context.Context, bkt objstore.B
 	k, v := index.AllPostingsKey()
 	all, err := indexr.Postings(ctx, k, v)
 	testutil.Ok(t, err)
-	ext := labels.FromMap(m.Thanos.Labels).String()
+	// Keyed as a store gateway serves it: without the compactor's shard label,
+	// so that a split range and an unsplit one compare equal.
+	ext := labels.NewBuilder(labels.FromMap(m.Thanos.Labels)).Del(metadata.CompactorShardLabel).Labels().String()
 	for all.Next() {
 		var builder labels.ScratchBuilder
 		var chks []chunks.Meta

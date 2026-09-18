@@ -38,10 +38,14 @@ import (
 // NodeConfig is the configuration of one compactor process that every
 // compactor, whatever executes its plans, shares.
 type NodeConfig struct {
-	DedupReplicaLabels   []string
-	DedupFunc            string
-	DeleteDelay          time.Duration
-	Levels               []int64
+	DedupReplicaLabels []string
+	DedupFunc          string
+	DeleteDelay        time.Duration
+	Levels             []int64
+	// Split is --compact.block-split.*; the zero value never splits.
+	Split compact.SplitConfig
+	// MaxIndexSize is --compact.block-max-index-size; zero means unlimited.
+	MaxIndexSize         int64
 	Concurrency          int
 	AcceptMalformedIndex bool
 }
@@ -128,9 +132,13 @@ func counter() prometheus.Counter {
 func NewNode(t *testing.T, shared objstore.Bucket, conf NodeConfig, hooks Hooks) *Node {
 	t.Helper()
 	conf = conf.WithDefaults()
+	logger := log.NewNopLogger()
+	if os.Getenv("COMPACTTEST_DEBUG") != "" {
+		logger = log.With(log.NewLogfmtLogger(os.Stderr), "node", t.Name())
+	}
 	n := &Node{
 		T:      t,
-		Logger: log.NewNopLogger(),
+		Logger: logger,
 		Conf:   conf,
 		Bkt:    NewHookBucket(shared),
 		Dir:    t.TempDir(),
@@ -164,10 +172,24 @@ func NewNode(t *testing.T, shared objstore.Bucket, conf NodeConfig, hooks Hooks)
 
 	grouper := compact.NewDefaultGrouper(n.Logger, insBkt, conf.AcceptMalformedIndex, conf.Vertical(), n.Reg, counter(), counter(), counter(), metadata.NoneFunc, 1, 1)
 	tsdbPlanner := compact.NewPlanner(n.Logger, conf.Levels, n.NoCompactFilter)
-	largeIndexPlanner := compact.WithLargeTotalIndexSizeFilter(tsdbPlanner, insBkt, math.MaxInt64, counter())
+	if conf.Split.Enabled() {
+		tsdbPlanner = tsdbPlanner.WithStreamNewestAcrossShards(n.Syncer.Metas)
+	}
+	indexLimit := conf.MaxIndexSize
+	if indexLimit <= 0 {
+		indexLimit = math.MaxInt64
+	}
+	largeIndexPlanner := compact.WithLargeTotalIndexSizeFilter(tsdbPlanner, insBkt, conf.Split.PlannerIndexSizeLimit(indexLimit), counter())
 	var planner compact.Planner = largeIndexPlanner
 	if conf.Vertical() {
 		planner = compact.WithVerticalCompactionDownsampleFilter(largeIndexPlanner, insBkt, counter())
+	}
+	if conf.Split.Enabled() {
+		split := conf.Split
+		if split.MaxIndexSizeBytes == 0 {
+			split.MaxIndexSizeBytes = conf.MaxIndexSize
+		}
+		planner = compact.WithBlockSplitting(planner, n.Logger, split, nil, insBkt, counter(), n.Syncer.Metas, n.NoCompactFilter.NoCompactMarkedBlocks)
 	}
 	cleaner := compact.NewBlocksCleaner(n.Logger, insBkt, ignoreDeletionMarkFilter, conf.DeleteDelay, counter(), counter())
 
