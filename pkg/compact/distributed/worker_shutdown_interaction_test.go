@@ -41,7 +41,7 @@ func TestWorkerShutdownAtExecutionStages(t *testing.T) {
 			t.Run(string(taskType)+"/"+stage, func(t *testing.T) {
 				c := newTestCluster(t)
 				cg, metas := c.makeGroup(labels.FromStrings("ext", "1"))
-				task, err := CompactionTask(cg, metas, false)
+				task, err := CompactionTask(cg, compact.Plan{Sources: metas})
 				testutil.Ok(t, err)
 				if taskType == TaskDownsample {
 					task = DownsampleTask(metas[0], downsample.ResLevel1, metadata.NoneFunc, 1, false, nil)

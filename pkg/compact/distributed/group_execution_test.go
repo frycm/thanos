@@ -77,7 +77,7 @@ func TestParkedPlanDoesNotStarveDisjointWork(t *testing.T) {
 	testutil.Ok(t, err)
 	testutil.Equals(t, 4, len(first.Sources))
 	sched := testScheduler(t, bkt, ManagerConfig{})
-	task, err := CompactionTask(cg, first.Sources, first.OverlappingBlocks)
+	task, err := CompactionTask(cg, first)
 	testutil.Ok(t, err)
 	sched.MarkOversized(task, "review: parked first plan")
 	executor := NewRemotePlanExecutor(logger, bkt, sched, planner, 1, nil)
@@ -119,17 +119,17 @@ func TestParkedPlanDoesNotStarveDisjointWork(t *testing.T) {
 // planGroup collects the first slots to inspect the production iterator without
 // dispatching tasks. Execute consumes the same iterator as slots become free.
 func (e *RemotePlanExecutor) planGroup(ctx context.Context, cg *compact.Group, first []*metadata.Meta) [][]*metadata.Meta {
-	p := groupPlans{executor: e, group: cg, first: first, excluded: map[ulid.ULID]struct{}{}}
+	p := groupPlans{executor: e, group: cg, first: compact.Plan{Sources: first}, excluded: map[ulid.ULID]struct{}{}}
 	var plans [][]*metadata.Meta
 	for len(plans) < e.maxInflightPerGroup {
 		plan, err := p.next(ctx)
 		if err != nil {
 			panic(err)
 		}
-		if len(plan) == 0 {
+		if plan.Empty() {
 			break
 		}
-		plans = append(plans, plan)
+		plans = append(plans, plan.Sources)
 	}
 	return plans
 }

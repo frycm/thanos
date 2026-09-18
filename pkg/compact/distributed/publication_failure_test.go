@@ -22,6 +22,7 @@ import (
 
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
+	"github.com/thanos-io/thanos/pkg/compact"
 	"github.com/thanos-io/thanos/pkg/compact/compacttest"
 	"github.com/thanos-io/thanos/pkg/compact/downsample"
 	"github.com/thanos-io/thanos/pkg/logutil"
@@ -104,7 +105,7 @@ func TestWorkerPublicationFailuresPreserveData(t *testing.T) {
 						testutil.Assert(t, leased != nil, "task must be leased")
 						return *leased
 					}
-					task, err := CompactionTask(cg, metas, false)
+					task, err := CompactionTask(cg, compact.Plan{Sources: metas})
 					testutil.Ok(t, err)
 					if kind != "compaction" {
 						m := metas[0]
@@ -167,7 +168,7 @@ func TestSourceDeletionFailureCanBeRetried(t *testing.T) {
 			// These tests execute directly, without the worker heartbeat loop.
 			c := newTestClusterConf(t, ManagerConfig{LeaseTTL: time.Minute})
 			cg, metas := c.makeGroup(labels.FromStrings("tenant", "one"))
-			task, err := CompactionTask(cg, metas, false)
+			task, err := CompactionTask(cg, compact.Plan{Sources: metas})
 			testutil.Ok(t, err)
 			_, err = c.sched.Submit(t.Context(), task)
 			testutil.Ok(t, err)
@@ -184,7 +185,7 @@ func TestSourceDeletionFailureCanBeRetried(t *testing.T) {
 
 			fault := &publicationFault{Bucket: c.shared, stage: metadata.DeletionMarkFilename, after: after}
 			executor := NewRemotePlanExecutor(c.logger, fault, c.sched, nil, 1, nil)
-			_, err = executor.verifyAndFinalize(t.Context(), cg, metas, result, false)
+			_, err = executor.verifyAndFinalize(t.Context(), cg, compact.Plan{Sources: metas}, result)
 			testutil.NotOk(t, err)
 			testutil.Assert(t, fault.hits > 0, "deletion failure must be reached after verification")
 			afterFailure := sourceObjects(t, c.shared, task.SourceBlocks)
@@ -193,7 +194,7 @@ func TestSourceDeletionFailureCanBeRetried(t *testing.T) {
 			}
 			compacttest.AssertSameContent(t, want, resultContent(t, c.shared, result), "source deletion failure cannot damage the replacement")
 			executor.bkt = c.shared
-			ids, err := executor.verifyAndFinalize(t.Context(), cg, metas, result, false)
+			ids, err := executor.verifyAndFinalize(t.Context(), cg, compact.Plan{Sources: metas}, result)
 			testutil.Ok(t, err)
 			testutil.Equals(t, 1, len(ids))
 			for _, m := range metas {
@@ -201,7 +202,7 @@ func TestSourceDeletionFailureCanBeRetried(t *testing.T) {
 			}
 			// A lost acknowledgement may cause the same successful finalization
 			// to run again; it must be idempotent.
-			_, err = executor.verifyAndFinalize(t.Context(), cg, metas, result, false)
+			_, err = executor.verifyAndFinalize(t.Context(), cg, compact.Plan{Sources: metas}, result)
 			testutil.Ok(t, err)
 			compacttest.AssertSameContent(t, want, resultContent(t, c.shared, result), "repeated finalization")
 		})
