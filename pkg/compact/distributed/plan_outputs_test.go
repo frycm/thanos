@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/efficientgo/core/testutil"
+	"github.com/oklog/ulid/v2"
 	"github.com/prometheus/prometheus/model/labels"
 
 	"github.com/thanos-io/objstore"
@@ -81,32 +82,65 @@ func mustProvenance(t *testing.T, m *metadata.Meta) Provenance {
 	return prov
 }
 
-// TestOutputMatcher pins down the verifier's rule for result block labels:
-// each block claims one of the plan's outputs, and no output twice.
-func TestOutputMatcher(t *testing.T) {
+// TestClaimOutputs pins down the verifier's rule for the outputs of a plan:
+// for a plan without outputs, one block with the group's labels; for a plan
+// with outputs, an account of every output, each block the output it claims,
+// no output claimed twice, and no output silently missing.
+func TestClaimOutputs(t *testing.T) {
 	cg, _ := newTestCluster(t).makeGroup(labels.FromStrings("ext", "1"))
 	group := map[string]string{"ext": "1"}
 	a := map[string]string{"ext": "1", "part": "a"}
 	b := map[string]string{"ext": "1", "part": "b"}
+	idA, idB := ulid.MustNew(10, nil), ulid.MustNew(11, nil)
+	meta := func(id ulid.ULID, lbls map[string]string, out *metadata.ThanosOutput) metadata.Meta {
+		m := metadata.Meta{}
+		m.ULID = id
+		m.Thanos.Labels = lbls
+		m.Thanos.Output = out
+		return m
+	}
+	set := func(index int, blocks ...ulid.ULID) *metadata.ThanosOutput {
+		return &metadata.ThanosOutput{Index: index, Count: 2, Blocks: blocks}
+	}
+	plan := compact.Plan{Outputs: []compact.PlanOutput{{Labels: a}, {Labels: b}}}
+	both := map[ulid.ULID]metadata.Meta{idA: meta(idA, a, set(0, idA, idB)), idB: meta(idB, b, set(1, idA, idB))}
+	report := func(outputs ...OutputResult) Result { return Result{Outputs: outputs} }
 
 	t.Run("a plan without outputs names the group's labels once", func(t *testing.T) {
-		m := newOutputMatcher(cg, compact.Plan{})
-		testutil.Ok(t, m.claim(group))
-		testutil.NotOk(t, m.claim(group), "a second block with the group's labels is not part of the plan")
-		testutil.NotOk(t, newOutputMatcher(cg, compact.Plan{}).claim(a))
+		testutil.Ok(t, claimOutputs(cg, compact.Plan{}, Result{}, map[ulid.ULID]metadata.Meta{idA: meta(idA, group, nil)}))
+		testutil.NotOk(t, claimOutputs(cg, compact.Plan{}, Result{}, map[ulid.ULID]metadata.Meta{idA: meta(idA, a, nil)}))
+		testutil.NotOk(t, claimOutputs(cg, compact.Plan{}, Result{}, map[ulid.ULID]metadata.Meta{idA: meta(idA, group, nil), idB: meta(idB, group, nil)}))
+		testutil.NotOk(t, claimOutputs(cg, compact.Plan{}, report(OutputResult{Index: 0, Block: idA.String()}), map[ulid.ULID]metadata.Meta{idA: meta(idA, group, nil)}),
+			"an account of outputs for a plan that named none")
 	})
-	t.Run("each output is claimed once, in any order", func(t *testing.T) {
-		plan := compact.Plan{Outputs: []compact.PlanOutput{{Labels: a}, {Labels: b}}}
-		m := newOutputMatcher(cg, plan)
-		testutil.Ok(t, m.claim(b))
-		testutil.Ok(t, m.claim(a))
-		testutil.NotOk(t, m.claim(a))
-		testutil.NotOk(t, newOutputMatcher(cg, plan).claim(group), "the group's labels are not an output of this plan")
+	t.Run("every output accounted for, in any order", func(t *testing.T) {
+		testutil.Ok(t, claimOutputs(cg, plan, report(OutputResult{Index: 1, Block: idB.String()}, OutputResult{Index: 0, Block: idA.String()}), both))
 	})
-	t.Run("an output without labels means the group's labels", func(t *testing.T) {
-		m := newOutputMatcher(cg, compact.Plan{Outputs: []compact.PlanOutput{{}, {Labels: a}}})
-		testutil.Ok(t, m.claim(group))
-		testutil.Ok(t, m.claim(a))
+	t.Run("a missing output is a missing block, not an empty one", func(t *testing.T) {
+		onlyA := map[ulid.ULID]metadata.Meta{idA: meta(idA, a, set(0, idA))}
+		testutil.NotOk(t, claimOutputs(cg, plan, report(OutputResult{Index: 0, Block: idA.String()}), onlyA))
+		testutil.NotOk(t, claimOutputs(cg, plan, Result{}, onlyA), "no account at all")
+	})
+	t.Run("an empty output is accounted for explicitly and agrees with the set", func(t *testing.T) {
+		onlyA := map[ulid.ULID]metadata.Meta{idA: meta(idA, a, set(0, idA))}
+		testutil.Ok(t, claimOutputs(cg, plan, report(OutputResult{Index: 0, Block: idA.String()}, OutputResult{Index: 1}), onlyA))
+		// The block says its set has two blocks; the report uploaded one.
+		claimsTwo := map[ulid.ULID]metadata.Meta{idA: meta(idA, a, set(0, idA, idB))}
+		testutil.NotOk(t, claimOutputs(cg, plan, report(OutputResult{Index: 0, Block: idA.String()}, OutputResult{Index: 1}), claimsTwo))
+	})
+	t.Run("a block must be the output it is claimed for", func(t *testing.T) {
+		swapped := map[ulid.ULID]metadata.Meta{idA: meta(idA, a, set(0, idA, idB)), idB: meta(idB, b, set(1, idA, idB))}
+		testutil.NotOk(t, claimOutputs(cg, plan, report(OutputResult{Index: 0, Block: idB.String()}, OutputResult{Index: 1, Block: idA.String()}), swapped), "labels of the wrong output")
+		mislabeled := map[ulid.ULID]metadata.Meta{idA: meta(idA, a, set(0, idA, idB)), idB: meta(idB, b, set(0, idA, idB))}
+		testutil.NotOk(t, claimOutputs(cg, plan, report(OutputResult{Index: 0, Block: idA.String()}, OutputResult{Index: 1, Block: idB.String()}), mislabeled), "the block says it is another output")
+		unstamped := map[ulid.ULID]metadata.Meta{idA: meta(idA, a, nil), idB: meta(idB, b, nil)}
+		testutil.NotOk(t, claimOutputs(cg, plan, report(OutputResult{Index: 0, Block: idA.String()}, OutputResult{Index: 1, Block: idB.String()}), unstamped), "no set recorded")
+	})
+	t.Run("no output twice, no block twice, nothing unaccounted", func(t *testing.T) {
+		testutil.NotOk(t, claimOutputs(cg, plan, report(OutputResult{Index: 0, Block: idA.String()}, OutputResult{Index: 0, Block: idB.String()}), both))
+		testutil.NotOk(t, claimOutputs(cg, plan, report(OutputResult{Index: 0, Block: idA.String()}, OutputResult{Index: 1, Block: idA.String()}), both))
+		testutil.NotOk(t, claimOutputs(cg, plan, report(OutputResult{Index: 0, Block: idA.String()}, OutputResult{Index: 1}), both), "an uploaded block accounted for nowhere")
+		testutil.NotOk(t, claimOutputs(cg, plan, report(OutputResult{Index: 0, Block: idA.String()}, OutputResult{Index: 2, Block: idB.String()}), both), "an output the plan did not name")
 	})
 }
 

@@ -389,7 +389,7 @@ func (w *Worker) execute(ctx context.Context, task Task, acknowledged *atomic.Bo
 		if err != nil {
 			return w.triageExecutionError(ctx, res, err, aborted, acknowledged)
 		}
-		return w.completeResult(ctx, res, outIDs, acknowledged)
+		return w.completeResult(ctx, res, outIDs, nil, acknowledged)
 	}
 
 	executor := compact.LocalPlanExecutor{
@@ -412,7 +412,38 @@ func (w *Worker) execute(ctx context.Context, task Task, acknowledged *atomic.Bo
 	if err != nil {
 		return w.triageExecutionError(ctx, res, err, aborted, acknowledged)
 	}
-	return w.completeResult(ctx, res, compIDs, acknowledged)
+	outputs, err := outputsOf(task, dir, compIDs)
+	if err != nil {
+		return w.triageExecutionError(ctx, res, compact.NewRetryError(err), aborted, acknowledged)
+	}
+	return w.completeResult(ctx, res, compIDs, outputs, acknowledged)
+}
+
+// outputsOf accounts for every output the task named: the result block that
+// is it, read from the block's own metadata, or none when the output held no
+// series. Nil for a task that named no outputs.
+func outputsOf(task Task, dir string, compIDs []ulid.ULID) ([]OutputResult, error) {
+	if len(task.Outputs) == 0 {
+		return nil, nil
+	}
+	out := make([]OutputResult, len(task.Outputs))
+	for i := range out {
+		out[i].Index = i
+	}
+	for _, id := range compIDs {
+		m, err := metadata.ReadFromDir(filepath.Join(dir, id.String()))
+		if err != nil {
+			return nil, errors.Wrapf(err, "read metadata of result block %s", id)
+		}
+		if m.Thanos.Output == nil || m.Thanos.Output.Index < 0 || m.Thanos.Output.Index >= len(out) {
+			return nil, errors.Errorf("result block %s does not say which of the task's %d outputs it is", id, len(out))
+		}
+		if prev := out[m.Thanos.Output.Index].Block; prev != "" {
+			return nil, errors.Errorf("result blocks %s and %s both claim output %d", prev, id, m.Thanos.Output.Index)
+		}
+		out[m.Thanos.Output.Index].Block = id.String()
+	}
+	return out, nil
 }
 
 // DataDir belongs to one worker process - the command scopes it by worker ID
@@ -467,13 +498,14 @@ func (w *Worker) triageExecutionError(ctx context.Context, res Result, err error
 // read back the worker reports an abort instead: the blocks are in the bucket,
 // but their delivery could not be confirmed. The requeued task's duplicate
 // result is reconciled by block deduplication, exactly as for a lost report.
-func (w *Worker) completeResult(ctx context.Context, res Result, ids []ulid.ULID, acknowledged *atomic.Bool) Result {
+func (w *Worker) completeResult(ctx context.Context, res Result, ids []ulid.ULID, outputs []OutputResult, acknowledged *atomic.Bool) Result {
 	res.OutputChecksums = map[string]string{}
+	res.Outputs = outputs
 	for _, id := range ids {
 		sum, err := metaChecksumRetry(ctx, w.bkt, id)
 		if err != nil {
 			level.Warn(w.logger).Log("msg", "could not checksum an uploaded result block; discarding the report", "block", id, "err", err)
-			res.OutputBlocks, res.OutputChecksums = nil, nil
+			res.OutputBlocks, res.OutputChecksums, res.Outputs = nil, nil, nil
 			return w.triageExecutionError(ctx, res, errors.Wrapf(err, "confirm the checksum of uploaded result block %s", id), OutcomeAbortedStoreUnreachable, acknowledged)
 		}
 		res.OutputBlocks = append(res.OutputBlocks, id.String())

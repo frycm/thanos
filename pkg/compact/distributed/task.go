@@ -149,9 +149,24 @@ type Result struct {
 	OutputBlocks    []string          `json:"output_blocks,omitempty"`
 	OutputChecksums map[string]string `json:"output_checksums,omitempty"`
 
+	// Outputs accounts for every output the task named, in order: the block
+	// that is it, or none when the output held no series and no block was
+	// written. A completed report for a task with outputs has to account for
+	// all of them; a missing entry is a missing block, not an empty one. Nil
+	// for a task that named no outputs.
+	Outputs []OutputResult `json:"outputs,omitempty"`
+
 	// OffendingBlock is set for the issue347 and out-of-order-chunks outcomes.
 	OffendingBlock string `json:"offending_block,omitempty"`
 	ErrorMessage   string `json:"error_message,omitempty"`
+}
+
+// OutputResult is what became of one output a task named.
+type OutputResult struct {
+	Index int `json:"index"`
+	// Block is the block produced for the output, or empty when the output
+	// held no series.
+	Block string `json:"block,omitempty"`
 }
 
 // LeaseRequest asks the manager for a task to work on.
