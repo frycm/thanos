@@ -308,6 +308,11 @@ type Suite struct {
 	// only these.
 	Scenarios []Scenario
 	Extra     bool
+	// OracleConf derives the oracle's configuration from a scenario's. nil
+	// judges a run against the standalone compactor under the same
+	// configuration; a feature that changes block layout but not content,
+	// such as splitting, judges itself against the compactor without it.
+	OracleConf func(NodeConfig) NodeConfig
 }
 
 // RunSuite runs the generic scenarios and the suite's own against the suite's
@@ -346,9 +351,13 @@ func RunSuite(t *testing.T, suite Suite) {
 			if sc.Tenants != nil {
 				c = BuildCorpus(t, sc.Name, sc.Tenants)
 			}
-			key := fmt.Sprintf("%s/%+v", c.Name, conf)
+			oracle := conf
+			if suite.OracleConf != nil {
+				oracle = suite.OracleConf(conf).WithDefaults()
+			}
+			key := fmt.Sprintf("%s/%+v", c.Name, oracle)
 			if goldens[key] == nil {
-				goldens[key] = Golden(t, c, conf)
+				goldens[key] = Golden(t, c, oracle)
 				inputs[key] = InputDump(t, c)
 				if c == defaultCorpus {
 					// The corpus spans 48h, so the oracle must cover the

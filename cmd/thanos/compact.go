@@ -383,17 +383,44 @@ func runCompact(
 	)
 	var planner compact.Planner
 
+	split := compact.SplitConfig{
+		MaxShards:         conf.blockSplitMaxShards,
+		MaxIndexSizeBytes: int64(conf.maxBlockIndexSize),
+		MaxSeries:         conf.blockSplitMaxSeries,
+		HashWithout:       strutil.ParseFlagLabels(conf.blockSplitIgnoreLabels),
+	}
+	var splitMetrics *compact.SplitMetrics
+	if split.Enabled() {
+		splitMetrics = compact.NewSplitMetrics(reg)
+		level.Info(logger).Log("msg", "block splitting by series is enabled", "max_shards", conf.blockSplitMaxShards,
+			"shard_max_index_size", conf.maxBlockIndexSize, "shard_max_series", conf.blockSplitMaxSeries, "hash_ignore_labels", strings.Join(split.HashWithout, ","))
+	}
+
 	tsdbPlanner := compact.NewPlanner(logger, levels, noCompactMarkerFilter)
+	if split.Enabled() {
+		// A shard group's last range is not the stream's newest while fresh
+		// blocks arrive unsplit; let it compact and downsample.
+		tsdbPlanner = tsdbPlanner.WithStreamNewestAcrossShards(sy.Metas)
+	}
+	// With splitting enabled the planner only refuses what the maximum number
+	// of shards cannot hold; below that the plan is split.
 	largeIndexFilterPlanner := compact.WithLargeTotalIndexSizeFilter(
 		tsdbPlanner,
 		insBkt,
-		int64(conf.maxBlockIndexSize),
+		split.PlannerIndexSizeLimit(int64(conf.maxBlockIndexSize)),
 		compactMetrics.blocksMarked.WithLabelValues(metadata.NoCompactMarkFilename, metadata.IndexSizeExceedingNoCompactReason),
 	)
 	if enableVerticalCompaction {
 		planner = compact.WithVerticalCompactionDownsampleFilter(largeIndexFilterPlanner, insBkt, compactMetrics.blocksMarked.WithLabelValues(metadata.NoCompactMarkFilename, metadata.DownsampleVerticalCompactionNoCompactReason))
 	} else {
 		planner = largeIndexFilterPlanner
+	}
+	if split.Enabled() {
+		// Plans over the limits are split by series, and blocks a split stream
+		// leaves behind unsplit are planned alone and split.
+		planner = compact.WithBlockSplitting(planner, logger, split, splitMetrics, insBkt,
+			compactMetrics.blocksMarked.WithLabelValues(metadata.NoCompactMarkFilename, metadata.IndexSizeExceedingNoCompactReason),
+			sy.Metas, noCompactMarkerFilter.NoCompactMarkedBlocks)
 	}
 	blocksCleaner := compact.NewBlocksCleaner(logger, insBkt, ignoreDeletionMarkFilter, deleteDelay, compactMetrics.blocksCleaned, compactMetrics.blockCleanupFailures)
 	compactor, err := compact.NewBucketCompactor(
@@ -738,6 +765,9 @@ type compactConfig struct {
 	webConf                                        webConfig
 	label                                          string
 	maxBlockIndexSize                              units.Base2Bytes
+	blockSplitMaxShards                            int
+	blockSplitMaxSeries                            uint64
+	blockSplitIgnoreLabels                         []string
 	hashFunc                                       string
 	enableVerticalCompaction                       bool
 	dedupFunc                                      string
@@ -837,6 +867,20 @@ func (cc *compactConfig) registerFlag(cmd extkingpin.FlagClause) {
 		"block is marked for no compaction (no-compact-mark.json is uploaded) which causes this block to be excluded from any compaction. "+
 		"Default is due to https://github.com/thanos-io/thanos/issues/1424, but it's overall recommended to keeps block size to some reasonable size.").
 		Hidden().Default("64GB").BytesVar(&cc.maxBlockIndexSize)
+
+	cmd.Flag("compact.block-split.max-shards", "Experimental. When greater than one, a compaction whose output is estimated to exceed --compact.block-max-index-size or --compact.block-split.max-series "+
+		"is split into several blocks by series instead of marking its biggest source block for no compaction: the smallest power of two that keeps every shard within the limits, up to this many. "+
+		"Each shard carries the external label "+metadata.CompactorShardLabel+"=i_of_M, which the store gateway strips. Rounded down to a power of two. Zero disables splitting.").
+		Hidden().Default("0").IntVar(&cc.blockSplitMaxShards)
+
+	cmd.Flag("compact.block-split.max-series", "Experimental. Number of series a shard of a split compaction aims to stay under, estimated from the sum of the source blocks' series. Zero ignores series counts.").
+		Hidden().Default("0").Uint64Var(&cc.blockSplitMaxSeries)
+
+	cmd.Flag("compact.block-split.ignore-labels", "Experimental. Series labels left out of the hash that places a series in a shard, so that series differing only in these labels - "+
+		"replicas that carry their replica label inside the series, such as HA Prometheus pairs behind a receiver - land in the same shard, where a later compaction could deduplicate them. "+
+		"Set it before the first split and never change it: shards are re-split by the same hash, and a plan whose shards would not together hold every series is refused. "+
+		"Repeated flag or comma separated list.").
+		Hidden().StringsVar(&cc.blockSplitIgnoreLabels)
 
 	cmd.Flag("compact.skip-block-with-out-of-order-chunks", "When set to true, mark blocks containing index with out-of-order chunks for no compact instead of halting the compaction").
 		Hidden().Default("false").BoolVar(&cc.skipBlockWithOutOfOrderChunks)

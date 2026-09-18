@@ -15,6 +15,7 @@ It is recommend to upgrade the storage components first (Receive, Store, etc.) a
 ### Fixed
 
 ### Added
+- [#5](https://github.com/frycm/thanos/issues/5) Compactor: experimental block splitting by series behind the hidden `--compact.block-split.max-shards` flag. A compaction estimated to exceed the index size limit is written as a power-of-two number of shard blocks carrying the external label `__compactor_shard__` instead of freezing its biggest source block; Store Gateway strips the label from what it serves. `--compact.block-split.ignore-labels` leaves series labels, such as in-series replica labels, out of the shard hash. Shards of an incomplete set are withheld from the compactor's view, and every plan over shards names the blocks that share a set with its sources so that they stay published.
 
 ### Changed
 
