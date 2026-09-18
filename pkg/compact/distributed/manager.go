@@ -16,7 +16,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/go-kit/log"
@@ -27,6 +26,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/thanos-io/objstore"
+	"go.uber.org/atomic"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/thanos-io/thanos/pkg/block"
@@ -1067,7 +1067,7 @@ func (e *RemotePlanExecutor) verifyAndFinalize(ctx context.Context, cg *compact.
 	for _, raw := range res.OutputBlocks {
 		id, err := ulid.Parse(raw)
 		if err != nil {
-			return nil, compact.NewRetryError(errors.Wrapf(err, "worker reported an unparseable block ID %q", raw))
+			return nil, compact.NewRetryError(errors.Wrapf(err, "worker reported an unparsable block ID %q", raw))
 		}
 
 		rawMeta, err := readRawMetaWithRetry(ctx, e.bkt, id)
@@ -1527,7 +1527,7 @@ func abortRequeueBackoff(aborts int, leaseTTL time.Duration) time.Duration {
 func fetchVerifiedMeta(ctx context.Context, bkt objstore.Bucket, raw string, checksums map[string]string) (*metadata.Meta, error) {
 	id, err := ulid.Parse(raw)
 	if err != nil {
-		return nil, errors.Wrapf(err, "worker reported an unparseable block ID %q", raw)
+		return nil, errors.Wrapf(err, "worker reported an unparsable block ID %q", raw)
 	}
 	rawMeta, err := readRawMetaWithRetry(ctx, bkt, id)
 	if err != nil {

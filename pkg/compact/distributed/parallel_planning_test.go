@@ -11,6 +11,7 @@ import (
 	"github.com/go-kit/log"
 	"github.com/oklog/ulid/v2"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/thanos-io/objstore"
 
@@ -26,7 +27,7 @@ func TestPlanGroupMixedSizePlansDoNotOverlap(t *testing.T) {
 		for _, vertical := range []bool{false, true} {
 			logger := log.NewNopLogger()
 			bkt := objstore.NewInMemBucket()
-			cnt := func() prometheus.Counter { return prometheus.NewCounter(prometheus.CounterOpts{Name: "test"}) }
+			cnt := func() prometheus.Counter { return promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"}) }
 			cg, err := compact.NewGroup(logger, bkt, "g", labels.EmptyLabels(), resolution, false, vertical,
 				cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), metadata.NoneFunc, 1, 1)
 			testutil.Ok(t, err)
@@ -53,7 +54,7 @@ func TestPlanGroupMixedSizePlansDoNotOverlap(t *testing.T) {
 func TestPlanGroupDispatchesTimeDisjointPlans(t *testing.T) {
 	logger := log.NewNopLogger()
 	bkt := objstore.NewInMemBucket()
-	cnt := func() prometheus.Counter { return prometheus.NewCounter(prometheus.CounterOpts{Name: "test"}) }
+	cnt := func() prometheus.Counter { return promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"}) }
 	cg, err := compact.NewGroup(logger, bkt, "g", labels.EmptyLabels(), 0, false, true,
 		cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), metadata.NoneFunc, 1, 1)
 	testutil.Ok(t, err)

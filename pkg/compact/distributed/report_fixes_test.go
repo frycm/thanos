@@ -17,6 +17,7 @@ import (
 	"github.com/oklog/ulid/v2"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/thanos-io/objstore"
 
@@ -165,7 +166,7 @@ func provenanceFixture(t *testing.T) (*RemotePlanExecutor, objstore.Bucket, *com
 	t.Helper()
 	bkt := objstore.NewInMemBucket()
 
-	cnt := func() prometheus.Counter { return prometheus.NewCounter(prometheus.CounterOpts{Name: "test"}) }
+	cnt := func() prometheus.Counter { return promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"}) }
 	cg, err := compact.NewGroup(log.NewNopLogger(), bkt, "0@test", labels.FromStrings("ext", "1"), 0,
 		false, false, cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), metadata.NoneFunc, 1, 1)
 	testutil.Ok(t, err)

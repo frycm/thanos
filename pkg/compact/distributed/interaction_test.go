@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,10 +18,12 @@ import (
 	"github.com/oklog/ulid/v2"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/thanos-io/objstore"
+	"go.uber.org/atomic"
 
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
@@ -204,7 +205,7 @@ func (c *testCluster) makeGroup(ext labels.Labels) (*compact.Group, []*metadata.
 		metas = append(metas, meta)
 	}
 
-	cnt := func() prometheus.Counter { return prometheus.NewCounter(prometheus.CounterOpts{Name: "test"}) }
+	cnt := func() prometheus.Counter { return promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"}) }
 	cg, err := compact.NewGroup(c.logger, c.manager, metas[0].Thanos.GroupKey(), ext, 0, false, false,
 		cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), metadata.NoneFunc, 1, 1)
 	testutil.Ok(c.t, err)
@@ -565,7 +566,7 @@ func (c *testCluster) makeDedupGroup() (*compact.Group, []*metadata.Meta, []*met
 		}
 	}
 
-	cnt := func() prometheus.Counter { return prometheus.NewCounter(prometheus.CounterOpts{Name: "test"}) }
+	cnt := func() prometheus.Counter { return promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"}) }
 	cg, err := compact.NewGroup(c.logger, c.manager, stripped[0].Thanos.GroupKey(), labels.FromStrings("tenant", "t1"), 0,
 		false, true /* vertical compaction, as --deduplication.replica-label enables */, cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), metadata.NoneFunc, 1, 1)
 	testutil.Ok(c.t, err)

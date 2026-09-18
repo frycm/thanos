@@ -60,11 +60,7 @@ thanos compact --compact.mode=worker \
 
 A store gateway and a querier on the trial bucket are enough for spot checks; the query frontend adds nothing to correctness.
 
-The manager refills a group's worker slots as individual plans finish. Parked
-plans and conflicting time ranges do not stop the search for independent work.
-Completed and deferred ranges remain reserved until the next metadata sync;
-only then can their replacements participate in further compaction. The limit
-controls concurrent plans, and does not split a single large plan across workers.
+The manager refills a group's worker slots as individual plans finish. Parked plans and conflicting time ranges do not stop the search for independent work. Completed and deferred ranges remain reserved until the next metadata sync; only then can their replacements participate in further compaction. The limit controls concurrent plans, and does not split a single large plan across workers.
 
 ### What to verify
 
@@ -200,24 +196,12 @@ The tool refuses to apply while the journal was written within `--manager-livene
 
 ### Reconciled scheduler and worker failure handling
 
-Journal reads and writes run outside the scheduler state lock, so an object-store
-stall does not block heartbeats. Snapshots are serialized before publication;
-callers recheck task ownership before rolling back a failed write.
+Journal reads and writes run outside the scheduler state lock, so an object-store stall does not block heartbeats. Snapshots are serialized before publication; callers recheck task ownership before rolling back a failed write.
 
-Aborted tasks retain their execution-attempt budget but have a separate cap of
-three times `--compact.manager.max-attempts`. Each abort delays requeueing by
-30 seconds times the abort count, capped at the lease TTL. Reaching the cap parks
-the sources; new blocks in the same plan do not reset that protection.
+Aborted tasks retain their execution-attempt budget but have a separate cap of three times `--compact.manager.max-attempts`. Each abort delays requeueing by 30 seconds times the abort count, capped at the lease TTL. Reaching the cap parks the sources; new blocks in the same plan do not reset that protection.
 
-Workers heartbeat immediately and at most every third of the lease TTL. A worker
-cancels its task if no heartbeat is acknowledged within the TTL. Local filesystem
-errors, including disk exhaustion, are retryable worker failures rather than
-shard-wide halts. Correct the resource problem before releasing parked work.
+Workers heartbeat immediately and at most every third of the lease TTL. A worker cancels its task if no heartbeat is acknowledged within the TTL. Local filesystem errors, including disk exhaustion, are retryable worker failures rather than shard-wide halts. Correct the resource problem before releasing parked work.
 
-Each worker needs an exclusive data directory. Startup removes abandoned ULID
-task directories left by crashes; other directories and symlinks are preserved.
-Task IDs received from the manager must be canonical ULIDs before filesystem use.
+Each worker needs an exclusive data directory. Startup removes abandoned ULID task directories left by crashes; other directories and symlinks are preserved. Task IDs received from the manager must be canonical ULIDs before filesystem use.
 
-Result metadata reads are retried three times, with a five-second timeout per
-read and short delays. Verification still precedes all source retirement, and
-the remote executor honors the same deletion veto as the local executor.
+Result metadata reads are retried three times, with a five-second timeout per read and short delays. Verification still precedes all source retirement, and the remote executor honors the same deletion veto as the local executor.

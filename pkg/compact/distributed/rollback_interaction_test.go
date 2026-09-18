@@ -12,6 +12,7 @@ import (
 	"github.com/efficientgo/core/testutil"
 	"github.com/oklog/ulid/v2"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/thanos-io/objstore"
 
@@ -32,7 +33,7 @@ func TestInteractionRollbackRestoresBucket(t *testing.T) {
 	bystander, bystanderMetas := c.makeGroup(labels.FromStrings("ext", "bystander"))
 	_ = bystander
 	testutil.Ok(t, block.MarkForDeletion(context.Background(), c.logger, c.shared, bystanderMetas[0].ULID, "retention",
-		prometheus.NewCounter(prometheus.CounterOpts{Name: "test"})))
+		promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"})))
 
 	cg, toCompact := c.makeGroup(labels.FromStrings("ext", "1"))
 	var got executeOutcome

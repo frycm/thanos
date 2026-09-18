@@ -12,6 +12,7 @@ import (
 	"github.com/go-kit/log"
 	"github.com/oklog/ulid/v2"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
@@ -59,7 +60,7 @@ func TestRefillWhileOnePlanIsStillRunning(t *testing.T) {
 func TestParkedPlanDoesNotStarveDisjointWork(t *testing.T) {
 	logger := log.NewNopLogger()
 	bkt := objstore.NewInMemBucket()
-	cnt := func() prometheus.Counter { return prometheus.NewCounter(prometheus.CounterOpts{Name: "test"}) }
+	cnt := func() prometheus.Counter { return promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"}) }
 	cg, err := compact.NewGroup(logger, bkt, "g", labels.EmptyLabels(), 0, false, false,
 		cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), metadata.NoneFunc, 1, 1)
 	testutil.Ok(t, err)
@@ -137,7 +138,7 @@ func schedulingFixture(t *testing.T, slots int) (*compact.Group, *Scheduler, *Re
 	t.Helper()
 	logger := log.NewNopLogger()
 	bkt := objstore.NewInMemBucket()
-	cnt := func() prometheus.Counter { return prometheus.NewCounter(prometheus.CounterOpts{Name: "test"}) }
+	cnt := func() prometheus.Counter { return promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"}) }
 	cg, err := compact.NewGroup(logger, bkt, "g", labels.EmptyLabels(), 0, false, false,
 		cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), metadata.NoneFunc, 1, 1)
 	testutil.Ok(t, err)

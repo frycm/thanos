@@ -16,6 +16,7 @@ import (
 	"github.com/oklog/ulid/v2"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/thanos-io/objstore"
 
 	"github.com/thanos-io/thanos/pkg/block"
@@ -42,18 +43,18 @@ func newRollbackFixture(t *testing.T) rollbackFixture {
 	t.Helper()
 	f := rollbackFixture{bkt: objstore.WithNoopInstr(objstore.NewInMemBucket()), next: 1}
 
-	f.producedA = f.upload(t, nil)
-	f.producedB = f.upload(t, nil)
-	f.sourceA = f.upload(t, nil)
+	f.producedA = f.upload(t)
+	f.producedB = f.upload(t)
+	f.sourceA = f.upload(t)
 	f.mark(t, f.sourceA, DeletionDetails("A", "ta1"))
-	f.sourceB = f.upload(t, nil)
+	f.sourceB = f.upload(t)
 	f.mark(t, f.sourceB, DeletionDetails("B", "tb1"))
-	f.retention = f.upload(t, nil)
+	f.retention = f.upload(t)
 	f.mark(t, f.retention, "retention")
-	f.untouched = f.upload(t, nil)
-	f.consumedA = f.upload(t, nil)
+	f.untouched = f.upload(t)
+	f.consumedA = f.upload(t)
 	f.mark(t, f.consumedA, DeletionDetails("A", "ta1"))
-	f.rawA = f.upload(t, nil)
+	f.rawA = f.upload(t)
 	f.mark(t, f.rawA, DeletionDetails("A", "ta0"))
 
 	// The produced blocks record what they were made from, which the IDs
@@ -65,7 +66,7 @@ func newRollbackFixture(t *testing.T) rollbackFixture {
 }
 
 // upload puts a block with the given provenance, if any, in the bucket.
-func (f *rollbackFixture) upload(t *testing.T, prov *Provenance, sources ...ulid.ULID) ulid.ULID {
+func (f *rollbackFixture) upload(t *testing.T) ulid.ULID {
 	t.Helper()
 	id := ulid.MustNew(f.next, nil)
 	f.next++
@@ -79,9 +80,6 @@ func (f *rollbackFixture) upload(t *testing.T, prov *Provenance, sources ...ulid
 	f.writeMeta(t, m)
 	// A block needs something besides meta.json for Delete to have work to do.
 	testutil.Ok(t, f.bkt.Upload(context.Background(), path.Join(id.String(), block.IndexFilename), strings.NewReader("index")))
-	if prov != nil {
-		f.stamp(t, id, *prov, sources...)
-	}
 	return id
 }
 
@@ -109,7 +107,7 @@ func (f *rollbackFixture) writeMeta(t *testing.T, m metadata.Meta) {
 func (f *rollbackFixture) mark(t *testing.T, id ulid.ULID, details string) {
 	t.Helper()
 	testutil.Ok(t, block.MarkForDeletion(context.Background(), log.NewNopLogger(), f.bkt, id, details,
-		prometheus.NewCounter(prometheus.CounterOpts{Name: "test"})))
+		promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"})))
 }
 
 func (f *rollbackFixture) remove(t *testing.T, id ulid.ULID) {
@@ -276,7 +274,7 @@ func TestRollbackRestoresSourcesGarbageCollectionMarked(t *testing.T) {
 	ctx := context.Background()
 
 	testutil.Ok(t, block.RemoveMark(ctx, log.NewNopLogger(), f.bkt, f.sourceA,
-		prometheus.NewCounter(prometheus.CounterOpts{Name: "test"}), metadata.DeletionMarkFilename))
+		promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"}), metadata.DeletionMarkFilename))
 	f.mark(t, f.sourceA, outdatedBlockDetails)
 
 	r, err := PlanRollback(ctx, log.NewNopLogger(), f.bkt, RollbackOptions{JournalID: "A"})
@@ -316,7 +314,7 @@ func TestRollbackRefusesUnrecoverableSources(t *testing.T) {
 		{"missing direct source", func(t *testing.T, f *rollbackFixture) { f.remove(t, f.sourceA) }},
 		{"missing ancestor", func(t *testing.T, f *rollbackFixture) { f.remove(t, f.rawA) }},
 		{"foreign mark", func(t *testing.T, f *rollbackFixture) {
-			testutil.Ok(t, block.RemoveMark(t.Context(), log.NewNopLogger(), f.bkt, f.rawA, prometheus.NewCounter(prometheus.CounterOpts{Name: "test"}), metadata.DeletionMarkFilename))
+			testutil.Ok(t, block.RemoveMark(t.Context(), log.NewNopLogger(), f.bkt, f.rawA, promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"}), metadata.DeletionMarkFilename))
 			f.mark(t, f.rawA, "retention")
 		}},
 		{"cycle", func(t *testing.T, f *rollbackFixture) {
@@ -356,7 +354,7 @@ func (b *rollbackDeleteFailureBucket) Delete(ctx context.Context, name string) e
 func TestRollbackCanResumeAfterInterruption(t *testing.T) {
 	for failAt := 1; failAt <= 8; failAt++ {
 		f := newRollbackFixture(t)
-		testutil.Ok(t, block.RemoveMark(t.Context(), log.NewNopLogger(), f.bkt, f.sourceA, prometheus.NewCounter(prometheus.CounterOpts{Name: "test"}), metadata.DeletionMarkFilename))
+		testutil.Ok(t, block.RemoveMark(t.Context(), log.NewNopLogger(), f.bkt, f.sourceA, promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"}), metadata.DeletionMarkFilename))
 		f.mark(t, f.sourceA, outdatedBlockDetails)
 		r, err := PlanRollback(t.Context(), log.NewNopLogger(), f.bkt, RollbackOptions{JournalID: "A"})
 		testutil.Ok(t, err)
@@ -415,7 +413,9 @@ func TestRollbackRestoresSourcesAfterManagerCrashAndGC(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	counter := func() prometheus.Counter { return prometheus.NewCounter(prometheus.CounterOpts{Name: "review"}) }
+	counter := func() prometheus.Counter {
+		return promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "review"})
+	}
 	syncer, err := compact.NewMetaSyncer(logger, prometheus.NewRegistry(), bkt, fetcher, dedupFilter, ignoreFilter, counter(), counter(), 0)
 	if err != nil {
 		t.Fatal(err)

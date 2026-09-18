@@ -16,6 +16,7 @@ import (
 	"github.com/oklog/ulid/v2"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/thanos-io/objstore"
@@ -31,8 +32,8 @@ import (
 
 // TestWorkerShutdownReportsAbortNotHalt pins down that a worker being asked to
 // shut down mid-task reports an abort, not a halt. The compaction seam wraps a
-// cancelled compaction in a halt error, and before the shutdown triage that
-// halt travelled to the manager and stopped the whole shard.
+// canceled compaction in a halt error, and before the shutdown triage that
+// halt traveled to the manager and stopped the whole shard.
 func TestReviewWorkerShutdownReportsAbortNotHalt(t *testing.T) {
 	c := newTestCluster(t)
 
@@ -72,7 +73,7 @@ func TestReviewWorkerShutdownReportsAbortNotHalt(t *testing.T) {
 // TestWorkerChecksumReadBackFailureAbortsNotCompletes pins down that a worker
 // which cannot read back the checksum of a block it uploaded reports an abort,
 // never a checksum-less completion. The manager rejects a completion without
-// checksums, so the old behaviour threw away the whole finished task on one
+// checksums, so the old behavior threw away the whole finished task on one
 // read blip - and on the downsample path even crashed the manager.
 func TestWorkerChecksumReadBackFailureAbortsNotCompletes(t *testing.T) {
 	old := metaChecksumRetryBackoff
@@ -431,7 +432,7 @@ func (p *listPlanner) Plan(_ context.Context, _ []*metadata.Meta, _ chan error, 
 func TestPlanGroupKeepsConcurrentPlansTimeDisjoint(t *testing.T) {
 	logger := log.NewNopLogger()
 	bkt := objstore.NewInMemBucket()
-	cnt := func() prometheus.Counter { return prometheus.NewCounter(prometheus.CounterOpts{Name: "test"}) }
+	cnt := func() prometheus.Counter { return promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"}) }
 
 	meta := func(minT, maxT int64) *metadata.Meta {
 		m := &metadata.Meta{}
@@ -478,7 +479,7 @@ type vetoChecker struct{}
 func (vetoChecker) CanDelete(_ *compact.Group, _ ulid.ULID) bool { return false }
 
 // TestRemoteFinalizeRespectsDeletableCheckerAndRecordsMetrics pins down that
-// manager-mode source retirement honours the BlockDeletableChecker extension
+// manager-mode source retirement honors the BlockDeletableChecker extension
 // point - the in-process executor always did - and that the group's compaction
 // and garbage-collection counters move, instead of flatlining the moment a
 // deployment flips to manager mode.
@@ -486,11 +487,11 @@ func TestRemoteFinalizeRespectsDeletableCheckerAndRecordsMetrics(t *testing.T) {
 	c := newTestCluster(t)
 	c.startWorker("w1")
 
-	run := func(ext labels.Labels, checker compact.BlockDeletableChecker) (*compact.Group, []*metadata.Meta, prometheus.Counter, prometheus.Counter) {
+	run := func(ext labels.Labels, checker compact.BlockDeletableChecker) ([]*metadata.Meta, prometheus.Counter, prometheus.Counter) {
 		cg, toCompact := c.makeGroup(ext)
-		compactions := prometheus.NewCounter(prometheus.CounterOpts{Name: "test_compactions"})
-		gcBlocks := prometheus.NewCounter(prometheus.CounterOpts{Name: "test_gc"})
-		cnt := func() prometheus.Counter { return prometheus.NewCounter(prometheus.CounterOpts{Name: "test"}) }
+		compactions := promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test_compactions"})
+		gcBlocks := promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test_gc"})
+		cnt := func() prometheus.Counter { return promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"}) }
 		// Rebuild the group with counters this test can read.
 		mcg, err := compact.NewGroup(c.logger, c.manager, cg.Key(), ext, 0, false, false,
 			compactions, cnt(), cnt(), cnt(), cnt(), gcBlocks, cnt(), cnt(), metadata.NoneFunc, 1, 1)
@@ -503,7 +504,7 @@ func TestRemoteFinalizeRespectsDeletableCheckerAndRecordsMetrics(t *testing.T) {
 		ids, err := e.Execute(context.Background(), "", mcg, compact.Plan{Sources: toCompact})
 		testutil.Ok(t, err)
 		testutil.Equals(t, 1, len(ids))
-		return mcg, toCompact, compactions, gcBlocks
+		return toCompact, compactions, gcBlocks
 	}
 
 	hasDeletionMark := func(id ulid.ULID) bool {
@@ -513,7 +514,7 @@ func TestRemoteFinalizeRespectsDeletableCheckerAndRecordsMetrics(t *testing.T) {
 	}
 
 	// With the default checker the sources are retired and both counters move.
-	_, toCompact, compactions, gcBlocks := run(labels.FromStrings("ext", "allow"), nil)
+	toCompact, compactions, gcBlocks := run(labels.FromStrings("ext", "allow"), nil)
 	for _, m := range toCompact {
 		testutil.Assert(t, hasDeletionMark(m.ULID), "source %s must be deletion-marked", m.ULID)
 	}
@@ -521,7 +522,7 @@ func TestRemoteFinalizeRespectsDeletableCheckerAndRecordsMetrics(t *testing.T) {
 	testutil.Equals(t, 2.0, promtestutil.ToFloat64(gcBlocks))
 
 	// A vetoing checker keeps every source, exactly as it does in-process.
-	_, toCompact, compactions, gcBlocks = run(labels.FromStrings("ext", "veto"), vetoChecker{})
+	toCompact, compactions, gcBlocks = run(labels.FromStrings("ext", "veto"), vetoChecker{})
 	for _, m := range toCompact {
 		testutil.Assert(t, !hasDeletionMark(m.ULID), "the checker's veto on %s must hold", m.ULID)
 	}
@@ -564,7 +565,7 @@ func TestDispatchDownsamplingRecordsFailures(t *testing.T) {
 	m.Compaction.Sources = []ulid.ULID{m.ULID}
 	m.Thanos.Labels = map[string]string{"ext": "1"}
 
-	failures := prometheus.NewCounterVec(prometheus.CounterOpts{Name: "test_ds_failures"}, []string{"resolution"})
+	failures := promauto.With(nil).NewCounterVec(prometheus.CounterOpts{Name: "test_ds_failures"}, []string{"resolution"})
 	err = DispatchDownsampling(context.Background(), log.NewNopLogger(), bkt, sched,
 		map[ulid.ULID]*metadata.Meta{m.ULID: m}, 1, metadata.NoneFunc, 1, false, nil, failures)
 	testutil.NotOk(t, err)
@@ -667,7 +668,7 @@ func (e *countingExecutor) Execute(_ context.Context, _ string, _ *compact.Group
 // had before the executor seam: one compaction run per group at a time, for
 // external callers that relied on it.
 func TestGroupCompactRunsAreSerialized(t *testing.T) {
-	cnt := func() prometheus.Counter { return prometheus.NewCounter(prometheus.CounterOpts{Name: "test"}) }
+	cnt := func() prometheus.Counter { return promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"}) }
 	cg, err := compact.NewGroup(log.NewNopLogger(), objstore.NewInMemBucket(), "g1", labels.EmptyLabels(), 0, false, false,
 		cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), metadata.NoneFunc, 1, 1)
 	testutil.Ok(t, err)

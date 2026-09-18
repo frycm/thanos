@@ -114,7 +114,7 @@ func DeletionDetails(journalID, taskID string) string {
 	return fmt.Sprintf("%s; journal %s; task %s", deletionDetailsPrefix, journalID, taskID)
 }
 
-// ParseDeletionDetails recognises deletion mark details written by the
+// ParseDeletionDetails recognizes deletion mark details written by the
 // distributed manager and returns the journal and task they name.
 func ParseDeletionDetails(details string) (journalID, taskID string, ok bool) {
 	if !strings.HasPrefix(details, deletionDetailsPrefix+"; ") {
