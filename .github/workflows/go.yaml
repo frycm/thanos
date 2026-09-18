@@ -25,6 +25,8 @@ jobs:
         run: go test -tags slicelabels -race -timeout 20m ./pkg/compact/compacttest -count=1 -args -compact.scenarios
       - name: Run the compact command as a process
         run: go test -tags slicelabels -race -timeout 5m ./cmd/thanos -run TestCompactorStandaloneProcess -count=1
+      - name: Run the stuck-block downsampling scenarios
+        run: go test -tags slicelabels -race -timeout 10m ./pkg/compact/downsample -run TestStuckBlockScenarios -count=1 -args -compact.scenarios
 
   distributed-failures:
     runs-on: ubuntu-latest
