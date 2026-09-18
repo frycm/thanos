@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -1362,8 +1363,13 @@ func (ex LocalPlanExecutor) Execute(ctx context.Context, dir string, cg *Group, 
 	if len(outputs) == 0 {
 		outputs = []PlanOutput{{}}
 	}
-	// outputOf remembers which output each result block is, for its labels.
-	outputOf := map[ulid.ULID]PlanOutput{}
+	// outputOf remembers which output each result block is, for its labels
+	// and its place in the set the plan produces.
+	type producedBy struct {
+		output PlanOutput
+		index  int
+	}
+	outputOf := map[ulid.ULID]producedBy{}
 
 	begin = time.Now()
 	var compIDs []ulid.ULID
@@ -1375,7 +1381,7 @@ func (ex LocalPlanExecutor) Execute(ctx context.Context, dir string, cg *Group, 
 		if len(outputs) > 1 {
 			level.Info(cg.logger).Log("msg", "compacting into several blocks", "outputs", len(outputs), "plan", sourceBlockStr)
 		}
-		for _, out := range outputs {
+		for i, out := range outputs {
 			populator := populateBlockFunc
 			if out.Series != nil {
 				if _, isDefault := populateBlockFunc.(tsdb.DefaultBlockPopulator); !isDefault {
@@ -1391,7 +1397,7 @@ func (ex LocalPlanExecutor) Execute(ctx context.Context, dir string, cg *Group, 
 				return e
 			}
 			for _, id := range ids {
-				outputOf[id] = out
+				outputOf[id] = producedBy{output: out, index: i}
 			}
 			compIDs = append(compIDs, ids...)
 		}
@@ -1451,7 +1457,7 @@ func (ex LocalPlanExecutor) Execute(ctx context.Context, dir string, cg *Group, 
 		}
 
 		outLabels := cg.labels.Map()
-		if l := outputOf[compID].Labels; l != nil {
+		if l := outputOf[compID].output.Labels; l != nil {
 			outLabels = maps.Clone(l)
 		}
 		thanosMeta := metadata.Thanos{
@@ -1460,6 +1466,16 @@ func (ex LocalPlanExecutor) Execute(ctx context.Context, dir string, cg *Group, 
 			Source:       metadata.CompactorSource,
 			SegmentFiles: block.GetSegmentFiles(bdir),
 			Extensions:   cg.Extensions(),
+		}
+		if len(plan.Outputs) > 0 {
+			// The outputs of a plan replace the sources as a set, and only a
+			// complete set may: each block records the whole set, so that a
+			// reader seeing one of them knows what else has to be there.
+			thanosMeta.Output = &metadata.ThanosOutput{
+				Index:  outputOf[compID].index,
+				Count:  len(outputs),
+				Blocks: slices.Clone(compIDs),
+			}
 		}
 		if stats.ChunkMaxSize > 0 {
 			thanosMeta.IndexStats.ChunkMaxSize = stats.ChunkMaxSize

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -31,6 +32,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/compact/downsample"
+	"github.com/thanos-io/thanos/pkg/errors"
 	"github.com/thanos-io/thanos/pkg/logutil"
 )
 
@@ -134,7 +136,17 @@ func (d *BucketDump) ReadBlock(t *testing.T, ctx context.Context, bkt objstore.B
 	t.Helper()
 	logger := log.NewNopLogger()
 	bdir := filepath.Join(dir, m.ULID.String())
-	testutil.Ok(t, block.Download(ctx, logger, bkt, m.ULID, bdir))
+	if err := block.Download(ctx, logger, bkt, m.ULID, bdir); err != nil {
+		if bkt.IsObjNotFoundErr(errors.Cause(err)) || errors.Is(err, os.ErrNotExist) || strings.Contains(err.Error(), "not found") {
+			// The block went away between listing and reading: something is
+			// deleting it, as garbage collection or a manager's maintenance
+			// does, and a store gateway would stop serving it a moment
+			// later. What it held is judged by what remains.
+			t.Logf("block %s disappeared while being read; skipping it", m.ULID)
+			return
+		}
+		testutil.Ok(t, err)
+	}
 	b, err := tsdb.OpenBlock(logutil.GoKitLogToSlog(logger), bdir, downsample.NewPool(), nil)
 	testutil.Ok(t, err)
 	defer func() { testutil.Ok(t, b.Close()) }()

@@ -118,3 +118,27 @@ func TestPlanIsDeterministic(t *testing.T) {
 		}
 	}
 }
+
+// TestPlanScopesCoverageByExternalLabels: a downsampled block covers a source
+// only for blocks of its own stream. The outputs of a compaction split by
+// series record the same sources while each holds other series, so once one
+// shard is downsampled the other must still be a candidate, and a shard's
+// own downsampled block still covers it.
+func TestPlanScopesCoverageByExternalLabels(t *testing.T) {
+	raw1, raw2, down1 := ulid.MustNew(1, nil), ulid.MustNew(2, nil), ulid.MustNew(3, nil)
+	source := ulid.MustNew(9, nil)
+	shard := func(m *metadata.Meta, v string) *metadata.Meta {
+		m.Thanos.Labels = map[string]string{"tenant": "a", "__compactor_shard__": v}
+		return m
+	}
+	metas := map[ulid.ULID]*metadata.Meta{
+		raw1:  shard(planMeta(raw1, ResLevel0, ResLevel1DownsampleRange, source), "1_of_2"),
+		raw2:  shard(planMeta(raw2, ResLevel0, ResLevel1DownsampleRange, source), "2_of_2"),
+		down1: shard(planMeta(down1, ResLevel1, ResLevel1DownsampleRange, source), "1_of_2"),
+	}
+
+	got, err := Plan(metas)
+	testutil.Ok(t, err)
+	testutil.Equals(t, 1, len(got), "shard 2 has never been downsampled")
+	testutil.Equals(t, raw2, got[0].Meta.ULID)
+}

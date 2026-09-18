@@ -117,6 +117,10 @@ func Downsample(
 	newMeta := *origMeta
 	newMeta.Thanos.Downsample.Resolution = resolution
 	newMeta.ULID = uid
+	// The source's output set is the source's: it names the blocks the
+	// source was compacted together with, not this one. A downsampled block
+	// is its own set.
+	newMeta.Thanos.Output = nil
 
 	// Writes downsampled chunks right into the files, avoiding excess memory allocation.
 	// Flushes index and meta data after aggregations.

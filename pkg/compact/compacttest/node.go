@@ -102,6 +102,7 @@ type Node struct {
 
 	Syncer             *compact.Syncer
 	Compactor          *compact.BucketCompactor
+	DedupFilter        *block.DefaultDeduplicateFilter
 	NoCompactFilter    *compact.GatherNoCompactionMarkFilter
 	NoDownsampleFilter *downsample.GatherNoDownsampleMarkFilter
 
@@ -142,6 +143,7 @@ func NewNode(t *testing.T, shared objstore.Bucket, conf NodeConfig, hooks Hooks)
 
 	ignoreDeletionMarkFilter := block.NewIgnoreDeletionMarkFilter(n.Logger, insBkt, conf.DeleteDelay/2, 4)
 	duplicateBlocksFilter := block.NewDeduplicateFilter(4)
+	n.DedupFilter = duplicateBlocksFilter
 	n.NoCompactFilter = compact.NewGatherNoCompactionMarkFilter(n.Logger, insBkt, 4)
 	n.NoDownsampleFilter = downsample.NewGatherNoDownsampleMarkFilter(n.Logger, insBkt, 4)
 

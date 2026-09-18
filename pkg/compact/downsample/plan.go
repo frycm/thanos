@@ -8,6 +8,7 @@ import (
 
 	"github.com/oklog/ulid/v2"
 	"github.com/pkg/errors"
+	"github.com/prometheus/prometheus/model/labels"
 
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 )
@@ -28,22 +29,22 @@ type Candidate struct {
 // a worker.
 func Plan(metas map[ulid.ULID]*metadata.Meta) ([]Candidate, error) {
 	// Blocks whose sources are already covered by a downsampled block do not need
-	// downsampling again.
-	sources5m := map[ulid.ULID]struct{}{}
-	sources1h := map[ulid.ULID]struct{}{}
+	// downsampling again. Coverage is per block stream: a downsampled block
+	// covers a source only for blocks with exactly its external labels. Blocks
+	// of different streams can record the same sources - the outputs of a
+	// compaction split by series do - while each holds other series, so a
+	// source ULID alone says nothing about which series have been downsampled.
+	sources5m := coverage{}
+	sources1h := coverage{}
 
 	for _, m := range metas {
 		switch m.Thanos.Downsample.Resolution {
 		case ResLevel0:
 			continue
 		case ResLevel1:
-			for _, id := range m.Compaction.Sources {
-				sources5m[id] = struct{}{}
-			}
+			sources5m.add(m)
 		case ResLevel2:
-			for _, id := range m.Compaction.Sources {
-				sources1h[id] = struct{}{}
-			}
+			sources1h.add(m)
 		default:
 			return nil, errors.Errorf("unexpected downsampling resolution %d", m.Thanos.Downsample.Resolution)
 		}
@@ -64,7 +65,7 @@ func Plan(metas map[ulid.ULID]*metadata.Meta) ([]Candidate, error) {
 			continue
 
 		case ResLevel0:
-			if covered(m, sources5m) {
+			if sources5m.covers(m) {
 				continue
 			}
 			// Only downsample blocks once we are sure to get roughly 2 chunks out of it.
@@ -76,7 +77,7 @@ func Plan(metas map[ulid.ULID]*metadata.Meta) ([]Candidate, error) {
 			candidates = append(candidates, Candidate{Meta: m, TargetResolution: ResLevel1})
 
 		case ResLevel1:
-			if covered(m, sources1h) {
+			if sources1h.covers(m) {
 				continue
 			}
 			if m.MaxTime-m.MinTime < ResLevel2DownsampleRange {
@@ -88,11 +89,32 @@ func Plan(metas map[ulid.ULID]*metadata.Meta) ([]Candidate, error) {
 	return candidates, nil
 }
 
-// covered reports whether every source of the block already appears in a
-// downsampled block.
-func covered(m *metadata.Meta, sources map[ulid.ULID]struct{}) bool {
+// coverage records which sources the downsampled blocks of a block stream -
+// one set of external labels - account for.
+type coverage map[coverageKey]struct{}
+
+type coverageKey struct {
+	stream uint64
+	source ulid.ULID
+}
+
+func streamOf(m *metadata.Meta) uint64 {
+	return labels.FromMap(m.Thanos.Labels).Hash()
+}
+
+func (c coverage) add(m *metadata.Meta) {
+	stream := streamOf(m)
 	for _, id := range m.Compaction.Sources {
-		if _, ok := sources[id]; !ok {
+		c[coverageKey{stream: stream, source: id}] = struct{}{}
+	}
+}
+
+// covers reports whether every source of the block already appears in a
+// downsampled block of the same stream.
+func (c coverage) covers(m *metadata.Meta) bool {
+	stream := streamOf(m)
+	for _, id := range m.Compaction.Sources {
+		if _, ok := c[coverageKey{stream: stream, source: id}]; !ok {
 			return false
 		}
 	}
