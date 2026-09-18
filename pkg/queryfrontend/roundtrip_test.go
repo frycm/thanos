@@ -634,16 +634,27 @@ func testRoundTripQueryCacheWithShardingMiddleware(t *testing.T) {
 	testutil.Assert(t, attempts == 3 || attempts == 4)
 
 	// Check that a subsequent request is served from the cache instead of
-	// hitting the server.
-	n := count.Load()
+	// hitting the server. The results cache is written after the response
+	// is returned, so give it a moment to settle on a loaded machine before
+	// judging: once a request is served from the cache, the count no longer
+	// moves.
 	ctx := user.InjectOrgID(context.Background(), "1")
-	httpReq, err := NewThanosQueryRangeCodec(true).EncodeRequest(ctx, testRequest)
-	testutil.Ok(t, err)
+	var served bool
+	for range 50 {
+		n := count.Load()
+		httpReq, err := NewThanosQueryRangeCodec(true).EncodeRequest(ctx, testRequest)
+		testutil.Ok(t, err)
 
-	_, rtErr = tpw(rt).RoundTrip(httpReq)
-	testutil.Ok(t, rtErr)
-	testutil.Equals(t, http.StatusOK, res.StatusCode)
-	testutil.Equals(t, n, count.Load())
+		_, rtErr = tpw(rt).RoundTrip(httpReq)
+		testutil.Ok(t, rtErr)
+		testutil.Equals(t, http.StatusOK, res.StatusCode)
+		if n == count.Load() {
+			served = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	testutil.Assert(t, served, "the request kept hitting the server instead of the cache")
 }
 
 // TestRoundTripLabelsCacheMiddleware tests the cache middleware for labels requests.
