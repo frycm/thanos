@@ -22,18 +22,16 @@ import (
 // recordingExecutor captures the plan it is handed and returns a canned result.
 type recordingExecutor struct {
 	gotGroup      *Group
-	gotToCompact  []*metadata.Meta
-	gotOverlap    bool
+	gotPlan       Plan
 	calls         int
 	returnCompIDs []ulid.ULID
 	returnErr     error
 }
 
-func (r *recordingExecutor) Execute(_ context.Context, _ string, cg *Group, toCompact []*metadata.Meta, overlappingBlocks bool) ([]ulid.ULID, error) {
+func (r *recordingExecutor) Execute(_ context.Context, _ string, cg *Group, plan Plan) ([]ulid.ULID, error) {
 	r.calls++
 	r.gotGroup = cg
-	r.gotToCompact = toCompact
-	r.gotOverlap = overlappingBlocks
+	r.gotPlan = plan
 	return r.returnCompIDs, r.returnErr
 }
 
@@ -45,6 +43,19 @@ type stubPlanner struct {
 
 func (s stubPlanner) Plan(_ context.Context, _ []*metadata.Meta, _ chan error, _ any) ([]*metadata.Meta, error) {
 	return s.plan, s.err
+}
+
+// outputPlanner is a stubPlanner that also names the plan's outputs.
+type outputPlanner struct {
+	stubPlanner
+	outputs    []PlanOutput
+	outputsErr error
+	gotSources []*metadata.Meta
+}
+
+func (o *outputPlanner) PlanOutputs(_ context.Context, _ *Group, sources []*metadata.Meta) ([]PlanOutput, error) {
+	o.gotSources = sources
+	return o.outputs, o.outputsErr
 }
 
 func testGroup(t *testing.T, metas ...*metadata.Meta) *Group {
@@ -99,10 +110,11 @@ func TestGroupPlanSeparatesPlanningFromExecution(t *testing.T) {
 	exec := &recordingExecutor{returnCompIDs: []ulid.ULID{out}}
 
 	// Plan is callable on its own and returns what the planner produced.
-	toCompact, overlapping, err := cg.Plan(ctx, planner, make(chan error, 1))
+	plan, err := cg.Plan(ctx, planner, make(chan error, 1))
 	testutil.Ok(t, err)
-	testutil.Equals(t, false, overlapping)
-	testutil.Equals(t, 2, len(toCompact))
+	testutil.Equals(t, false, plan.OverlappingBlocks)
+	testutil.Equals(t, 2, len(plan.Sources))
+	testutil.Equals(t, 0, len(plan.Outputs), "a planner that does not name outputs leaves them to the executor's default")
 
 	// compact hands that same plan to the executor.
 	shouldRerun, compIDs, err := cg.compact(ctx, "/tmp/does-not-matter", planner, exec, make(chan error, 1))
@@ -112,8 +124,74 @@ func TestGroupPlanSeparatesPlanningFromExecution(t *testing.T) {
 
 	testutil.Equals(t, 1, exec.calls)
 	testutil.Equals(t, cg, exec.gotGroup)
-	testutil.Equals(t, []*metadata.Meta{m1, m2}, exec.gotToCompact)
-	testutil.Equals(t, false, exec.gotOverlap)
+	testutil.Equals(t, []*metadata.Meta{m1, m2}, exec.gotPlan.Sources)
+	testutil.Equals(t, false, exec.gotPlan.OverlappingBlocks)
+}
+
+// TestGroupPlanCarriesPlannerOutputs asserts that a planner deciding what a
+// plan produces sees the plan's sources and that its outputs travel with the
+// plan to the executor, so an executor never has to invent them.
+func TestGroupPlanCarriesPlannerOutputs(t *testing.T) {
+	ctx := context.Background()
+
+	m1 := meta(ulid.MustNew(1, nil), 0, 100)
+	m2 := meta(ulid.MustNew(2, nil), 100, 200)
+	cg := testGroup(t, m1, m2)
+
+	outputs := []PlanOutput{
+		{Labels: map[string]string{"ext": "1", "part": "a"}, Series: &SeriesPartition{Index: 0, Count: 2}},
+		{Labels: map[string]string{"ext": "1", "part": "b"}, Series: &SeriesPartition{Index: 1, Count: 2}},
+	}
+	planner := &outputPlanner{stubPlanner: stubPlanner{plan: []*metadata.Meta{m1, m2}}, outputs: outputs}
+	exec := &recordingExecutor{}
+
+	_, _, err := cg.compact(ctx, "/tmp/does-not-matter", planner, exec, make(chan error, 1))
+	testutil.Ok(t, err)
+	testutil.Equals(t, []*metadata.Meta{m1, m2}, planner.gotSources)
+	testutil.Equals(t, outputs, exec.gotPlan.Outputs)
+
+	// Outputs are only asked for when there is a plan.
+	idle := &outputPlanner{outputs: outputs}
+	_, _, err = cg.compact(ctx, "/tmp/does-not-matter", idle, exec, make(chan error, 1))
+	testutil.Ok(t, err)
+	testutil.Equals(t, []*metadata.Meta(nil), idle.gotSources)
+
+	// A malformed partition is refused before anything is executed.
+	bad := &outputPlanner{stubPlanner: stubPlanner{plan: []*metadata.Meta{m1, m2}}, outputs: []PlanOutput{{Series: &SeriesPartition{Index: 2, Count: 2}}}}
+	exec = &recordingExecutor{}
+	_, _, err = cg.compact(ctx, "/tmp/does-not-matter", bad, exec, make(chan error, 1))
+	testutil.NotOk(t, err)
+	testutil.Equals(t, 0, exec.calls)
+}
+
+// TestGroupCompactTreatsDeferredPlanAsNoWork asserts that an executor that
+// declines a plan neither fails the group nor asks for a rerun.
+func TestGroupCompactTreatsDeferredPlanAsNoWork(t *testing.T) {
+	ctx := context.Background()
+
+	m1 := meta(ulid.MustNew(1, nil), 0, 100)
+	m2 := meta(ulid.MustNew(2, nil), 100, 200)
+	cg := testGroup(t, m1, m2)
+	exec := &recordingExecutor{returnErr: errors.Wrap(ErrPlanDeferred, "parked")}
+
+	shouldRerun, compIDs, err := cg.compact(ctx, "/tmp/does-not-matter", stubPlanner{plan: []*metadata.Meta{m1, m2}}, exec, make(chan error, 1))
+	testutil.Ok(t, err)
+	testutil.Equals(t, false, shouldRerun)
+	testutil.Equals(t, 0, len(compIDs))
+	testutil.Equals(t, 1, exec.calls)
+}
+
+type singleBlockPlanner struct {
+	stubPlanner
+	single bool
+}
+
+func (p singleBlockPlanner) PlansSingleBlockGroups() bool { return p.single }
+
+func TestPlansSingleBlockGroups(t *testing.T) {
+	testutil.Equals(t, false, plansSingleBlockGroups(stubPlanner{}))
+	testutil.Equals(t, false, plansSingleBlockGroups(singleBlockPlanner{}))
+	testutil.Equals(t, true, plansSingleBlockGroups(singleBlockPlanner{single: true}))
 }
 
 // TestGroupCompactSkipsExecutorWhenNothingPlanned asserts the executor is not
@@ -143,7 +221,7 @@ func TestGroupPlanHaltsOnOverlap(t *testing.T) {
 		meta(ulid.MustNew(2, nil), 50, 150),
 	)
 
-	_, _, err := cg.Plan(ctx, stubPlanner{}, make(chan error, 1))
+	_, err := cg.Plan(ctx, stubPlanner{}, make(chan error, 1))
 	testutil.NotOk(t, err)
 	testutil.Equals(t, true, IsHaltError(err))
 }
