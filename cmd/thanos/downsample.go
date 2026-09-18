@@ -7,7 +7,6 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"sort"
 	"sync"
 	"time"
 
@@ -203,26 +202,9 @@ func downsampleBucket(
 		}
 	}()
 
-	// mapping from a hash over all source IDs to blocks. We don't need to downsample a block
-	// if a downsampled version with the same hash already exists.
-	sources5m := map[ulid.ULID]struct{}{}
-	sources1h := map[ulid.ULID]struct{}{}
-
-	for _, m := range metas {
-		switch m.Thanos.Downsample.Resolution {
-		case downsample.ResLevel0:
-			continue
-		case downsample.ResLevel1:
-			for _, id := range m.Compaction.Sources {
-				sources5m[id] = struct{}{}
-			}
-		case downsample.ResLevel2:
-			for _, id := range m.Compaction.Sources {
-				sources1h[id] = struct{}{}
-			}
-		default:
-			return errors.Errorf("unexpected downsampling resolution %d", m.Thanos.Downsample.Resolution)
-		}
+	candidates, err := downsample.Plan(metas)
+	if err != nil {
+		return err
 	}
 
 	ignoreDirs := []string{}
@@ -233,14 +215,6 @@ func downsampleBucket(
 	if err := runutil.DeleteAll(dir, ignoreDirs...); err != nil {
 		level.Warn(logger).Log("msg", "failed deleting potentially outdated directories/files, some disk space usage might have leaked. Continuing", "err", err, "dir", dir)
 	}
-
-	metasULIDS := make([]ulid.ULID, 0, len(metas))
-	for k := range metas {
-		metasULIDS = append(metasULIDS, k)
-	}
-	sort.Slice(metasULIDS, func(i, j int) bool {
-		return metasULIDS[i].Compare(metasULIDS[j]) < 0
-	})
 
 	var (
 		wg                      sync.WaitGroup
@@ -274,49 +248,8 @@ func downsampleBucket(
 
 	// Workers scheduled, distribute blocks.
 metaSendLoop:
-	for _, mk := range metasULIDS {
-		m := metas[mk]
-
-		switch m.Thanos.Downsample.Resolution {
-		case downsample.ResLevel2:
-			continue
-
-		case downsample.ResLevel0:
-			missing := false
-			for _, id := range m.Compaction.Sources {
-				if _, ok := sources5m[id]; !ok {
-					missing = true
-					break
-				}
-			}
-			if !missing {
-				continue
-			}
-			// Only downsample blocks once we are sure to get roughly 2 chunks out of it.
-			// NOTE(fabxc): this must match with at which block size the compactor creates downsampled
-			// blocks. Otherwise we may never downsample some data.
-			if m.MaxTime-m.MinTime < downsample.ResLevel1DownsampleRange {
-				continue
-			}
-
-		case downsample.ResLevel1:
-			missing := false
-			for _, id := range m.Compaction.Sources {
-				if _, ok := sources1h[id]; !ok {
-					missing = true
-					break
-				}
-			}
-			if !missing {
-				continue
-			}
-			// Only downsample blocks once we are sure to get roughly 2 chunks out of it.
-			// NOTE(fabxc): this must match with at which block size the compactor creates downsampled
-			// blocks. Otherwise we may never downsample some data.
-			if m.MaxTime-m.MinTime < downsample.ResLevel2DownsampleRange {
-				continue
-			}
-		}
+	for _, c := range candidates {
+		m := c.Meta
 
 		select {
 		case <-workerCtx.Done():
