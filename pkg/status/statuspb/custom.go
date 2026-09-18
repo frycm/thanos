@@ -5,7 +5,6 @@ package statuspb
 
 import (
 	"cmp"
-	"maps"
 	"slices"
 
 	v1 "github.com/prometheus/prometheus/web/api/v1"
@@ -61,25 +60,33 @@ func maxValue(a, b uint64) uint64 {
 }
 
 func mergeStatistics(a, b []Statistic, mergeFunc func(uint64, uint64) uint64) []Statistic {
-	merged := make(map[string]Statistic, len(a))
+	// Keep the order in which names were first seen, so that statistics with
+	// equal values sort deterministically instead of in map iteration order.
+	merged := make(map[string]int, len(a))
+	out := make([]Statistic, 0, len(a)+len(b))
 	for _, stat := range a {
-		merged[stat.Name] = stat
+		merged[stat.Name] = len(out)
+		out = append(out, stat)
 	}
 
 	for _, stat := range b {
-		v, found := merged[stat.Name]
+		i, found := merged[stat.Name]
 		if !found {
-			merged[stat.Name] = stat
+			merged[stat.Name] = len(out)
+			out = append(out, stat)
 			continue
 		}
-		v.Value = mergeFunc(v.Value, stat.Value)
-		merged[stat.Name] = v
+		out[i].Value = mergeFunc(out[i].Value, stat.Value)
 	}
 
-	return slices.SortedStableFunc(maps.Values(merged), func(a, b Statistic) int {
+	if len(out) == 0 {
+		return nil
+	}
+	slices.SortStableFunc(out, func(a, b Statistic) int {
 		// Descending sort.
 		return cmp.Compare(b.Value, a.Value)
 	})
+	return out
 }
 
 // ConvertToPrometheusTSDBStat converts a protobuf Statistic slice to the equivalent Prometheus struct.
