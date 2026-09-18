@@ -82,6 +82,15 @@ type TaskEntry struct {
 
 	Outputs         []string          `json:"outputs,omitempty"`
 	OutputChecksums map[string]string `json:"output_checksums,omitempty"`
+	// Verified is set once the manager has checked the outputs against the
+	// plan and retired the sources. Until then the outputs supersede nothing,
+	// however complete they look: the manager's deduplication filter treats
+	// a worker's block as published only when its task says so here.
+	Verified bool `json:"verified,omitzero"`
+	// RejectedOutputs are blocks the worker uploaded for the task that failed
+	// verification. They are deleted, here or by maintenance if the delete
+	// failed; while listed they are unpublished, and the entry is not pruned.
+	RejectedOutputs []string `json:"rejected_outputs,omitempty"`
 
 	Attempts int `json:"attempts"`
 	// Aborts counts, separately from Attempts, how often a worker discarded the
@@ -215,7 +224,9 @@ func WriteJournal(ctx context.Context, bkt objstore.Bucket, j *Journal) error {
 func (j *Journal) Prune(retention time.Duration, now time.Time) int {
 	pruned := 0
 	for id, e := range j.Tasks {
-		if e.State.Terminal() && now.Sub(e.UpdatedAt) > retention {
+		// An entry still naming rejected outputs guards the bucket against
+		// them: pruned, they would count as published again.
+		if e.State.Terminal() && len(e.RejectedOutputs) == 0 && now.Sub(e.UpdatedAt) > retention {
 			delete(j.Tasks, id)
 			pruned++
 		}

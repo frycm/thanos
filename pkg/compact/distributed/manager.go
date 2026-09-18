@@ -188,9 +188,14 @@ type Scheduler struct {
 	// generation.
 	ownerID string
 
-	mtx        sync.Mutex
-	journal    *Journal
-	tasks      map[string]*pendingTask
+	mtx     sync.Mutex
+	journal *Journal
+	tasks   map[string]*pendingTask
+	// verifying holds the tasks whose completed result this manager is
+	// verifying right now, from the report to the verdict. Maintenance never
+	// touches their outputs: only a completed task nobody in this process is
+	// verifying - one reported before a restart - has its outputs rejected.
+	verifying  map[string]struct{}
 	queue      []string
 	workerSeen map[string]time.Time
 	// halted is the error the manager's control loop halted on, once it has.
@@ -265,6 +270,7 @@ func NewScheduler(ctx context.Context, logger log.Logger, bkt objstore.Bucket, r
 		journal:     j,
 		tasks:       map[string]*pendingTask{},
 		workerSeen:  map[string]time.Time{},
+		verifying:   map[string]struct{}{},
 		lastPersist: time.Now(),
 	}
 	s.m.journalGeneration.Set(float64(j.Generation))
@@ -499,6 +505,10 @@ func (s *Scheduler) Report(ctx context.Context, res Result) error {
 		p.entry.State = StateCompleted
 		p.entry.Outputs = res.OutputBlocks
 		p.entry.OutputChecksums = res.OutputChecksums
+		// The result is delivered to the plan waiting for it, which verifies
+		// it next; until it says so the outputs are neither published nor
+		// anybody else's to clean up.
+		s.verifying[res.TaskID] = struct{}{}
 	case res.Outcome == OutcomeAbortedWorkerShutdown:
 		// The operator stopped the worker; the task itself did nothing wrong.
 		// It goes straight back to the queue: neither the attempt nor the
@@ -651,6 +661,80 @@ func oversizedReason(task Task, conf ManagerConfig) string {
 			indexBytes, perOutput, len(task.SourceBlocks), conf.MaxTaskIndexBytes)
 	}
 	return ""
+}
+
+// VerificationDone tells the scheduler that the plan waiting for the task's
+// result is done with it - accepted, rejected, or given up on - so that
+// maintenance may act on whatever the journal says about its outputs.
+func (s *Scheduler) VerificationDone(taskID string) {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	delete(s.verifying, taskID)
+}
+
+// RejectOutputs records blocks a worker uploaded for the task that failed
+// verification. While recorded they are unpublished to the manager's
+// deduplication filter, the entry is not pruned, and maintenance retries
+// deleting them.
+func (s *Scheduler) RejectOutputs(ctx context.Context, taskID string, blocks []ulid.ULID) error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	e, ok := s.journal.Tasks[taskID]
+	if !ok {
+		return errors.Errorf("task %s is not in the journal", taskID)
+	}
+	for _, b := range blocks {
+		if !slices.Contains(e.RejectedOutputs, b.String()) {
+			e.RejectedOutputs = append(e.RejectedOutputs, b.String())
+		}
+	}
+	e.UpdatedAt = time.Now()
+	return s.persistLocked(ctx)
+}
+
+// AcceptOutputs records that the task's outputs passed verification and may
+// supersede the blocks they were made from.
+func (s *Scheduler) AcceptOutputs(ctx context.Context, taskID string) error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	e, ok := s.journal.Tasks[taskID]
+	if !ok {
+		return errors.Errorf("task %s is not in the journal", taskID)
+	}
+	e.Verified = true
+	e.UpdatedAt = time.Now()
+	return s.persistLocked(ctx)
+}
+
+// OutputPublished reports whether a block a worker produced for the task may
+// supersede the blocks it was made from: the task completed, the manager
+// verified its outputs, the block is one of them and was not rejected. A task
+// the journal no longer knows - aged out, or another manager's - is not
+// judged here; its blocks were verified long ago or are not ours to doubt.
+func (s *Scheduler) OutputPublished(taskID, blockID string) bool {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	e, ok := s.journal.Tasks[taskID]
+	if !ok {
+		return true
+	}
+	if slices.Contains(e.RejectedOutputs, blockID) {
+		return false
+	}
+	return e.State == StateCompleted && e.Verified && slices.Contains(e.Outputs, blockID)
+}
+
+// PublishedFunc is the rule the manager's deduplication filter judges blocks
+// by: a block stamped with this journal's provenance is published only when
+// OutputPublished says so; every other block is judged by its metadata alone.
+func (s *Scheduler) PublishedFunc() func(*metadata.Meta) bool {
+	return func(m *metadata.Meta) bool {
+		prov, ok := ProvenanceOf(m)
+		if !ok || prov.JournalID != s.conf.JournalID {
+			return true
+		}
+		return s.OutputPublished(prov.TaskID, prov.BlockID)
+	}
 }
 
 // SourcesParked reports whether any source belongs to an abandoned or oversized
@@ -880,6 +964,54 @@ func (s *Scheduler) unparkRequests(ctx context.Context) ([]string, error) {
 	return ids, err
 }
 
+// cleanupOutputsLocked finishes what a rejected result started: rejected
+// blocks whose deletion failed are deleted again, and a task reported
+// completed whose outputs nobody in this process is verifying - the manager
+// stopped between the report and the verification, and this is its
+// successor - has them rejected, since the plan is redone and nobody will
+// account for them. A task under verification is left alone whatever the
+// clock says: its verdict is what decides. Reports true when the journal
+// changed.
+func (s *Scheduler) cleanupOutputsLocked(ctx context.Context) bool {
+	dirty := false
+	for id, e := range s.journal.Tasks {
+		if _, busy := s.verifying[id]; busy {
+			continue
+		}
+		if e.State == StateCompleted && !e.Verified && len(e.Outputs) > 0 {
+			level.Warn(s.logger).Log("msg", "a completed task was never verified; rejecting its outputs so that the plan is redone", "task", id, "blocks", len(e.Outputs))
+			for _, b := range e.Outputs {
+				if !slices.Contains(e.RejectedOutputs, b) {
+					e.RejectedOutputs = append(e.RejectedOutputs, b)
+				}
+			}
+			e.Outputs = nil
+			e.UpdatedAt = time.Now()
+			dirty = true
+		}
+		if len(e.RejectedOutputs) == 0 {
+			continue
+		}
+		var left []string
+		for _, b := range e.RejectedOutputs {
+			bid, err := ulid.Parse(b)
+			if err != nil {
+				continue
+			}
+			if err := block.Delete(ctx, s.logger, s.bkt, bid); err != nil {
+				level.Warn(s.logger).Log("msg", "could not delete a rejected result block; retrying on the next tick", "task", id, "block", b, "err", err)
+				left = append(left, b)
+			}
+		}
+		if len(left) != len(e.RejectedOutputs) {
+			e.RejectedOutputs = left
+			e.UpdatedAt = time.Now()
+			dirty = true
+		}
+	}
+	return dirty
+}
+
 func (s *Scheduler) maintainLocked(ctx context.Context, unpark []string) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
@@ -889,6 +1021,7 @@ func (s *Scheduler) maintainLocked(ctx context.Context, unpark []string) error {
 	// stays bounded and a parked set is released after the retention as
 	// promised, not only on the next restart.
 	dirty := s.journal.Prune(s.conf.JournalRetention, time.Now()) > 0
+	dirty = s.cleanupOutputsLocked(ctx) || dirty
 
 	// Any unpark request forces a journal write, its marker is only removed
 	// after one: the entry it names may be gone from memory already because
@@ -1032,6 +1165,7 @@ func (e *RemotePlanExecutor) runPlan(ctx context.Context, cg *compact.Group, pla
 		return nil, ctx.Err()
 	case res = <-resultCh:
 	}
+	defer e.sched.VerificationDone(task.ID)
 
 	if err := ReconstructError(res); err != nil {
 		return nil, err
@@ -1049,14 +1183,24 @@ func (e *RemotePlanExecutor) runPlan(ctx context.Context, cg *compact.Group, pla
 // a block that merely exists is not good enough. It has to carry the labels of
 // one of the plan's outputs and the group's resolution, sit inside the plan's
 // time range, and together the outputs have to account for every source in
-// the plan.
+// the plan, for the plan's whole time span, and for every output the plan
+// named - a shard that holds a fraction of the series lists every source and
+// spans the whole range, so ancestry and time alone would not notice a
+// missing sibling.
+//
+// A rejected result is retried as a whole, and the sources stay. Every output
+// verified to be this task's is then a block nobody will ever account for, and
+// worse than an orphan: it lists the plan's sources, so the deduplication
+// filter would let it retire them on the next sync. Such blocks are recorded
+// in the journal as rejected, which the manager's deduplication filter treats
+// as unpublished from then on, and deleted. Only blocks known to be ours: one
+// that failed the provenance check could be anybody's.
 func (e *RemotePlanExecutor) verifyAndFinalize(ctx context.Context, cg *compact.Group, plan compact.Plan, res Result) ([]ulid.ULID, error) {
 	toCompact, overlappingBlocks := plan.Sources, plan.OverlappingBlocks
 	checker := e.deletableChecker
 	if checker == nil {
 		checker = compact.DefaultBlockDeletableChecker{}
 	}
-	outputs := newOutputMatcher(cg, plan)
 
 	// An output block records the union of its parents' sources, not the
 	// parents' ULIDs, so that union is what the outputs must account for.
@@ -1066,26 +1210,27 @@ func (e *RemotePlanExecutor) verifyAndFinalize(ctx context.Context, cg *compact.
 		for _, s := range m.Compaction.Sources {
 			expected[s] = struct{}{}
 		}
-		if m.MinTime < planMinTime {
-			planMinTime = m.MinTime
-		}
-		if m.MaxTime > planMaxTime {
-			planMaxTime = m.MaxTime
-		}
+		planMinTime = min(planMinTime, m.MinTime)
+		planMaxTime = max(planMaxTime, m.MaxTime)
+	}
+
+	var ours []ulid.ULID
+	reject := func(err error) ([]ulid.ULID, error) {
+		return nil, e.rejectOutputs(ctx, res.TaskID, ours, err)
 	}
 
 	covered := map[ulid.ULID]struct{}{}
-	outMetas := make([]metadata.Meta, 0, len(res.OutputBlocks))
+	outMetas := make(map[ulid.ULID]metadata.Meta, len(res.OutputBlocks))
 	compIDs := make([]ulid.ULID, 0, len(res.OutputBlocks))
 	for _, raw := range res.OutputBlocks {
 		id, err := ulid.Parse(raw)
 		if err != nil {
-			return nil, compact.NewRetryError(errors.Wrapf(err, "worker reported an unparsable block ID %q", raw))
+			return reject(errors.Wrapf(err, "worker reported an unparsable block ID %q", raw))
 		}
 
 		rawMeta, err := readRawMetaWithRetry(ctx, e.bkt, id)
 		if err != nil {
-			return nil, compact.NewRetryError(errors.Wrapf(err, "verify result block %s reported by worker", id))
+			return reject(errors.Wrapf(err, "verify result block %s reported by worker", id))
 		}
 		sum, ok := res.OutputChecksums[raw]
 		if !ok || sum == "" {
@@ -1093,48 +1238,54 @@ func (e *RemotePlanExecutor) verifyAndFinalize(ctx context.Context, cg *compact.
 			// worker observed after its upload; without it the block in the
 			// bucket could be anything. Workers always report it, so its absence
 			// is a verification failure, not a matter of degree.
-			return nil, compact.NewRetryError(errors.Errorf(
-				"worker reported no checksum for result block %s", id))
+			return reject(errors.Errorf("worker reported no checksum for result block %s", id))
 		}
 		if got := checksumOf(rawMeta); got != sum {
-			return nil, compact.NewRetryError(errors.Errorf(
+			return reject(errors.Errorf(
 				"result block %s metadata does not match the checksum the worker reported: got %s, reported %s", id, got, sum))
 		}
 
 		var meta metadata.Meta
 		if err := json.Unmarshal(rawMeta, &meta); err != nil {
-			return nil, compact.NewRetryError(errors.Wrapf(err, "unmarshal metadata of result block %s", id))
+			return reject(errors.Wrapf(err, "unmarshal metadata of result block %s", id))
 		}
-
 		if meta.ULID.Compare(id) != 0 {
-			return nil, compact.NewRetryError(errors.Errorf("result block %s holds metadata for %s", id, meta.ULID))
+			return reject(errors.Errorf("result block %s holds metadata for %s", id, meta.ULID))
 		}
 		if err := verifyProvenance(&meta, Provenance{
 			TaskID: res.TaskID, TaskType: TaskCompaction, JournalID: e.journalID, Generation: res.Generation,
 		}); err != nil {
-			return nil, compact.NewRetryError(errors.Wrapf(err, "result block %s", id))
+			return reject(errors.Wrapf(err, "result block %s", id))
 		}
-		if err := outputs.claim(meta.Thanos.Labels); err != nil {
-			return nil, compact.NewRetryError(errors.Wrapf(err, "result block %s", id))
-		}
+		// From here on the block is known to be this task's.
+		ours = append(ours, id)
+
 		if meta.Thanos.Downsample.Resolution != cg.Resolution() {
-			return nil, compact.NewRetryError(errors.Errorf(
+			return reject(errors.Errorf(
 				"result block %s has resolution %d, the group has %d", id, meta.Thanos.Downsample.Resolution, cg.Resolution()))
 		}
 		if meta.MinTime < planMinTime || meta.MaxTime > planMaxTime {
-			return nil, compact.NewRetryError(errors.Errorf(
+			return reject(errors.Errorf(
 				"result block %s spans [%d, %d], outside the plan's [%d, %d]", id, meta.MinTime, meta.MaxTime, planMinTime, planMaxTime))
 		}
 		for _, s := range meta.Compaction.Sources {
 			if _, ok := expected[s]; !ok {
-				return nil, compact.NewRetryError(errors.Errorf(
+				return reject(errors.Errorf(
 					"result block %s was compacted from %s, which is not a source of this plan", id, s))
 			}
 			covered[s] = struct{}{}
 		}
-
-		outMetas = append(outMetas, meta)
+		if _, dup := outMetas[id]; dup {
+			return reject(errors.Errorf("result block %s was reported twice", id))
+		}
+		outMetas[id] = meta
 		compIDs = append(compIDs, id)
+	}
+
+	// Every output the plan named is accounted for, each block is the output
+	// it claims to be, and no output is claimed twice.
+	if err := claimOutputs(cg, plan, res, outMetas); err != nil {
+		return reject(err)
 	}
 
 	if len(compIDs) == 0 {
@@ -1166,7 +1317,7 @@ func (e *RemotePlanExecutor) verifyAndFinalize(ctx context.Context, cg *compact.
 	// in the plan. A partial result means data would go missing with the sources.
 	for s := range expected {
 		if _, ok := covered[s]; !ok {
-			return nil, compact.NewRetryError(errors.Errorf(
+			return reject(errors.Errorf(
 				"the reported result blocks do not account for source %s; refusing to delete the plan's sources", s))
 		}
 	}
@@ -1176,10 +1327,22 @@ func (e *RemotePlanExecutor) verifyAndFinalize(ctx context.Context, cg *compact.
 	// with the sources. Compacted blocks inherit the union of their parents'
 	// ranges, so the outputs have to cover the plan's span exactly, without
 	// gaps between them.
-	if err := verifyTimeCoverage(outMetas, planMinTime, planMaxTime); err != nil {
-		return nil, compact.NewRetryError(err)
+	metas := make([]metadata.Meta, 0, len(compIDs))
+	for _, id := range compIDs {
+		metas = append(metas, outMetas[id])
+	}
+	if err := verifyTimeCoverage(metas, planMinTime, planMaxTime); err != nil {
+		return reject(err)
 	}
 
+	// Verified: from now on the outputs may supersede the sources, in the
+	// bucket-wide view as here. Persisting that is best effort - the entry is
+	// updated in memory, and the journal catches up on the next write.
+	if e.sched != nil {
+		if err := e.sched.AcceptOutputs(ctx, res.TaskID); err != nil {
+			level.Warn(e.logger).Log("msg", "could not persist the verification of a task's outputs; the journal catches up on the next write", "task", res.TaskID, "err", err)
+		}
+	}
 	cg.RecordCompaction(overlappingBlocks)
 
 	// Mark the sources for deletion now that the result is known to be in the
@@ -1194,6 +1357,127 @@ func (e *RemotePlanExecutor) verifyAndFinalize(ctx context.Context, cg *compact.
 		cg.RecordSourceGarbageCollected()
 	}
 	return compIDs, nil
+}
+
+// rejectOutputs refuses a task's result: the blocks verified to be the task's
+// are recorded as rejected in the journal and deleted, and the cause is
+// returned as the error the control loop retries on. If a block can be
+// neither deleted nor recorded, nothing keeps it from retiring the plan's
+// sources on the next sync, and the manager halts instead.
+func (e *RemotePlanExecutor) rejectOutputs(ctx context.Context, taskID string, ours []ulid.ULID, cause error) error {
+	if len(ours) == 0 {
+		return compact.NewRetryError(cause)
+	}
+	recorded := false
+	if e.sched != nil {
+		if err := e.sched.RejectOutputs(ctx, taskID, ours); err != nil {
+			level.Error(e.logger).Log("msg", "could not record the rejected result blocks of a task in the journal", "task", taskID, "err", err)
+		} else {
+			recorded = true
+		}
+	}
+	failed := 0
+	for _, id := range ours {
+		level.Warn(e.logger).Log("msg", "deleting a result block of a rejected task result", "task", taskID, "block", id, "reason", cause)
+		if err := block.Delete(ctx, e.logger, e.bkt, id); err != nil {
+			failed++
+			level.Error(e.logger).Log("msg", "could not delete the result block of a rejected task result", "task", taskID, "block", id, "err", err)
+		}
+	}
+	if failed > 0 && !recorded {
+		return compact.NewHaltError(errors.Wrapf(cause,
+			"%d rejected result block(s) of task %s could be neither deleted nor recorded as rejected; left alone they would retire the plan's sources on the next sync", failed, taskID))
+	}
+	return compact.NewRetryError(cause)
+}
+
+// claimOutputs checks the result blocks against the outputs the plan named.
+//
+// For a plan without outputs the result is the one block a compaction has
+// always produced, carrying the group's labels; the worker reports no
+// per-output account. For a plan with outputs the worker accounts for each
+// of them: the block that is it, or none when it held no series. Every
+// block then has to say which output it is and agree with the report on the
+// whole set the compaction produced, and every output is claimed at most
+// once. An output missing from the account is a missing block: without this
+// a result could omit a shard and still pass the source and time checks,
+// since every shard lists every source and spans the whole range.
+func claimOutputs(cg *compact.Group, plan compact.Plan, res Result, outMetas map[ulid.ULID]metadata.Meta) error {
+	if len(plan.Outputs) == 0 {
+		if len(res.Outputs) > 0 {
+			return errors.Errorf("the report accounts for %d outputs, the plan named none", len(res.Outputs))
+		}
+		if len(outMetas) > 1 {
+			return errors.Errorf("%d result blocks for a plan that produces one", len(outMetas))
+		}
+		for id, meta := range outMetas {
+			if !labels.Equal(labels.FromMap(meta.Thanos.Labels), cg.Labels()) {
+				return errors.Errorf("result block %s carries labels %v, the plan's output has %v", id, meta.Thanos.Labels, cg.Labels())
+			}
+		}
+		return nil
+	}
+
+	if len(res.Outputs) != len(plan.Outputs) {
+		return errors.Errorf("the report accounts for %d outputs, the plan named %d", len(res.Outputs), len(plan.Outputs))
+	}
+	reported := map[ulid.ULID]struct{}{}
+	for id := range outMetas {
+		reported[id] = struct{}{}
+	}
+	seen := make([]bool, len(plan.Outputs))
+	claimed := map[ulid.ULID]int{}
+	for _, o := range res.Outputs {
+		if o.Index < 0 || o.Index >= len(plan.Outputs) {
+			return errors.Errorf("the report accounts for output %d, which the plan did not name", o.Index)
+		}
+		if seen[o.Index] {
+			return errors.Errorf("the report accounts for output %d twice", o.Index)
+		}
+		seen[o.Index] = true
+		if o.Block == "" {
+			continue
+		}
+		id, err := ulid.Parse(o.Block)
+		if err != nil {
+			return errors.Wrapf(err, "the report names an unparsable block %q for output %d", o.Block, o.Index)
+		}
+		meta, ok := outMetas[id]
+		if !ok {
+			return errors.Errorf("the report names block %s for output %d but does not report it as uploaded", id, o.Index)
+		}
+		if _, dup := claimed[id]; dup {
+			return errors.Errorf("result block %s is claimed for two outputs", id)
+		}
+		claimed[id] = o.Index
+
+		want := plan.Outputs[o.Index].Labels
+		if want == nil {
+			want = cg.Labels().Map()
+		}
+		if !labels.Equal(labels.FromMap(meta.Thanos.Labels), labels.FromMap(want)) {
+			return errors.Errorf("result block %s carries labels %v, output %d of the plan has %v", id, meta.Thanos.Labels, o.Index, want)
+		}
+		set := meta.Thanos.Output
+		if set == nil {
+			return errors.Errorf("result block %s does not record which output it is", id)
+		}
+		if set.Index != o.Index || set.Count != len(plan.Outputs) {
+			return errors.Errorf("result block %s says it is output %d of %d, the report says output %d of %d", id, set.Index, set.Count, o.Index, len(plan.Outputs))
+		}
+		if len(set.Blocks) != len(reported) {
+			return errors.Errorf("result block %s records a set of %d blocks, the report %d", id, len(set.Blocks), len(reported))
+		}
+		for _, sibling := range set.Blocks {
+			if _, ok := reported[sibling]; !ok {
+				return errors.Errorf("result block %s records %s in its set, which the report does not mention", id, sibling)
+			}
+		}
+	}
+	if len(claimed) != len(reported) {
+		return errors.Errorf("the report uploads %d blocks but accounts for %d of them as outputs", len(reported), len(claimed))
+	}
+	return nil
 }
 
 // readRawMeta returns the raw bytes of a block's meta.json in the bucket.
@@ -1297,54 +1581,6 @@ func verifyProvenance(m *metadata.Meta, want Provenance) error {
 		return errors.Errorf("was produced under journal generation %d, not %d", got.Generation, want.Generation)
 	}
 	return nil
-}
-
-// outputMatcher checks result blocks against the outputs a plan names: every
-// block has to carry the labels of one output, and no output may be claimed
-// by two blocks. A plan without outputs names the one block a compaction has
-// always produced, with the group's labels.
-type outputMatcher struct {
-	expected []labels.Labels
-	claimed  []bool
-}
-
-func newOutputMatcher(cg *compact.Group, plan compact.Plan) *outputMatcher {
-	m := &outputMatcher{}
-	if len(plan.Outputs) == 0 {
-		m.expected = []labels.Labels{cg.Labels()}
-	}
-	for _, o := range plan.Outputs {
-		if o.Labels == nil {
-			m.expected = append(m.expected, cg.Labels())
-			continue
-		}
-		m.expected = append(m.expected, labels.FromMap(o.Labels))
-	}
-	m.claimed = make([]bool, len(m.expected))
-	return m
-}
-
-// claim matches a result block's labels to an unclaimed output.
-func (m *outputMatcher) claim(lbls map[string]string) error {
-	got := labels.FromMap(lbls)
-	matched := -1
-	for i, want := range m.expected {
-		if !labels.Equal(got, want) {
-			continue
-		}
-		if !m.claimed[i] {
-			m.claimed[i] = true
-			return nil
-		}
-		matched = i
-	}
-	if matched >= 0 {
-		return errors.Errorf("carries labels %v, which another result block of the plan already carries", got)
-	}
-	if len(m.expected) == 1 {
-		return errors.Errorf("carries labels %v, the plan's output has %v", got, m.expected[0])
-	}
-	return errors.Errorf("carries labels %v, which none of the plan's %d outputs has", got, len(m.expected))
 }
 
 // CompactionTask builds the task that asks a worker to execute a plan.

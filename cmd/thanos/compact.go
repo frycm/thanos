@@ -424,6 +424,9 @@ func runCompact(
 			return errors.Wrap(err, "create compaction scheduler")
 		}
 		planExecutor = distributed.NewRemotePlanExecutor(logger, insBkt, scheduler, planner, conf.managerMaxInflightPerGroup, nil)
+		// A worker's output supersedes the blocks it was made from only once
+		// this manager has verified it; a result it rejected never does.
+		duplicateBlocksFilter.SetPublishedFunc(scheduler.PublishedFunc())
 	}
 
 	compactor, err := compact.NewBucketCompactorWithExecutor(

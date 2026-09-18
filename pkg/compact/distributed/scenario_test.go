@@ -142,6 +142,7 @@ func newNode(t *testing.T, shared objstore.Bucket, handler *switchableHandler, c
 			})
 			testutil.Ok(t, err)
 			n.sched = sched
+			cn.DedupFilter.SetPublishedFunc(sched.PublishedFunc())
 
 			mux := http.NewServeMux()
 			RegisterServer(mux, cn.Logger, sched)
