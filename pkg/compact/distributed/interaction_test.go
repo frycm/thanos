@@ -223,17 +223,22 @@ type executeOutcome struct {
 // execute dispatches the plan through the real RemotePlanExecutor, as the
 // manager's compaction loop would, and reports back on a channel.
 func (c *testCluster) execute(cg *compact.Group, toCompact []*metadata.Meta) <-chan executeOutcome {
-	return c.executeOpts(cg, toCompact, false)
+	return c.executePlan(cg, compact.Plan{Sources: toCompact})
 }
 
 // executeOpts dispatches a plan with vertical compaction and deduplication
 // replica labels configured, as a manager running with
 // --deduplication.replica-label would.
 func (c *testCluster) executeOpts(cg *compact.Group, toCompact []*metadata.Meta, overlapping bool) <-chan executeOutcome {
+	return c.executePlan(cg, compact.Plan{Sources: toCompact, OverlappingBlocks: overlapping})
+}
+
+// executePlan dispatches a complete plan, outputs included.
+func (c *testCluster) executePlan(cg *compact.Group, plan compact.Plan) <-chan executeOutcome {
 	e := NewRemotePlanExecutor(c.logger, c.manager, c.sched, nil, 1, nil)
 	ch := make(chan executeOutcome, 1)
 	go func() {
-		ids, err := e.Execute(context.Background(), "", cg, compact.Plan{Sources: toCompact, OverlappingBlocks: overlapping})
+		ids, err := e.Execute(context.Background(), "", cg, plan)
 		ch <- executeOutcome{compIDs: ids, err: err}
 	}()
 	return ch

@@ -629,16 +629,26 @@ func (s *Scheduler) MarkOversized(task Task, reason string) {
 }
 
 // oversizedReason returns why a task exceeds the limits, or "" when it fits.
+//
+// The limits bound what a worker has to build, so a plan that names several
+// partitioned outputs is judged per output: its sources' series and index
+// bytes are spread over as many blocks as the plan produces.
 func oversizedReason(task Task, conf ManagerConfig) string {
+	series, indexBytes := task.ExpectedSeries, task.ExpectedIndexBytes
+	perOutput := ""
+	if n := uint64(len(task.Outputs)); n > 1 {
+		series, indexBytes = series/n, indexBytes/int64(n)
+		perOutput = fmt.Sprintf(" per output, over %d outputs,", n)
+	}
 	switch {
-	case conf.MaxTaskSeries > 0 && task.ExpectedSeries > conf.MaxTaskSeries:
-		return fmt.Sprintf("task expects %d series from %d source blocks, over the configured --compact.manager.max-task-series of %d; "+
+	case conf.MaxTaskSeries > 0 && series > conf.MaxTaskSeries:
+		return fmt.Sprintf("task expects %d series%s from %d source blocks, over the configured --compact.manager.max-task-series of %d; "+
 			"split the plan, raise worker capacity together with the limit, or no-compact-mark the blocks",
-			task.ExpectedSeries, len(task.SourceBlocks), conf.MaxTaskSeries)
-	case conf.MaxTaskIndexBytes > 0 && task.ExpectedIndexBytes > conf.MaxTaskIndexBytes:
-		return fmt.Sprintf("task expects %d bytes of source index from %d source blocks, over the configured --compact.manager.max-task-index-size of %d; "+
+			series, perOutput, len(task.SourceBlocks), conf.MaxTaskSeries)
+	case conf.MaxTaskIndexBytes > 0 && indexBytes > conf.MaxTaskIndexBytes:
+		return fmt.Sprintf("task expects %d bytes of source index%s from %d source blocks, over the configured --compact.manager.max-task-index-size of %d; "+
 			"split the plan, raise worker capacity together with the limit, or no-compact-mark the blocks",
-			task.ExpectedIndexBytes, len(task.SourceBlocks), conf.MaxTaskIndexBytes)
+			indexBytes, perOutput, len(task.SourceBlocks), conf.MaxTaskIndexBytes)
 	}
 	return ""
 }
@@ -984,8 +994,8 @@ func NewRemotePlanExecutor(logger log.Logger, bkt objstore.Bucket, sched *Schedu
 }
 
 // runPlan hands one plan to a worker and waits for it to finish.
-func (e *RemotePlanExecutor) runPlan(ctx context.Context, cg *compact.Group, toCompact []*metadata.Meta, overlappingBlocks bool) ([]ulid.ULID, error) {
-	task, err := CompactionTask(cg, toCompact, overlappingBlocks)
+func (e *RemotePlanExecutor) runPlan(ctx context.Context, cg *compact.Group, plan compact.Plan) ([]ulid.ULID, error) {
+	task, err := CompactionTask(cg, plan)
 	if err != nil {
 		return nil, err
 	}
@@ -1027,7 +1037,7 @@ func (e *RemotePlanExecutor) runPlan(ctx context.Context, cg *compact.Group, toC
 		return nil, err
 	}
 
-	return e.verifyAndFinalize(ctx, cg, toCompact, res, overlappingBlocks)
+	return e.verifyAndFinalize(ctx, cg, plan, res)
 }
 
 // verifyAndFinalize checks that what a worker claims to have uploaded is really
@@ -1036,14 +1046,17 @@ func (e *RemotePlanExecutor) runPlan(ctx context.Context, cg *compact.Group, toC
 //
 // The provenance checks are what stands between a confused worker and data
 // loss: the sources are deleted below on the strength of this verification, so
-// a block that merely exists is not good enough. It has to carry this group's
-// labels and resolution, sit inside the plan's time range, and together the
-// outputs have to account for every source in the plan.
-func (e *RemotePlanExecutor) verifyAndFinalize(ctx context.Context, cg *compact.Group, toCompact []*metadata.Meta, res Result, overlappingBlocks bool) ([]ulid.ULID, error) {
+// a block that merely exists is not good enough. It has to carry the labels of
+// one of the plan's outputs and the group's resolution, sit inside the plan's
+// time range, and together the outputs have to account for every source in
+// the plan.
+func (e *RemotePlanExecutor) verifyAndFinalize(ctx context.Context, cg *compact.Group, plan compact.Plan, res Result) ([]ulid.ULID, error) {
+	toCompact, overlappingBlocks := plan.Sources, plan.OverlappingBlocks
 	checker := e.deletableChecker
 	if checker == nil {
 		checker = compact.DefaultBlockDeletableChecker{}
 	}
+	outputs := newOutputMatcher(cg, plan)
 
 	// An output block records the union of its parents' sources, not the
 	// parents' ULIDs, so that union is what the outputs must account for.
@@ -1101,9 +1114,8 @@ func (e *RemotePlanExecutor) verifyAndFinalize(ctx context.Context, cg *compact.
 		}); err != nil {
 			return nil, compact.NewRetryError(errors.Wrapf(err, "result block %s", id))
 		}
-		if !labels.Equal(labels.FromMap(meta.Thanos.Labels), cg.Labels()) {
-			return nil, compact.NewRetryError(errors.Errorf(
-				"result block %s carries labels %v, the group has %v", id, meta.Thanos.Labels, cg.Labels()))
+		if err := outputs.claim(meta.Thanos.Labels); err != nil {
+			return nil, compact.NewRetryError(errors.Wrapf(err, "result block %s", id))
 		}
 		if meta.Thanos.Downsample.Resolution != cg.Resolution() {
 			return nil, compact.NewRetryError(errors.Errorf(
@@ -1287,8 +1299,57 @@ func verifyProvenance(m *metadata.Meta, want Provenance) error {
 	return nil
 }
 
+// outputMatcher checks result blocks against the outputs a plan names: every
+// block has to carry the labels of one output, and no output may be claimed
+// by two blocks. A plan without outputs names the one block a compaction has
+// always produced, with the group's labels.
+type outputMatcher struct {
+	expected []labels.Labels
+	claimed  []bool
+}
+
+func newOutputMatcher(cg *compact.Group, plan compact.Plan) *outputMatcher {
+	m := &outputMatcher{}
+	if len(plan.Outputs) == 0 {
+		m.expected = []labels.Labels{cg.Labels()}
+	}
+	for _, o := range plan.Outputs {
+		if o.Labels == nil {
+			m.expected = append(m.expected, cg.Labels())
+			continue
+		}
+		m.expected = append(m.expected, labels.FromMap(o.Labels))
+	}
+	m.claimed = make([]bool, len(m.expected))
+	return m
+}
+
+// claim matches a result block's labels to an unclaimed output.
+func (m *outputMatcher) claim(lbls map[string]string) error {
+	got := labels.FromMap(lbls)
+	matched := -1
+	for i, want := range m.expected {
+		if !labels.Equal(got, want) {
+			continue
+		}
+		if !m.claimed[i] {
+			m.claimed[i] = true
+			return nil
+		}
+		matched = i
+	}
+	if matched >= 0 {
+		return errors.Errorf("carries labels %v, which another result block of the plan already carries", got)
+	}
+	if len(m.expected) == 1 {
+		return errors.Errorf("carries labels %v, the plan's output has %v", got, m.expected[0])
+	}
+	return errors.Errorf("carries labels %v, which none of the plan's %d outputs has", got, len(m.expected))
+}
+
 // CompactionTask builds the task that asks a worker to execute a plan.
-func CompactionTask(cg *compact.Group, toCompact []*metadata.Meta, overlappingBlocks bool) (Task, error) {
+func CompactionTask(cg *compact.Group, plan compact.Plan) (Task, error) {
+	toCompact, overlappingBlocks := plan.Sources, plan.OverlappingBlocks
 	spec, err := GroupSpecOf(cg)
 	if err != nil {
 		return Task{}, err
@@ -1315,6 +1376,7 @@ func CompactionTask(cg *compact.Group, toCompact []*metadata.Meta, overlappingBl
 		ExpectedMinTime:    minTime,
 		ExpectedMaxTime:    maxTime,
 		OverlappingBlocks:  overlappingBlocks,
+		Outputs:            plan.Outputs,
 		ExpectedSeries:     series,
 		ExpectedIndexBytes: indexBytes,
 	}, nil

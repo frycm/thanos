@@ -13,6 +13,8 @@ package distributed
 import (
 	"encoding/json"
 	"time"
+
+	"github.com/thanos-io/thanos/pkg/compact"
 )
 
 // TaskType describes the unit of work a task represents.
@@ -70,6 +72,14 @@ type Task struct {
 	// OverlappingBlocks reports whether the group contained overlapping blocks at
 	// planning time. Only possible with vertical compaction enabled.
 	OverlappingBlocks bool `json:"overlapping_blocks"`
+
+	// Outputs are the blocks the plan produces, as the manager's planner
+	// decided them: each with its external labels and, optionally, the
+	// partition of the series it holds. Empty means the one block a
+	// compaction has always produced, carrying the group's labels. The
+	// worker produces exactly these; it decides nothing about them, since
+	// only the manager sees the whole bucket.
+	Outputs []compact.PlanOutput `json:"outputs,omitempty"`
 
 	// TargetResolution is set for TaskDownsample only.
 	TargetResolution int64 `json:"target_resolution,omitzero"`

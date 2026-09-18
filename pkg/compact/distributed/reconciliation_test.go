@@ -258,7 +258,7 @@ func TestFinalizeRetriesTransientMetadataReads(t *testing.T) {
 			testutil.Ok(t, err)
 			w, err := NewWorker(c.logger, c.shared, nil, comp, prometheus.NewRegistry(), WorkerConfig{JournalID: journalID, DataDir: t.TempDir()})
 			testutil.Ok(t, err)
-			task, err := CompactionTask(cg, metas, false)
+			task, err := CompactionTask(cg, compact.Plan{Sources: metas})
 			testutil.Ok(t, err)
 			_, err = c.sched.Submit(t.Context(), task)
 			testutil.Ok(t, err)
@@ -278,7 +278,7 @@ func TestFinalizeRetriesTransientMetadataReads(t *testing.T) {
 				return nil
 			})
 			e := NewRemotePlanExecutor(c.logger, bkt, c.sched, nil, 1, nil)
-			ids, err := e.verifyAndFinalize(t.Context(), cg, metas, res, false)
+			ids, err := e.verifyAndFinalize(t.Context(), cg, compact.Plan{Sources: metas}, res)
 			if persistent {
 				testutil.NotOk(t, err)
 				testutil.Equals(t, 3, reads)

@@ -17,8 +17,7 @@ import (
 // Execute fills free slots from the group's current metadata snapshot. Sources
 // and envelopes remain reserved even after completion: newly produced blocks
 // only become planning inputs after the outer compactor loop synchronizes them.
-func (e *RemotePlanExecutor) Execute(ctx context.Context, _ string, cg *compact.Group, plan compact.Plan) ([]ulid.ULID, error) {
-	first, overlappingBlocks := plan.Sources, plan.OverlappingBlocks
+func (e *RemotePlanExecutor) Execute(ctx context.Context, _ string, cg *compact.Group, first compact.Plan) ([]ulid.ULID, error) {
 	plans := groupPlans{executor: e, group: cg, first: first, excluded: map[ulid.ULID]struct{}{}}
 	type outcome struct {
 		ids []ulid.ULID
@@ -44,13 +43,13 @@ func (e *RemotePlanExecutor) Execute(ctx context.Context, _ string, cg *compact.
 				recordError(err)
 				break
 			}
-			if len(plan) == 0 {
+			if plan.Empty() {
 				exhausted = true
 				break
 			}
 			inflight++
 			go func() {
-				ids, err := e.runPlan(ctx, cg, plan, overlappingBlocks)
+				ids, err := e.runPlan(ctx, cg, plan)
 				results <- outcome{ids: ids, err: err}
 			}()
 		}
@@ -98,33 +97,35 @@ func planEnvelope(metas []*metadata.Meta) planSpan {
 type groupPlans struct {
 	executor *RemotePlanExecutor
 	group    *compact.Group
-	first    []*metadata.Meta
+	first    compact.Plan
 	excluded map[ulid.ULID]struct{}
 	reserved []planSpan
 }
 
-func (p *groupPlans) next(ctx context.Context) ([]*metadata.Meta, error) {
+// next returns the next plan to dispatch, or an empty plan when the group has
+// no more. Plans come from the group's planner complete with their outputs,
+// so a worker never has to decide what to produce.
+func (p *groupPlans) next(ctx context.Context) (compact.Plan, error) {
 	for {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return compact.Plan{}, err
 		}
 		plan := p.first
-		p.first = nil
-		if len(plan) == 0 {
+		p.first = compact.Plan{}
+		if plan.Empty() {
 			if p.executor.planner == nil {
-				return nil, nil
+				return compact.Plan{}, nil
 			}
 			var err error
-			next, err := p.group.PlanExcluding(ctx, p.executor.planner, p.excluded, make(chan error, 1))
+			plan, err = p.group.PlanExcluding(ctx, p.executor.planner, p.excluded, make(chan error, 1))
 			if err != nil {
-				return nil, err
+				return compact.Plan{}, err
 			}
-			plan = next.Sources
-			if len(plan) == 0 {
-				return nil, nil
+			if plan.Empty() {
+				return compact.Plan{}, nil
 			}
 		}
-		span := planEnvelope(plan)
+		span := planEnvelope(plan.Sources)
 		overlaps := false
 		for _, taken := range p.reserved {
 			if span.min < taken.max && taken.min < span.max {
@@ -132,7 +133,7 @@ func (p *groupPlans) next(ctx context.Context) ([]*metadata.Meta, error) {
 				break
 			}
 		}
-		for _, m := range plan {
+		for _, m := range plan.Sources {
 			p.excluded[m.ULID] = struct{}{}
 		}
 		p.reserved = append(p.reserved, span)

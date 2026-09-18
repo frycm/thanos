@@ -231,10 +231,10 @@ func TestVerifyAndFinalizeAcceptsTheRealResult(t *testing.T) {
 		toCompact[0].ULID, toCompact[1].ULID)
 	id, sum := uploadResultMeta(t, bkt, out)
 
-	compIDs, err := e.verifyAndFinalize(context.Background(), cg, toCompact, Result{
+	compIDs, err := e.verifyAndFinalize(context.Background(), cg, compact.Plan{Sources: toCompact}, Result{
 		TaskID: "t1", Outcome: OutcomeCompleted,
 		OutputBlocks: []string{id}, OutputChecksums: map[string]string{id: sum},
-	}, false)
+	})
 	testutil.Ok(t, err)
 	testutil.Equals(t, 1, len(compIDs))
 	testutil.Equals(t, true, deletionMarked(t, bkt, toCompact[0].ULID))
@@ -277,10 +277,10 @@ func TestVerifyAndFinalizeRefusesForeignBlocks(t *testing.T) {
 			e, bkt, cg, toCompact := provenanceFixture(t)
 			id, sum := uploadResultMeta(t, bkt, tc.out(toCompact))
 
-			_, err := e.verifyAndFinalize(context.Background(), cg, toCompact, Result{
+			_, err := e.verifyAndFinalize(context.Background(), cg, compact.Plan{Sources: toCompact}, Result{
 				TaskID: "t1", Outcome: OutcomeCompleted,
 				OutputBlocks: []string{id}, OutputChecksums: map[string]string{id: sum},
-			}, false)
+			})
 			testutil.NotOk(t, err)
 			testutil.Equals(t, true, compact.IsRetryError(err))
 			testutil.Equals(t, false, deletionMarked(t, bkt, toCompact[0].ULID))
@@ -298,10 +298,10 @@ func TestVerifyAndFinalizeRefusesChecksumMismatch(t *testing.T) {
 		toCompact[0].ULID, toCompact[1].ULID)
 	id, _ := uploadResultMeta(t, bkt, out)
 
-	_, err := e.verifyAndFinalize(context.Background(), cg, toCompact, Result{
+	_, err := e.verifyAndFinalize(context.Background(), cg, compact.Plan{Sources: toCompact}, Result{
 		TaskID: "t1", Outcome: OutcomeCompleted,
 		OutputBlocks: []string{id}, OutputChecksums: map[string]string{id: "sha256:not-what-was-uploaded"},
-	}, false)
+	})
 	testutil.NotOk(t, err)
 	testutil.Equals(t, false, deletionMarked(t, bkt, toCompact[0].ULID))
 }
@@ -318,7 +318,7 @@ func TestVerifyAndFinalizeEmptyResult(t *testing.T) {
 			m.Stats.NumSamples = 0
 		}
 
-		compIDs, err := e.verifyAndFinalize(context.Background(), cg, toCompact, Result{TaskID: "t1", Outcome: OutcomeCompleted}, false)
+		compIDs, err := e.verifyAndFinalize(context.Background(), cg, compact.Plan{Sources: toCompact}, Result{TaskID: "t1", Outcome: OutcomeCompleted})
 		testutil.Ok(t, err)
 		testutil.Equals(t, 0, len(compIDs))
 		testutil.Equals(t, true, deletionMarked(t, bkt, toCompact[0].ULID))
@@ -329,7 +329,7 @@ func TestVerifyAndFinalizeEmptyResult(t *testing.T) {
 		e, bkt, cg, toCompact := provenanceFixture(t)
 		toCompact[0].Stats.NumSamples = 0
 
-		_, err := e.verifyAndFinalize(context.Background(), cg, toCompact, Result{TaskID: "t1", Outcome: OutcomeCompleted}, false)
+		_, err := e.verifyAndFinalize(context.Background(), cg, compact.Plan{Sources: toCompact}, Result{TaskID: "t1", Outcome: OutcomeCompleted})
 		testutil.NotOk(t, err)
 		testutil.Equals(t, true, compact.IsRetryError(err))
 		testutil.Equals(t, false, deletionMarked(t, bkt, toCompact[0].ULID))
@@ -387,10 +387,10 @@ func TestVerifyAndFinalizeRefusesMissingChecksum(t *testing.T) {
 		toCompact[0].ULID, toCompact[1].ULID)
 	id, _ := uploadResultMeta(t, bkt, out)
 
-	_, err := e.verifyAndFinalize(context.Background(), cg, toCompact, Result{
+	_, err := e.verifyAndFinalize(context.Background(), cg, compact.Plan{Sources: toCompact}, Result{
 		TaskID: "t1", Outcome: OutcomeCompleted,
 		OutputBlocks: []string{id},
-	}, false)
+	})
 	testutil.NotOk(t, err)
 	testutil.Equals(t, true, compact.IsRetryError(err))
 	testutil.Equals(t, false, deletionMarked(t, bkt, toCompact[0].ULID))
@@ -460,10 +460,10 @@ func TestVerifyAndFinalizeRequiresProvenance(t *testing.T) {
 			}
 			id, sum := uploadResultMeta(t, bkt, out)
 
-			_, err := e.verifyAndFinalize(context.Background(), cg, toCompact, Result{
+			_, err := e.verifyAndFinalize(context.Background(), cg, compact.Plan{Sources: toCompact}, Result{
 				TaskID: "t1", Outcome: OutcomeCompleted,
 				OutputBlocks: []string{id}, OutputChecksums: map[string]string{id: sum},
-			}, false)
+			})
 			testutil.NotOk(t, err)
 			testutil.Equals(t, true, compact.IsRetryError(err))
 			testutil.Equals(t, false, deletionMarked(t, bkt, toCompact[0].ULID))

@@ -408,7 +408,7 @@ func (w *Worker) execute(ctx context.Context, task Task, acknowledged *atomic.Bo
 		},
 	}
 
-	compIDs, err := executor.Execute(ctx, dir, cg, compact.Plan{Sources: toCompact, OverlappingBlocks: task.OverlappingBlocks})
+	compIDs, err := executor.Execute(ctx, dir, cg, compact.Plan{Sources: toCompact, OverlappingBlocks: task.OverlappingBlocks, Outputs: task.Outputs})
 	if err != nil {
 		return w.triageExecutionError(ctx, res, err, aborted, acknowledged)
 	}
