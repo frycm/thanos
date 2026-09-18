@@ -5,8 +5,9 @@ package metadata
 
 import (
 	"cmp"
-	"github.com/oklog/ulid/v2"
 	"slices"
+
+	"github.com/oklog/ulid/v2"
 )
 
 type sourceInterval struct {

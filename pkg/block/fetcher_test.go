@@ -1680,7 +1680,7 @@ func TestResolutionMetaFilter_UncoveredGaugeAndBoundedLogging(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	gauge := prometheus.NewGauge(prometheus.GaugeOpts{Name: "test_uncovered"})
+	gauge := promauto.With(nil).NewGauge(prometheus.GaugeOpts{Name: "test_uncovered"})
 	f := NewResolutionMetaFilter(log.NewNopLogger(), 300000, 3600000, gauge)
 	report := f.Reporter()
 
@@ -1774,7 +1774,7 @@ func TestResolutionMetaFilter_CoverageAcrossTheTimePartition(t *testing.T) {
 	// The store serves [0, 100].
 	mint := time.Unix(0, 0)
 	maxt := time.Unix(0, 100*time.Millisecond.Nanoseconds())
-	gauge := prometheus.NewGauge(prometheus.GaugeOpts{Name: "test_uncovered"})
+	gauge := promauto.With(nil).NewGauge(prometheus.GaugeOpts{Name: "test_uncovered"})
 	resolution := NewResolutionMetaFilter(log.NewNopLogger(), res5m, res1h, gauge)
 	chain := []MetadataFilter{
 		resolution,

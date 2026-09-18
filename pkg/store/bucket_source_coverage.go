@@ -12,6 +12,7 @@ import (
 	"github.com/oklog/ulid/v2"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/model/labels"
 
 	"github.com/thanos-io/thanos/pkg/block/metadata"
@@ -20,7 +21,7 @@ import (
 // fallbackFilterGauge receives the counts of the filters re-run on fallback
 // metadata. They are not exported: the fetcher's counters describe its
 // metadata pass, and the reporter describes the served fallbacks.
-var fallbackFilterGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "fallback_filter"}, []string{"state"})
+var fallbackFilterGauge = promauto.With(nil).NewGaugeVec(prometheus.GaugeOpts{Name: "fallback_filter", Help: "Counts of the metadata filters re-run on fallback blocks; unregistered."}, []string{"state"})
 
 // Try replacements first, then load only the fallbacks still needed. This
 // avoids loading all historical raw blocks on every cold start and preserves

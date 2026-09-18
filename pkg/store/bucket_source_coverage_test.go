@@ -11,6 +11,7 @@ import (
 	"github.com/go-kit/log"
 	"github.com/oklog/ulid/v2"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/model/labels"
 
 	"github.com/thanos-io/thanos/pkg/block"
@@ -78,7 +79,7 @@ func TestResolutionFilterAndSelectionPreserveUncoveredRaw(t *testing.T) {
 			coarse.Compaction.Sources = []ulid.ULID{coarse.ULID}
 		}
 		metas := map[ulid.ULID]*metadata.Meta{raw.ULID: raw, coarse.ULID: &coarse}
-		gauge := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "test"}, []string{"state"})
+		gauge := promauto.With(nil).NewGaugeVec(prometheus.GaugeOpts{Name: "test"}, []string{"state"})
 		testutil.Ok(t, block.NewResolutionMetaFilter(log.NewNopLogger(), 300000, 3600000, nil).Filter(t.Context(), metas, gauge, nil))
 		testutil.Assert(t, metas[raw.ULID] != nil, "filter must retain uncovered raw")
 		set := newBucketBlockSet(labels.EmptyLabels())

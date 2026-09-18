@@ -18,6 +18,7 @@ import (
 	"github.com/go-kit/log"
 	"github.com/oklog/ulid/v2"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/tsdb"
@@ -212,7 +213,7 @@ func TestResolutionStraddlingFallbackTrustsCoverBeyondPartition(t *testing.T) {
 
 	minTime, maxTime := time.UnixMilli(0), time.UnixMilli(1799999)
 	partition := block.NewTimePartitionMetaFilter(model.TimeOrDurationValue{Time: &minTime}, model.TimeOrDurationValue{Time: &maxTime})
-	gauge := prometheus.NewGauge(prometheus.GaugeOpts{Name: "test_uncovered"})
+	gauge := promauto.With(nil).NewGauge(prometheus.GaugeOpts{Name: "test_uncovered"})
 	filter := block.NewResolutionMetaFilter(logger, downsample.ResLevel1, downsample.ResLevel2, gauge)
 	fetcher, err := block.NewMetaFetcher(logger, 1, bkt, block.NewConcurrentLister(logger, bkt), "", nil, []block.MetadataFilter{filter, partition})
 	testutil.Ok(t, err)

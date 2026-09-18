@@ -42,38 +42,13 @@ In general, an average of 6 MB of local disk space is required per TSDB block st
 
 ## Resolution filtering and failures
 
-`--min-block-resolution` prefers downsampled blocks while retaining finer data
-whose sources and time range are not covered at the minimum resolution. The
-default `0s` minimum preserves the existing behavior. `--max-block-resolution`
-is a hard upper bound; data excluded by that bound must be served elsewhere.
+`--min-block-resolution` prefers downsampled blocks while retaining finer data whose sources and time range are not covered at the minimum resolution. The default `0s` minimum preserves the existing behavior. `--max-block-resolution` is a hard upper bound; data excluded by that bound must be served elsewhere.
 
-Coverage advertised by metadata is not enough to remove a fallback. The store
-first attempts to load replacements, then loads or retains the finer blocks
-still needed when a replacement fails to load. This also applies on cold start,
-without eagerly loading all raw blocks when replacements load successfully.
-Blocks at the configured minimum resolution that hide a finer block have their
-index headers checked before becoming selectable, including when lazy index
-downloading is enabled; blocks that hide nothing keep their configured lazy
-loading. A finer block straddling a `--min-time`/`--max-time` boundary counts
-the cover on the far side of that boundary as served by the store responsible
-for it. A fallback that cannot be loaded is logged and retried on the next
-sync, like any other block. Both flags accept only the resolutions the
-compactor produces: `0s`, `5m` and `1h`.
-Other blocks retain their configured lazy-loading behavior.
-Fallbacks obey the same time partition. When coverage disappears from the
-bucket, retained finer data becomes eligible again on the next successful sync.
+Coverage advertised by metadata is not enough to remove a fallback. The store first attempts to load replacements, then loads or retains the finer blocks still needed when a replacement fails to load. This also applies on cold start, without eagerly loading all raw blocks when replacements load successfully. Blocks at the configured minimum resolution that hide a finer block have their index headers checked before becoming selectable, including when lazy index downloading is enabled; blocks that hide nothing keep their configured lazy loading. A finer block straddling a `--min-time`/`--max-time` boundary counts the cover on the far side of that boundary as served by the store responsible for it. A fallback that cannot be loaded is logged and retried on the next sync, like any other block. Both flags accept only the resolutions the compactor produces: `0s`, `5m` and `1h`. Other blocks retain their configured lazy-loading behavior. Fallbacks obey the same time partition. When coverage disappears from the bucket, retained finer data becomes eligible again on the next successful sync.
 
-Tests exercise source/time coverage, split ranges and gaps, replacement index
-read failures on cold start and during resync, recovery, disappearing coverage,
-and time partitioning. Query integration tests use real raw and aggregate chunks
-and actual replicas for `prometheus_replica`, `receiver_replica`,
-`otelcol_replica`, and `ruler_replica` with penalty deduplication. They check
-counts, sums, counter rates and strict-query failure when fallback chunks cannot
-be read. A fuzz test compares interval coverage with a per-millisecond reference.
+Tests exercise source/time coverage, split ranges and gaps, replacement index read failures on cold start and during resync, recovery, disappearing coverage, and time partitioning. Query integration tests use real raw and aggregate chunks and actual replicas for `prometheus_replica`, `receiver_replica`, `otelcol_replica`, and `ruler_replica` with penalty deduplication. They check counts, sums, counter rates and strict-query failure when fallback chunks cannot be read. A fuzz test compares interval coverage with a per-millisecond reference.
 
-This cannot restore blocks already deleted by retention or guarantee successful
-queries during an object-store outage. A strict query must fail when selected
-data cannot be read; it must not silently report an incomplete result as success.
+This cannot restore blocks already deleted by retention or guarantee successful queries during an object-store outage. A strict query must fail when selected data cannot be read; it must not silently report an incomplete result as success.
 
 ## Flags
 
@@ -231,22 +206,22 @@ Flags:
                                  in RFC3339 format or time duration relative
                                  to current time, such as -1d or 2h45m. Valid
                                  duration units are ms, s, m, h, d, w, y.
-      --min-block-resolution=0s  Minimum downsampling resolution of blocks to
-                                 serve, one of 0s, 5m or 1h. Queries have
-                                 to ask for data at this resolution
-                                 or coarser (max_source_resolution,
+      --min-block-resolution=0s  Minimum downsampling resolution of
+                                 blocks to serve, one of 0s, 5m or 1h.
+                                 Queries have to ask for data at this
+                                 resolution or coarser (max_source_resolution,
                                  or --query.auto-downsampling on the querier);
-                                 a finer request is answered only from the
-                                 finer blocks this store still serves; it cannot
-                                 substitute coarser data on the client's behalf.
-                                 Blocks of a finer resolution whose data is not
-                                 covered by a retained block at this resolution
-                                 are still served, as hiding those would drop
-                                 the range entirely.
+                                 a finer request is answered only from the finer
+                                 blocks this store still serves, since a store
+                                 cannot substitute coarser data on the client's
+                                 behalf. Blocks of a finer resolution whose
+                                 data is not covered by a retained block at this
+                                 resolution are still served, as hiding those
+                                 would drop the range entirely.
       --max-block-resolution=1h  Maximum downsampling resolution of blocks to
-                                 serve, one of 0s, 5m or 1h. Blocks of a coarser resolution
-                                 are not served; make sure another store serves
-                                 them.
+                                 serve, one of 0s, 5m or 1h. Blocks of a coarser
+                                 resolution are not served; make sure another
+                                 store serves them.
       --selector.relabel-config-file=<file-path>
                                  Path to YAML file with relabeling
                                  configuration that allows selecting blocks
