@@ -5,7 +5,6 @@ package distributed
 
 import (
 	"context"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -28,6 +27,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/compact"
+	"github.com/thanos-io/thanos/pkg/compact/compacttest"
 	"github.com/thanos-io/thanos/pkg/compact/downsample"
 	"github.com/thanos-io/thanos/pkg/dedup"
 	"github.com/thanos-io/thanos/pkg/discovery/dns"
@@ -42,46 +42,6 @@ import (
 // paths - a crashed worker, an unreachable journal, a manager replaced mid
 // flight - are single lines in a scenario, and the journal, which the scheduler
 // persists on every transition, doubles as the deterministic observation point.
-
-// hookBucket is one participant's view of the shared bucket. Faults injected
-// here affect only this participant.
-type hookBucket struct {
-	objstore.Bucket
-
-	mtx      sync.Mutex
-	onGet    func(ctx context.Context, name string) error
-	onUpload func(ctx context.Context, name string) error
-}
-
-func (b *hookBucket) hooks() (func(context.Context, string) error, func(context.Context, string) error) {
-	b.mtx.Lock()
-	defer b.mtx.Unlock()
-	return b.onGet, b.onUpload
-}
-
-func (b *hookBucket) setOnGet(f func(ctx context.Context, name string) error) {
-	b.mtx.Lock()
-	defer b.mtx.Unlock()
-	b.onGet = f
-}
-
-func (b *hookBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
-	if onGet, _ := b.hooks(); onGet != nil {
-		if err := onGet(ctx, name); err != nil {
-			return nil, err
-		}
-	}
-	return b.Bucket.Get(ctx, name)
-}
-
-func (b *hookBucket) Upload(ctx context.Context, name string, r io.Reader, opts ...objstore.ObjectUploadOption) error {
-	if _, onUpload := b.hooks(); onUpload != nil {
-		if err := onUpload(ctx, name); err != nil {
-			return err
-		}
-	}
-	return b.Bucket.Upload(ctx, name, r, opts...)
-}
 
 // switchableHandler lets a scenario replace the manager behind a stable URL,
 // which is exactly what a manager restart looks like to a worker.
@@ -111,7 +71,7 @@ type testCluster struct {
 	conf   ManagerConfig
 
 	shared  objstore.Bucket
-	manager *hookBucket
+	manager *compacttest.HookBucket
 	sched   *Scheduler
 	handler *switchableHandler
 	srv     *httptest.Server
@@ -119,7 +79,7 @@ type testCluster struct {
 
 type testWorker struct {
 	id     string
-	bkt    *hookBucket
+	bkt    *compacttest.HookBucket
 	reg    *prometheus.Registry
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -142,7 +102,7 @@ func newTestClusterConf(t *testing.T, conf ManagerConfig) *testCluster {
 		shared:  objstore.NewInMemBucket(),
 		handler: &switchableHandler{},
 	}
-	c.manager = &hookBucket{Bucket: c.shared}
+	c.manager = compacttest.NewHookBucket(c.shared)
 	c.sched = c.newScheduler()
 	c.srv = httptest.NewServer(c.handler)
 	t.Cleanup(c.srv.Close)
@@ -189,7 +149,7 @@ func (c *testCluster) startWorkerMerge(id string, mergeFunc storage.VerticalChun
 
 	w := &testWorker{
 		id:   id,
-		bkt:  &hookBucket{Bucket: c.shared},
+		bkt:  compacttest.NewHookBucket(c.shared),
 		reg:  prometheus.NewRegistry(),
 		done: make(chan struct{}),
 		dead: &atomic.Bool{},
@@ -339,7 +299,7 @@ func counterValue(t *testing.T, reg *prometheus.Registry, name, labelValue strin
 // reads pass through, so the worker gets far enough to hold a lease.
 func gateChunks(w *testWorker) (release func()) {
 	gate := make(chan struct{})
-	w.bkt.setOnGet(func(ctx context.Context, name string) error {
+	w.bkt.SetOnGet(func(ctx context.Context, name string) error {
 		if strings.HasSuffix(name, "meta.json") || strings.HasPrefix(name, JournalPrefix) {
 			return nil
 		}
@@ -455,7 +415,7 @@ func TestInteractionJournalOutageFailsClosed(t *testing.T) {
 	w1 := c.startWorker("w1")
 	journalDown := true
 	var mtx sync.Mutex
-	w1.bkt.setOnGet(func(_ context.Context, name string) error {
+	w1.bkt.SetOnGet(func(_ context.Context, name string) error {
 		mtx.Lock()
 		down := journalDown
 		mtx.Unlock()

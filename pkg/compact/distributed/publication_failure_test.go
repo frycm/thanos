@@ -22,6 +22,7 @@ import (
 
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
+	"github.com/thanos-io/thanos/pkg/compact/compacttest"
 	"github.com/thanos-io/thanos/pkg/compact/downsample"
 	"github.com/thanos-io/thanos/pkg/logutil"
 )
@@ -63,14 +64,15 @@ func sourceObjects(t *testing.T, bkt objstore.Bucket, sources []string) map[stri
 	return objects
 }
 
-func resultContent(t *testing.T, bkt objstore.Bucket, result Result) *bucketDump {
+func resultContent(t *testing.T, bkt objstore.Bucket, result Result) *compacttest.BucketDump {
 	t.Helper()
-	d := &bucketDump{series: map[string]map[downsample.AggrType][]scnSample{}}
+	d := compacttest.NewBucketDump()
 	for _, raw := range result.OutputBlocks {
 		m, err := block.DownloadMeta(t.Context(), nil, bkt, ulid.MustParse(raw))
 		testutil.Ok(t, err)
-		d.readBlock(t, t.Context(), bkt, t.TempDir(), &m)
+		d.ReadBlock(t, t.Context(), bkt, t.TempDir(), &m)
 	}
+	d.Sort()
 	return d
 }
 
@@ -152,7 +154,7 @@ func TestWorkerPublicationFailuresPreserveData(t *testing.T) {
 					retried := w.execute(t.Context(), task, testAtomicBool(true))
 					testutil.Equals(t, OutcomeCompleted, retried.Outcome)
 					testutil.Equals(t, before, sourceObjects(t, c.shared, task.SourceBlocks))
-					assertSameContent(t, want, resultContent(t, c.shared, retried), "publication retry")
+					compacttest.AssertSameContent(t, want, resultContent(t, c.shared, retried), "publication retry")
 				})
 			}
 		}
@@ -189,7 +191,7 @@ func TestSourceDeletionFailureCanBeRetried(t *testing.T) {
 			for name, body := range before {
 				testutil.Equals(t, body, afterFailure[name], "source data must remain immutable: %s", name)
 			}
-			assertSameContent(t, want, resultContent(t, c.shared, result), "source deletion failure cannot damage the replacement")
+			compacttest.AssertSameContent(t, want, resultContent(t, c.shared, result), "source deletion failure cannot damage the replacement")
 			executor.bkt = c.shared
 			ids, err := executor.verifyAndFinalize(t.Context(), cg, metas, result, false)
 			testutil.Ok(t, err)
@@ -201,7 +203,7 @@ func TestSourceDeletionFailureCanBeRetried(t *testing.T) {
 			// to run again; it must be idempotent.
 			_, err = executor.verifyAndFinalize(t.Context(), cg, metas, result, false)
 			testutil.Ok(t, err)
-			assertSameContent(t, want, resultContent(t, c.shared, result), "repeated finalization")
+			compacttest.AssertSameContent(t, want, resultContent(t, c.shared, result), "repeated finalization")
 		})
 	}
 }

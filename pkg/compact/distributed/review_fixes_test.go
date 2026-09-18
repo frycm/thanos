@@ -22,6 +22,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 
 	"github.com/thanos-io/thanos/pkg/compact"
+	"github.com/thanos-io/thanos/pkg/compact/compacttest"
 	"github.com/thanos-io/thanos/pkg/compact/downsample"
 )
 
@@ -89,7 +90,7 @@ func TestWorkerChecksumReadBackFailureAbortsNotCompletes(t *testing.T) {
 
 	// Fail reads of any meta.json that is neither a source block's nor the
 	// journal: that is exactly the read-back of the freshly uploaded result.
-	w1.bkt.setOnGet(func(_ context.Context, name string) error {
+	w1.bkt.SetOnGet(func(_ context.Context, name string) error {
 		if !strings.HasSuffix(name, "meta.json") || strings.HasPrefix(name, JournalPrefix) {
 			return nil
 		}
@@ -107,7 +108,7 @@ func TestWorkerChecksumReadBackFailureAbortsNotCompletes(t *testing.T) {
 	testutil.Equals(t, 0.0, counterValue(t, w1.reg, "thanos_compact_worker_tasks_total", string(OutcomeCompleted)))
 
 	// Once the store recovers, the requeued task completes for real.
-	w1.bkt.setOnGet(nil)
+	w1.bkt.SetOnGet(nil)
 	var got executeOutcome
 	select {
 	case got = <-outcome:
@@ -123,18 +124,18 @@ func TestWorkerChecksumReadBackFailureAbortsNotCompletes(t *testing.T) {
 // through the compactor's wait loop and exit the whole manager process, whose
 // restart voids every in-flight lease.
 func TestSubmitJournalBlipIsRetryable(t *testing.T) {
-	bkt := &hookBucket{Bucket: objstore.NewInMemBucket()}
+	bkt := compacttest.NewHookBucket(objstore.NewInMemBucket())
 	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
 		JournalID: "shard-blip",
 	})
 	testutil.Ok(t, err)
 
-	bkt.onUpload = func(_ context.Context, name string) error {
+	bkt.SetOnUpload(func(_ context.Context, name string) error {
 		if strings.HasPrefix(name, JournalPrefix) {
 			return errors.New("injected: journal write failed")
 		}
 		return nil
-	}
+	})
 
 	_, err = sched.Submit(context.Background(), Task{ID: "t-blip", Type: TaskCompaction})
 	testutil.NotOk(t, err)
@@ -143,7 +144,7 @@ func TestSubmitJournalBlipIsRetryable(t *testing.T) {
 
 	// The submission was rolled back: once the journal recovers the same task
 	// can be submitted again.
-	bkt.onUpload = nil
+	bkt.SetOnUpload(nil)
 	_, err = sched.Submit(context.Background(), Task{ID: "t-blip", Type: TaskCompaction})
 	testutil.Ok(t, err)
 }
@@ -575,7 +576,7 @@ func TestDispatchDownsamplingRecordsFailures(t *testing.T) {
 // the lock across a bucket GET+PUT, so a slow object store froze all heartbeats
 // - and frozen heartbeats are expired leases and discarded work.
 func TestHeartbeatsAreNotStalledByJournalIO(t *testing.T) {
-	bkt := &hookBucket{Bucket: objstore.NewInMemBucket()}
+	bkt := compacttest.NewHookBucket(objstore.NewInMemBucket())
 	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
 		JournalID: "shard-slow",
 	})
@@ -590,8 +591,7 @@ func TestHeartbeatsAreNotStalledByJournalIO(t *testing.T) {
 	// Make every journal write take its time, and start a Submit that has to
 	// sit in that slow upload.
 	uploadStarted := make(chan struct{})
-	bkt.mtx.Lock()
-	bkt.onUpload = func(_ context.Context, name string) error {
+	bkt.SetOnUpload(func(_ context.Context, name string) error {
 		if strings.HasPrefix(name, JournalPrefix) {
 			select {
 			case uploadStarted <- struct{}{}:
@@ -600,8 +600,7 @@ func TestHeartbeatsAreNotStalledByJournalIO(t *testing.T) {
 			time.Sleep(500 * time.Millisecond)
 		}
 		return nil
-	}
-	bkt.mtx.Unlock()
+	})
 
 	done := make(chan struct{})
 	go func() {
