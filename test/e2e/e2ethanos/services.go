@@ -33,6 +33,11 @@ import (
 )
 
 const (
+	// DefaultMinioImage is the Minio image used in e2e tests. The efficientgo/e2e
+	// default points at Docker Hub, where the image is no longer available;
+	// upstream Thanos mirrors it on quay.io. See https://quay.io/repository/thanos/minio?tab=tags.
+	DefaultMinioImage = "quay.io/thanos/minio:RELEASE.2022-03-14T18-25-24Z"
+
 	infoLogLevel = "info"
 )
 

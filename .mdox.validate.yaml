@@ -61,4 +61,13 @@ validators:
     type: 'ignore'
   - regex: 'codeburst\.io'
     type: 'ignore'
-
+  # Fork CI: links that fail from GitHub Actions regardless of this repository's content.
+  # Slack archives answer 403 without a session.
+  - regex: 'cloud-native\.slack\.com'
+    type: 'ignore'
+  # Loki moved its promtail documentation; the old anchors answer 404.
+  - regex: 'grafana\.com\/docs\/loki'
+    type: 'ignore'
+  # The upstream release branch this fork tracks is referenced before it exists upstream.
+  - regex: 'github\.com\/thanos-io\/thanos\/tree\/release-'
+    type: 'ignore'
