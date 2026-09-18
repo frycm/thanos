@@ -14,6 +14,7 @@ import (
 	"github.com/oklog/ulid/v2"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/thanos-io/objstore"
 
 	"github.com/thanos-io/thanos/pkg/block"
@@ -285,7 +286,7 @@ func (r *Rollback) RecentlyActive(window time.Duration, now time.Time) []string 
 // until it returns successfully, including while retrying an interrupted rollback.
 func (r *Rollback) Apply(ctx context.Context, logger log.Logger, bkt objstore.Bucket) error {
 
-	counter := prometheus.NewCounter(prometheus.CounterOpts{
+	counter := promauto.With(nil).NewCounter(prometheus.CounterOpts{
 		Name: "thanos_compact_rollback_marks_removed_total",
 		Help: "Total number of deletion marks removed by the rollback.",
 	})

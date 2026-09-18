@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,8 +19,10 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/thanos-io/objstore"
+	"go.uber.org/atomic"
 
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/compact"
@@ -81,7 +82,7 @@ type nodeConfig struct {
 }
 
 func (c nodeConfig) withDefaults() nodeConfig {
-	c.NodeConfig = c.NodeConfig.WithDefaults()
+	c.NodeConfig = c.WithDefaults()
 	if c.mode == "" {
 		c.mode = modeManager
 	}
@@ -125,8 +126,8 @@ func newNode(t *testing.T, shared objstore.Bucket, handler *switchableHandler, c
 	conf = conf.withDefaults()
 	n := &node{
 		conf:               conf,
-		downsamples:        prometheus.NewCounterVec(prometheus.CounterOpts{Name: "scenario_downsamples"}, []string{"resolution"}),
-		downsampleFailures: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "scenario_downsample_failures"}, []string{"resolution"}),
+		downsamples:        promauto.With(nil).NewCounterVec(prometheus.CounterOpts{Name: "scenario_downsamples"}, []string{"resolution"}),
+		downsampleFailures: promauto.With(nil).NewCounterVec(prometheus.CounterOpts{Name: "scenario_downsample_failures"}, []string{"resolution"}),
 	}
 	var hooks compacttest.Hooks
 	if conf.mode == modeManager {
@@ -204,7 +205,7 @@ func newScenarioRun(t *testing.T, c *compacttest.Corpus, conf nodeConfig) *scena
 	s.srv = httptest.NewServer(s.handler)
 	t.Cleanup(s.srv.Close)
 	s.Run = compacttest.NewRun(t, c, s.conf.NodeConfig)
-	s.Run.NewNode = func(base compacttest.NodeConfig) *compacttest.Node {
+	s.NewNode = func(base compacttest.NodeConfig) *compacttest.Node {
 		s.mtx.Lock()
 		conf := s.next
 		s.mtx.Unlock()
@@ -215,10 +216,10 @@ func newScenarioRun(t *testing.T, c *compacttest.Corpus, conf nodeConfig) *scena
 		s.mtx.Unlock()
 		return n.Node
 	}
-	s.Run.Quiet = func() bool {
+	s.Quiet = func() bool {
 		return s.currentManager().sched == nil || len(s.tasksInState(StatePending))+len(s.tasksInState(StateLeased)) == 0
 	}
-	s.Run.Start()
+	s.Start()
 	return s
 }
 
@@ -238,7 +239,7 @@ func (s *scenarioRun) replaceManager(conf nodeConfig) *node {
 	s.mtx.Lock()
 	s.next = conf
 	s.mtx.Unlock()
-	s.Run.Replace(conf.NodeConfig)
+	s.Replace(conf.NodeConfig)
 	return s.currentManager()
 }
 
@@ -248,7 +249,7 @@ func (s *scenarioRun) install(n *node) {
 	s.mtx.Lock()
 	s.manager = n
 	s.mtx.Unlock()
-	s.Run.Install(n.Node)
+	s.Install(n.Node)
 }
 
 type workerOpts struct {

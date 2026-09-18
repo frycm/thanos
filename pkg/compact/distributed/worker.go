@@ -10,7 +10,6 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
-	"sync/atomic"
 	"time"
 
 	"github.com/efficientgo/core/backoff"
@@ -22,6 +21,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/thanos-io/objstore"
+	"go.uber.org/atomic"
 
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
@@ -134,7 +134,7 @@ func NewWorker(logger log.Logger, bkt objstore.Bucket, client TaskClient, comp c
 	}, nil
 }
 
-// Run leases and executes tasks until the context is cancelled.
+// Run leases and executes tasks until the context is canceled.
 func (w *Worker) Run(ctx context.Context) error {
 	if err := w.cleanTaskDirectories(); err != nil {
 		return errors.Wrap(err, "clean abandoned worker task directories")
@@ -193,7 +193,7 @@ func (w *Worker) runTask(ctx context.Context, task Task) {
 	level.Info(w.logger).Log("msg", "finished task", "task", task.ID, "outcome", res.Outcome,
 		"blocks", len(res.OutputBlocks), "duration", time.Since(start))
 
-	// Report on a context that is not tied to the task, so a cancelled task still
+	// Report on a context that is not tied to the task, so a canceled task still
 	// tells the manager what happened.
 	reportCtx, reportCancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer reportCancel()
@@ -288,7 +288,7 @@ func (w *Worker) heartbeat(ctx context.Context, task Task, acknowledged *atomic.
 				level.Warn(w.logger).Log("msg", "heartbeat failed", "task", task.ID, "err", err)
 			}
 		} else if !resp.Acknowledged {
-			level.Warn(w.logger).Log("msg", "the manager no longer recognises our lease; abandoning the task", "task", task.ID)
+			level.Warn(w.logger).Log("msg", "the manager no longer recognizes our lease; abandoning the task", "task", task.ID)
 			abandon()
 			return
 		} else {
@@ -488,7 +488,7 @@ func (w *Worker) completeResult(ctx context.Context, res Result, ids []ulid.ULID
 // over the wire.
 func (w *Worker) rebuildGroup(ctx context.Context, task Task) (*compact.Group, []*metadata.Meta, error) {
 	noopCounter := func() prometheus.Counter {
-		return prometheus.NewCounter(prometheus.CounterOpts{Name: "thanos_compact_worker_noop"})
+		return promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "thanos_compact_worker_noop_total", Help: "Placeholder counter for group metrics a worker does not report; unregistered."})
 	}
 
 	var extensions any

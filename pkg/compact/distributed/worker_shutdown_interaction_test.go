@@ -100,8 +100,8 @@ func TestWorkerShutdownAtExecutionStages(t *testing.T) {
 
 // TestWorkerShutdownReportsAbortNotHalt pins down that a worker being asked to
 // shut down mid-task reports an abort, not a halt. The compaction seam wraps a
-// cancelled compaction in a halt error, and before the shutdown triage that
-// halt travelled to the manager and stopped the whole shard.
+// canceled compaction in a halt error, and before the shutdown triage that
+// halt traveled to the manager and stopped the whole shard.
 func TestWorkerShutdownReportsAbortNotHalt(t *testing.T) {
 	c := newTestCluster(t)
 
