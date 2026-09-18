@@ -436,12 +436,14 @@ func (g *DefaultGrouper) Groups(blocks map[ulid.ULID]*metadata.Meta) (res []*Gro
 // Group captures a set of blocks that have the same origin labels and downsampling resolution.
 // Those blocks generally contain the same series and can thus efficiently be compacted.
 type Group struct {
-	logger                        log.Logger
-	bkt                           objstore.Bucket
-	key                           string
-	labels                        labels.Labels
-	resolution                    int64
-	mtx                           sync.Mutex
+	logger     log.Logger
+	bkt        objstore.Bucket
+	key        string
+	labels     labels.Labels
+	resolution int64
+	mtx        sync.Mutex
+	// compactRunMtx serializes whole runs while allowing the executor to plan under mtx.
+	compactRunMtx                 sync.Mutex
 	metasByMinTime                []*metadata.Meta
 	acceptMalformedIndex          bool
 	enableVerticalCompaction      bool
@@ -595,6 +597,41 @@ func (cg *Group) Labels() labels.Labels {
 // Resolution returns the common downsampling resolution of blocks in the group.
 func (cg *Group) Resolution() int64 {
 	return cg.resolution
+}
+
+// AcceptMalformedIndex returns whether blocks with a malformed index are
+// tolerated in this group.
+func (cg *Group) AcceptMalformedIndex() bool {
+	return cg.acceptMalformedIndex
+}
+
+// EnableVerticalCompaction returns whether overlapping blocks may be compacted
+// vertically in this group.
+func (cg *Group) EnableVerticalCompaction() bool {
+	return cg.enableVerticalCompaction
+}
+
+// HashFunc returns the hash function used for the files of this group's blocks.
+func (cg *Group) HashFunc() metadata.HashFunc {
+	return cg.hashFunc
+}
+
+// BlockFilesConcurrency returns how many files of a single block are fetched or
+// uploaded concurrently.
+func (cg *Group) BlockFilesConcurrency() int {
+	return cg.blockFilesConcurrency
+}
+
+// CompactBlocksFetchConcurrency returns how many blocks of a plan are downloaded
+// concurrently.
+func (cg *Group) CompactBlocksFetchConcurrency() int {
+	return cg.compactBlocksFetchConcurrency
+}
+
+// BlocksMarkedForDeletion returns the counter tracking blocks this group marked
+// for deletion.
+func (cg *Group) BlocksMarkedForDeletion() prometheus.Counter {
+	return cg.blocksMarkedForDeletion
 }
 
 func (cg *Group) Extensions() any {
@@ -923,6 +960,9 @@ func (cg *Group) Compact(ctx context.Context, dir string, planner Planner, comp 
 // CompactWithExecutor plans a single compaction against the group and hands the
 // resulting plan to the given executor.
 func (cg *Group) CompactWithExecutor(ctx context.Context, dir string, planner Planner, executor PlanExecutor) (shouldRerun bool, compIDs []ulid.ULID, rerr error) {
+	cg.compactRunMtx.Lock()
+	defer cg.compactRunMtx.Unlock()
+
 	cg.compactionRunsStarted.Inc()
 
 	subDir := filepath.Join(dir, cg.Key())
@@ -990,6 +1030,11 @@ func NewIssue347Error(err error, brokenBlock ulid.ULID) error {
 	return issue347Error(err, brokenBlock)
 }
 
+// Block returns the ID of the block that caused the error.
+func (e Issue347Error) Block() ulid.ULID {
+	return e.id
+}
+
 func (e Issue347Error) Error() string {
 	return e.err.Error()
 }
@@ -1004,6 +1049,11 @@ func IsIssue347Error(err error) bool {
 type OutOfOrderChunksError struct {
 	err error
 	id  ulid.ULID
+}
+
+// Block returns the ID of the block that caused the error.
+func (e OutOfOrderChunksError) Block() ulid.ULID {
+	return e.id
 }
 
 func (e OutOfOrderChunksError) Error() string {
@@ -1203,14 +1253,25 @@ func RepairIssue347(ctx context.Context, logger log.Logger, bkt objstore.Bucket,
 // Planning is separated from execution so that the resulting plan can be handed
 // to an arbitrary PlanExecutor, possibly running in a different process.
 func (cg *Group) Plan(ctx context.Context, planner Planner, errChan chan error) (Plan, error) {
+	return cg.PlanExcluding(ctx, planner, nil, errChan)
+}
+
+// PlanExcluding plans the next compaction for the group while pretending the
+// given blocks are not there.
+//
+// Repeated planning yields disjoint source IDs, but the resulting blocks can
+// still overlap: the planner may select blocks on both sides of an excluded
+// interval. Executors dispatching several plans concurrently must also check
+// that their full output time spans are disjoint.
+func (cg *Group) PlanExcluding(ctx context.Context, planner Planner, exclude map[ulid.ULID]struct{}, errChan chan error) (Plan, error) {
 	cg.mtx.Lock()
 	defer cg.mtx.Unlock()
 
-	return cg.planLocked(ctx, planner, errChan)
+	return cg.planLocked(ctx, planner, exclude, errChan)
 }
 
-// planLocked implements Plan. Callers have to hold cg.mtx.
-func (cg *Group) planLocked(ctx context.Context, planner Planner, errChan chan error) (Plan, error) {
+// planLocked implements PlanExcluding. Callers have to hold cg.mtx.
+func (cg *Group) planLocked(ctx context.Context, planner Planner, exclude map[ulid.ULID]struct{}, errChan chan error) (Plan, error) {
 	// Check for overlapped blocks.
 	overlappingBlocks := false
 	if err := cg.areBlocksOverlapping(nil); err != nil {
@@ -1223,9 +1284,26 @@ func (cg *Group) planLocked(ctx context.Context, planner Planner, errChan chan e
 		overlappingBlocks = true
 	}
 
+	candidates := cg.metasByMinTime
+	if len(exclude) > 0 {
+		candidates = make([]*metadata.Meta, 0, len(cg.metasByMinTime))
+		for _, m := range cg.metasByMinTime {
+			if _, skip := exclude[m.ULID]; skip {
+				continue
+			}
+			candidates = append(candidates, m)
+		}
+	}
+
+	if len(candidates) == 0 {
+		// Everything in the group is already being worked on. Planners expect a
+		// non-empty set of blocks, so stop here rather than handing them nothing.
+		return Plan{}, nil
+	}
+
 	var toCompact []*metadata.Meta
 	if err := tracing.DoInSpanWithErr(ctx, "compaction_planning", func(ctx context.Context) (e error) {
-		toCompact, e = planner.Plan(ctx, cg.metasByMinTime, errChan, cg.Extensions())
+		toCompact, e = planner.Plan(ctx, candidates, errChan, cg.Extensions())
 		return e
 	}); err != nil {
 		return Plan{}, errors.Wrap(err, "plan compaction")
@@ -1537,11 +1615,14 @@ func (ex LocalPlanExecutor) Execute(ctx context.Context, dir string, cg *Group, 
 	return compIDs, nil
 }
 
+// compact plans work for the group and hands it to the executor.
+//
+// The group lock is held only while planning. A group is compacted by a single
+// goroutine at a time, so nothing else mutates it meanwhile, and releasing the
+// lock lets an executor plan further, disjoint work for the same group while the
+// first plan is still running.
 func (cg *Group) compact(ctx context.Context, dir string, planner Planner, executor PlanExecutor, errChan chan error) (bool, []ulid.ULID, error) {
-	cg.mtx.Lock()
-	defer cg.mtx.Unlock()
-
-	plan, err := cg.planLocked(ctx, planner, errChan)
+	plan, err := cg.Plan(ctx, planner, errChan)
 	if err != nil {
 		return false, nil, err
 	}
@@ -1562,6 +1643,19 @@ func (cg *Group) compact(ctx context.Context, dir string, planner Planner, execu
 
 	// Even if no blocks were produced, because all sources were empty, there may be more work to do.
 	return true, compIDs, nil
+}
+
+// RecordCompaction records a verified remote compaction in the group metrics.
+func (cg *Group) RecordCompaction(overlappingBlocks bool) {
+	cg.compactions.Inc()
+	if overlappingBlocks {
+		cg.verticalCompactions.Inc()
+	}
+}
+
+// RecordSourceGarbageCollected records source retirement by a remote executor.
+func (cg *Group) RecordSourceGarbageCollected() {
+	cg.groupGarbageCollectedBlocks.Inc()
 }
 
 func (cg *Group) deleteBlock(id ulid.ULID, bdir string, blockDeletableChecker BlockDeletableChecker) error {
