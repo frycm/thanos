@@ -71,3 +71,6 @@ validators:
   # The upstream release branch this fork tracks is referenced before it exists upstream.
   - regex: 'github\.com\/thanos-io\/thanos\/tree\/release-'
     type: 'ignore'
+  # GitHub rate-limits the workflow badge links from Actions runners.
+  - regex: 'github\.com\/thanos-io\/thanos\/actions'
+    type: 'ignore'
