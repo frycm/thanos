@@ -24,6 +24,7 @@ import (
 
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/compact"
+	"github.com/thanos-io/thanos/pkg/compact/compacttest"
 	"github.com/thanos-io/thanos/pkg/compact/downsample"
 	"github.com/thanos-io/thanos/pkg/logutil"
 )
@@ -140,7 +141,7 @@ func TestWorkerResourceErrorsDoNotHaltManager(t *testing.T) {
 // write, so expiry can run in between; a second copy of the id would never be
 // removed and would inflate the queue metrics forever.
 func TestLeaseExpiredDuringPersistLeavesNoDuplicateQueueEntry(t *testing.T) {
-	bkt := &hookBucket{Bucket: objstore.NewInMemBucket()}
+	bkt := compacttest.NewHookBucket(objstore.NewInMemBucket())
 	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
 		JournalID:   "shard-dup",
 		LeaseTTL:    20 * time.Millisecond,
@@ -152,8 +153,7 @@ func TestLeaseExpiredDuringPersistLeavesNoDuplicateQueueEntry(t *testing.T) {
 
 	uploadStarted := make(chan struct{}, 1)
 	release := make(chan struct{})
-	bkt.mtx.Lock()
-	bkt.onUpload = func(_ context.Context, name string) error {
+	bkt.SetOnUpload(func(_ context.Context, name string) error {
 		if strings.HasPrefix(name, JournalPrefix) {
 			select {
 			case uploadStarted <- struct{}{}:
@@ -162,8 +162,7 @@ func TestLeaseExpiredDuringPersistLeavesNoDuplicateQueueEntry(t *testing.T) {
 			<-release
 		}
 		return nil
-	}
-	bkt.mtx.Unlock()
+	})
 
 	leased := make(chan error, 1)
 	go func() {
@@ -268,7 +267,8 @@ func TestFinalizeRetriesTransientMetadataReads(t *testing.T) {
 			res := w.execute(t.Context(), *leased, testAtomicBool(true))
 			testutil.Equals(t, OutcomeCompleted, res.Outcome)
 			var reads int
-			bkt := &hookBucket{Bucket: c.shared, onGet: func(_ context.Context, name string) error {
+			bkt := compacttest.NewHookBucket(c.shared)
+			bkt.SetOnGet(func(_ context.Context, name string) error {
 				if name == res.OutputBlocks[0]+"/"+block.MetaFilename {
 					reads++
 					if persistent || reads == 1 {
@@ -276,7 +276,7 @@ func TestFinalizeRetriesTransientMetadataReads(t *testing.T) {
 					}
 				}
 				return nil
-			}}
+			})
 			e := NewRemotePlanExecutor(c.logger, bkt, c.sched, nil, 1, nil)
 			ids, err := e.verifyAndFinalize(t.Context(), cg, metas, res, false)
 			if persistent {
@@ -297,7 +297,7 @@ func TestFinalizeRetriesTransientMetadataReads(t *testing.T) {
 }
 
 func TestMaintenanceWaitingForJournalDoesNotBlockHeartbeats(t *testing.T) {
-	bkt := &hookBucket{Bucket: objstore.NewInMemBucket()}
+	bkt := compacttest.NewHookBucket(objstore.NewInMemBucket())
 	s := testScheduler(t, bkt, ManagerConfig{LeaseTTL: time.Minute})
 	_, err := s.Submit(t.Context(), Task{ID: "first", Type: TaskCompaction})
 	testutil.Ok(t, err)
@@ -311,8 +311,7 @@ func TestMaintenanceWaitingForJournalDoesNotBlockHeartbeats(t *testing.T) {
 		}
 	}
 	defer unblock()
-	bkt.mtx.Lock()
-	bkt.onUpload = func(ctx context.Context, name string) error {
+	bkt.SetOnUpload(func(ctx context.Context, name string) error {
 		if strings.HasPrefix(name, JournalPrefix) {
 			select {
 			case started <- struct{}{}:
@@ -325,8 +324,7 @@ func TestMaintenanceWaitingForJournalDoesNotBlockHeartbeats(t *testing.T) {
 			}
 		}
 		return nil
-	}
-	bkt.mtx.Unlock()
+	})
 	done := make(chan struct{})
 	go func() { defer close(done); _, _ = s.Submit(t.Context(), Task{ID: "second", Type: TaskCompaction}) }()
 	<-started

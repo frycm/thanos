@@ -14,6 +14,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/thanos-io/objstore"
+	"github.com/thanos-io/thanos/pkg/compact/compacttest"
 )
 
 // This file holds regression tests for the findings of the second review of
@@ -22,22 +23,18 @@ import (
 // failNextJournalWrite makes the next journal upload fail once the given
 // condition holds, polling the scheduler's state - which is free while the
 // write is in flight - and returns after that write went through the hook.
-func failNextJournalWrite(bkt *hookBucket, ready func() bool) {
-	bkt.mtx.Lock()
-	defer bkt.mtx.Unlock()
-	bkt.onUpload = func(_ context.Context, name string) error {
+func failNextJournalWrite(bkt *compacttest.HookBucket, ready func() bool) {
+	bkt.SetOnUpload(func(_ context.Context, name string) error {
 		if !strings.HasPrefix(name, JournalPrefix) {
 			return nil
 		}
-		bkt.mtx.Lock()
-		bkt.onUpload = nil
-		bkt.mtx.Unlock()
+		bkt.SetOnUpload(nil)
 		deadline := time.Now().Add(5 * time.Second)
 		for !ready() && time.Now().Before(deadline) {
 			time.Sleep(time.Millisecond)
 		}
 		return errors.New("injected journal write failure")
-	}
+	})
 }
 
 // TestSubmitFailureRemovesOnlyItsTask pins down that a Submit whose journal
@@ -46,7 +43,7 @@ func failNextJournalWrite(bkt *hookBucket, ready func() bool) {
 // meantime; the old code popped the last queue entry, which was then the
 // other task - left in the scheduler's maps but never leased, forever.
 func TestSubmitFailureRemovesOnlyItsTask(t *testing.T) {
-	bkt := &hookBucket{Bucket: objstore.NewInMemBucket()}
+	bkt := compacttest.NewHookBucket(objstore.NewInMemBucket())
 	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
 		JournalID: "shard-submit", JournalUnavailableTimeout: time.Hour,
 	})
@@ -89,7 +86,7 @@ func TestSubmitFailureRemovesOnlyItsTask(t *testing.T) {
 // The old code assumed the task was still its own and dereferenced a map
 // entry the lease had moved on - a nil pointer panic in the manager.
 func TestSubmitSurvivesLeaseDuringJournalWrite(t *testing.T) {
-	bkt := &hookBucket{Bucket: objstore.NewInMemBucket()}
+	bkt := compacttest.NewHookBucket(objstore.NewInMemBucket())
 	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
 		JournalID: "shard-submit-lease", JournalUnavailableTimeout: time.Hour,
 	})
@@ -301,7 +298,7 @@ func TestMaintainPrunesAndUnparks(t *testing.T) {
 // outlives a failed journal write: the entry is only gone once the bucket says
 // so, otherwise a restart would read it back and park the set again.
 func TestMaintainKeepsUnparkMarkerUntilPersisted(t *testing.T) {
-	bkt := &hookBucket{Bucket: objstore.NewInMemBucket()}
+	bkt := compacttest.NewHookBucket(objstore.NewInMemBucket())
 	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
 		JournalID: "shard-a", JournalRetention: time.Hour, LeaseTTL: time.Hour, JournalUnavailableTimeout: time.Hour,
 	})

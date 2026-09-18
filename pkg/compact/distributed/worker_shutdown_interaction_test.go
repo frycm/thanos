@@ -17,6 +17,7 @@ import (
 
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/compact"
+	"github.com/thanos-io/thanos/pkg/compact/compacttest"
 	"github.com/thanos-io/thanos/pkg/compact/downsample"
 	"github.com/thanos-io/thanos/pkg/logutil"
 )
@@ -58,8 +59,8 @@ func TestWorkerShutdownAtExecutionStages(t *testing.T) {
 				if stage == "compaction" {
 					executor = shutdownCompactor{Compactor: comp, cancel: cancel}
 				}
-				bkt := &hookBucket{Bucket: c.shared}
-				bkt.onGet = func(_ context.Context, name string) error {
+				bkt := compacttest.NewHookBucket(c.shared)
+				bkt.SetOnGet(func(_ context.Context, name string) error {
 					if stage == "checksum" && strings.HasSuffix(name, "meta.json") {
 						isSource := false
 						for _, m := range metas {
@@ -75,14 +76,14 @@ func TestWorkerShutdownAtExecutionStages(t *testing.T) {
 						return ctx.Err()
 					}
 					return nil
-				}
-				bkt.onUpload = func(_ context.Context, _ string) error {
+				})
+				bkt.SetOnUpload(func(_ context.Context, _ string) error {
 					if stage == "upload" {
 						cancel()
 						return ctx.Err()
 					}
 					return nil
-				}
+				})
 				w, err := NewWorker(c.logger, bkt, nil, executor, prometheus.NewRegistry(), WorkerConfig{JournalID: journalID, DataDir: t.TempDir()})
 				testutil.Ok(t, err)
 				result := w.execute(ctx, *leased, testAtomicBool(true))

@@ -49,6 +49,15 @@ go test -tags slicelabels -race -timeout 5m ./cmd/thanos -run TestCompactorManag
 ```
 
 The Go CI workflow explicitly runs both commands with Go 1.25 and Go 1.26.
+
+The corpus, the content oracle, the fault-injectable bucket views and the
+compactor process come from `pkg/compact/compacttest`, which also holds the
+scenarios every compactor has to survive whatever executes its plans: an object
+store outage, a process crash and restart, a corrupted source, and failed
+publications of every block file. `TestGenericScenarios` runs those against a
+manager with two workers; `TestScenarios` adds the failures only the
+distributed compactor can have. The same generic scenarios run against the
+standalone compactor in `pkg/compact/compacttest` itself.
 Ordinary unit tests also run the publication and result-validation regressions;
 the larger fault-scenario corpus remains opt-in outside that dedicated CI job.
 
