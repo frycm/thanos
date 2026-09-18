@@ -1013,7 +1013,7 @@ func outOfOrderChunkError(err error, brokenBlock ulid.ULID) OutOfOrderChunksErro
 	return OutOfOrderChunksError{err: err, id: brokenBlock}
 }
 
-// NewOutOfOrderChunksError returns an error signalling that the given block
+// NewOutOfOrderChunksError returns an error signaling that the given block
 // contains out-of-order chunks. It is exported so that out-of-process executors
 // can reconstruct the error class reported by a remote worker.
 func NewOutOfOrderChunksError(err error, brokenBlock ulid.ULID) error {

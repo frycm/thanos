@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,10 +18,12 @@ import (
 	"github.com/oklog/ulid/v2"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/thanos-io/objstore"
+	"go.uber.org/atomic"
 
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
@@ -79,7 +80,7 @@ func MergeFuncFor(dedupFunc string) storage.VerticalChunkSeriesMergeFunc {
 }
 
 // Hooks let a feature replace the parts of a node it changes. Nil hooks keep
-// the standalone compactor's behaviour.
+// the standalone compactor's behavior.
 type Hooks struct {
 	// Executor builds the executor that runs the node's compaction plans. The
 	// default executes them in process.
@@ -119,7 +120,7 @@ type Node struct {
 }
 
 func counter() prometheus.Counter {
-	return prometheus.NewCounter(prometheus.CounterOpts{Name: "scenario_counter"})
+	return promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "scenario_events_total", Help: "Events the compactor under test counts; unregistered."})
 }
 
 // NewNode builds a node over the shared bucket.

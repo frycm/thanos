@@ -27,6 +27,7 @@ import (
 	"github.com/go-kit/log"
 	"github.com/oklog/ulid/v2"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/thanos-io/objstore"
@@ -177,7 +178,7 @@ func (c *Corpus) Upload(t *testing.T, bkt objstore.Bucket) {
 		testutil.Ok(t, block.Upload(ctx, logger, bkt, b.Dir, metadata.NoneFunc))
 		if b.Mark != "" {
 			testutil.Ok(t, block.MarkForNoCompact(ctx, logger, bkt, b.ID, b.Mark, "scenario corpus",
-				prometheus.NewCounter(prometheus.CounterOpts{Name: "scenario_marks"})))
+				promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "scenario_marks_total", Help: "Blocks the corpus marked no-compact."})))
 		}
 	}
 }

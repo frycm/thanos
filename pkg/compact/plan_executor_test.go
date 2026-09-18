@@ -11,6 +11,7 @@ import (
 	"github.com/oklog/ulid/v2"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/thanos-io/objstore"
 
@@ -50,7 +51,7 @@ func testGroup(t *testing.T, metas ...*metadata.Meta) *Group {
 	t.Helper()
 
 	cnt := func() prometheus.Counter {
-		return prometheus.NewCounter(prometheus.CounterOpts{Name: "test"})
+		return promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"})
 	}
 	g, err := NewGroup(
 		log.NewNopLogger(),
