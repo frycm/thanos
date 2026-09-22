@@ -1764,6 +1764,10 @@ func DispatchDownsampling(
 				return ctx.Err()
 			case res = <-resultCh:
 			}
+			// The result is under verification from here until this returns;
+			// maintenance leaves it alone meanwhile, and rejects what was
+			// never accepted afterwards.
+			defer sched.VerificationDone(res.TaskID)
 
 			// Aborted outcomes never reach the submitter: the scheduler requeues
 			// them, and past the abort cap it fails the task.
@@ -1798,6 +1802,15 @@ func DispatchDownsampling(
 					inc(downsampleFailures, resolution)
 					return compact.NewRetryError(errors.Wrapf(err, "downsampled block %s reported for %s", outMeta.ULID, c.Meta.ULID))
 				}
+			}
+
+			// Verified: the block is published to the manager's view. Until
+			// then the deduplication filter withholds it, and without this
+			// the manager would downsample the same block again every pass.
+			if err := sched.AcceptOutputs(ctx, res.TaskID); err != nil {
+				failed.Store(true)
+				inc(downsampleFailures, resolution)
+				return compact.NewRetryError(errors.Wrapf(err, "accept downsample of %s", c.Meta.ULID))
 			}
 
 			inc(downsamples, resolution)

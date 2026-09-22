@@ -12,8 +12,9 @@ package distributed
 
 import (
 	"encoding/json"
-	"github.com/oklog/ulid/v2"
 	"time"
+
+	"github.com/oklog/ulid/v2"
 
 	"github.com/thanos-io/thanos/pkg/compact"
 )
