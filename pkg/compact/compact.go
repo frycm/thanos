@@ -1028,6 +1028,32 @@ func IsOutOfOrderChunkError(err error) bool {
 }
 
 // HaltError is a type wrapper for errors that should halt any further progress on compactions.
+// partitionsCover checks that outputs which each hold one partition of the
+// sources' series together hold every series, from the tallies their
+// populators kept. The outputs of a plan replace its sources, so a series no
+// output kept would be lost with them. Partitions fail to cover when they do
+// not hash as the sources were partitioned: a shard block re-partitioned
+// with other labels left out of the hash holds series that none of the finer
+// partitions claims. An output without a partition holds every series.
+func partitionsCover(outputs []PlanOutput, stats []PartitionStats) error {
+	var walked, kept uint64
+	for i, out := range outputs {
+		if out.Series == nil {
+			return nil
+		}
+		if i > 0 && stats[i].Walked != walked {
+			return errors.Errorf("series partition %d of %d walked %d series of the sources where the first walked %d", out.Series.Index, out.Series.Count, stats[i].Walked, walked)
+		}
+		walked = stats[i].Walked
+		kept += stats[i].Kept
+	}
+	if kept != walked {
+		return errors.Errorf("the plan's %d series partitions together hold %d of the %d series of the sources, so the plan would lose the rest; "+
+			"a partition of a shard block must leave the same labels out of its hash as the shard was made with", len(outputs), kept, walked)
+	}
+	return nil
+}
+
 type HaltError struct {
 	err error
 }
@@ -1381,13 +1407,14 @@ func (ex LocalPlanExecutor) Execute(ctx context.Context, dir string, cg *Group, 
 		if len(outputs) > 1 {
 			level.Info(cg.logger).Log("msg", "compacting into several blocks", "outputs", len(outputs), "plan", sourceBlockStr)
 		}
+		stats := make([]PartitionStats, len(outputs))
 		for i, out := range outputs {
 			populator := populateBlockFunc
 			if out.Series != nil {
 				if _, isDefault := populateBlockFunc.(tsdb.DefaultBlockPopulator); !isDefault {
 					return errors.Errorf("cannot partition a compaction whose lifecycle callback provides its own block populator (%T)", populateBlockFunc)
 				}
-				populator = PartitionedBlockPopulator{Partition: *out.Series}
+				populator = PartitionedBlockPopulator{Partition: *out.Series, Stats: &stats[i]}
 			}
 			ids, e := ex.Comp.CompactWithBlockPopulator(dir, toCompactDirs, nil, populator)
 			if e != nil {
@@ -1401,7 +1428,7 @@ func (ex LocalPlanExecutor) Execute(ctx context.Context, dir string, cg *Group, 
 			}
 			compIDs = append(compIDs, ids...)
 		}
-		return nil
+		return partitionsCover(outputs, stats)
 	}); err != nil {
 		return nil, halt(errors.Wrapf(err, "compact blocks %v", toCompactDirs))
 	}

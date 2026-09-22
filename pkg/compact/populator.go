@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"slices"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
@@ -26,6 +27,19 @@ import (
 // chunk writing - is the default populator's logic.
 type PartitionedBlockPopulator struct {
 	Partition SeriesPartition
+	// Stats, if set, receives the populator's tally of the sources' series.
+	Stats *PartitionStats
+}
+
+// PartitionStats is the tally a PartitionedBlockPopulator keeps of the
+// series it walked in the sources and the series among them it kept for its
+// partition, both counted once per source block that holds the series. The
+// populators of every partition of one compaction walk the same series, so
+// whoever runs them can tell from their tallies whether the partitions
+// together kept every series.
+type PartitionStats struct {
+	Walked uint64
+	Kept   uint64
 }
 
 var _ tsdb.BlockPopulator = PartitionedBlockPopulator{}
@@ -181,6 +195,7 @@ func (p PartitionedBlockPopulator) partitionPostings(ctx context.Context, all in
 	var (
 		refs    []storage.SeriesRef
 		builder labels.ScratchBuilder
+		digest  = xxhash.New()
 		n       int
 	)
 	for all.Next() {
@@ -193,9 +208,15 @@ func (p PartitionedBlockPopulator) partitionPostings(ctx context.Context, all in
 		if err := indexr.Series(all.At(), &builder, nil); err != nil {
 			return nil, err
 		}
+		if p.Stats != nil {
+			p.Stats.Walked++
+		}
 		lset := builder.Labels()
-		if !p.Partition.Contains(lset) {
+		if !p.Partition.contains(lset, digest) {
 			continue
+		}
+		if p.Stats != nil {
+			p.Stats.Kept++
 		}
 		refs = append(refs, all.At())
 		lset.Range(func(l labels.Label) {

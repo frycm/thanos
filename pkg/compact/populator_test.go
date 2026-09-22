@@ -143,3 +143,77 @@ func TestSeriesPartitionValidate(t *testing.T) {
 	testutil.NotOk(t, SeriesPartition{}.Validate())
 	testutil.NotOk(t, SeriesPartition{Index: 4, Count: 4}.Validate())
 }
+
+// TestSeriesPartitionWithout: a partition that leaves labels out of its hash
+// hashes a series as labels.StableHash hashes the series without them, so
+// replicas differing only in those labels share a partition and a series that
+// carries none of them hashes as it always did.
+func TestSeriesPartitionWithout(t *testing.T) {
+	without := []string{"replica", "prometheus_replica"}
+	lsets := []labels.Labels{
+		labels.FromStrings("__name__", "up", "job", "api", "replica", "a"),
+		labels.FromStrings("__name__", "up", "job", "api", "replica", "b"),
+		labels.FromStrings("__name__", "up", "instance", "h1", "job", "api", "prometheus_replica", "p0", "replica", "a"),
+		labels.FromStrings("__name__", "up", "job", "api"),
+		labels.FromStrings("replica", "only"),
+		labels.EmptyLabels(),
+	}
+	for _, lset := range lsets {
+		want := labels.StableHash(labels.NewBuilder(lset).Del(without...).Labels())
+		for _, count := range []uint64{1, 2, 8, 1 << 20} {
+			p := SeriesPartition{Index: want % count, Count: count, Without: without}
+			testutil.Assert(t, p.Contains(lset), "%s must hash as its label set without %v", lset, without)
+			testutil.Equals(t, want, p.hash(lset, nil))
+		}
+	}
+	testutil.Equals(t, labels.StableHash(lsets[3]), SeriesPartition{Count: 1, Without: without}.hash(lsets[3], nil), "a series without the labels hashes as before")
+	testutil.Equals(t, SeriesPartition{Count: 1, Without: without}.hash(lsets[0], nil), SeriesPartition{Count: 1, Without: without}.hash(lsets[1], nil), "replicas hash together")
+	testutil.Assert(t, SeriesPartition{Count: 1}.hash(lsets[0], nil) != SeriesPartition{Count: 1}.hash(lsets[1], nil), "without the exclusion they hash apart")
+	testutil.NotOk(t, SeriesPartition{Index: 0, Count: 2, Without: []string{"a", ""}}.Validate())
+}
+
+// TestPartitionedBlockPopulatorKeepsReplicasTogether: two replicas whose
+// replica label sits inside the series land in the same partition when the
+// partition leaves that label out of its hash, and the populators' tallies
+// show the partitions covering every series.
+func TestPartitionedBlockPopulatorKeepsReplicasTogether(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	var series []labels.Labels
+	for i := range 40 {
+		for _, replica := range []string{"a", "b"} {
+			series = append(series, labels.FromStrings("__name__", fmt.Sprintf("metric_%d", i%5), "instance", fmt.Sprintf("host-%d", i), "job", "api", "replica", replica))
+		}
+	}
+	id, err := e2eutil.CreateBlock(ctx, dir, series, 30, 0, time.Hour.Milliseconds(), labels.FromStrings("ext", "1"), 0, metadata.NoneFunc, nil)
+	testutil.Ok(t, err)
+	dirs := []string{filepath.Join(dir, id.String())}
+	comp, err := tsdb.NewLeveledCompactor(ctx, nil, slog.Default(), []int64{time.Hour.Milliseconds(), 2 * time.Hour.Milliseconds()}, chunkenc.NewPool(),
+		storage.NewCompactingChunkSeriesMerger(storage.ChainedSeriesMerge))
+	testutil.Ok(t, err)
+	out := t.TempDir()
+
+	const count = 4
+	var walked, kept uint64
+	partitionOf := map[string]uint64{}
+	for i := range uint64(count) {
+		stats := &PartitionStats{}
+		ids, err := comp.CompactWithBlockPopulator(out, dirs, nil, PartitionedBlockPopulator{Partition: SeriesPartition{Index: i, Count: count, Without: []string{"replica"}}, Stats: stats})
+		testutil.Ok(t, err)
+		testutil.Equals(t, uint64(len(series)), stats.Walked, "every partition walks every series once per source block")
+		walked, kept = stats.Walked, kept+stats.Kept
+		if len(ids) == 0 {
+			continue
+		}
+		_, lsets, _ := blockContent(t, out, ids[0])
+		for _, lset := range lsets {
+			logical := labels.NewBuilder(lset).Del("replica").Labels().String()
+			if j, ok := partitionOf[logical]; ok {
+				testutil.Equals(t, j, i, "replicas of %s sit in different partitions", logical)
+			}
+			partitionOf[logical] = i
+		}
+	}
+	testutil.Equals(t, walked, kept, "the partitions together keep every series")
+	testutil.Equals(t, len(series)/2, len(partitionOf))
+}
