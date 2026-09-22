@@ -8,6 +8,7 @@ import (
 	"slices"
 
 	"github.com/cespare/xxhash/v2"
+	"github.com/oklog/ulid/v2"
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/model/labels"
 
@@ -28,6 +29,12 @@ type Plan struct {
 	// compactor has always produced: one, carrying the group's labels and
 	// holding every series of the sources.
 	Outputs []PlanOutput
+	// Siblings are blocks outside the plan that the outputs complete a set
+	// with: the blocks the sources shared their own set with - the other
+	// shards of the split that made them - which would otherwise be left
+	// with a set that can never be complete again once the sources are
+	// gone. The outputs are published together with them.
+	Siblings []ulid.ULID
 }
 
 // Empty reports whether the plan has nothing to do.
@@ -120,6 +127,68 @@ type OutputPlanner interface {
 	// PlanOutputs returns the outputs of a plan with the given sources for
 	// the group. An empty result means the default output.
 	PlanOutputs(ctx context.Context, cg *Group, sources []*metadata.Meta) ([]PlanOutput, error)
+}
+
+// SiblingPlanner is implemented by planners whose plans compact blocks that
+// share a set with blocks outside the plan - shards of one split, say. The
+// plan's outputs are published together with the siblings it names: the
+// outputs and the siblings together replace what the sources' own set once
+// replaced, so that the siblings keep a complete set once the sources are
+// gone. Only a planner with a view of the bucket can name them.
+type SiblingPlanner interface {
+	PlanSiblings(ctx context.Context, cg *Group, sources []*metadata.Meta) ([]ulid.ULID, error)
+}
+
+// SetSiblings returns the siblings a plan over the given sources has to name:
+// every block in the view, other than the sources, that a set naming one of
+// the sources also names - the sources' own sets, and the sets of other
+// blocks that named a source as their sibling. Those blocks are published
+// by such a set, and retiring the sources would leave it incomplete for
+// good; named again by the plan's outputs, they stay published. The view
+// must be the compactor's, holding only published blocks: a block that is
+// about to be retired must not be named, or the new set would never be
+// complete.
+func SetSiblings(view map[ulid.ULID]*metadata.Meta, sources []*metadata.Meta) []ulid.ULID {
+	isSource := make(map[ulid.ULID]struct{}, len(sources))
+	for _, m := range sources {
+		isSource[m.ULID] = struct{}{}
+	}
+	namesASource := func(set []ulid.ULID) bool {
+		for _, id := range set {
+			if _, ok := isSource[id]; ok {
+				return true
+			}
+		}
+		return false
+	}
+	siblings := map[ulid.ULID]struct{}{}
+	collect := func(set []ulid.ULID) {
+		for _, id := range set {
+			if _, ok := isSource[id]; ok {
+				continue
+			}
+			if _, ok := view[id]; !ok {
+				continue
+			}
+			siblings[id] = struct{}{}
+		}
+	}
+	for _, m := range sources {
+		if m.Thanos.Output != nil {
+			collect(m.Thanos.Output.Blocks)
+		}
+	}
+	for _, m := range view {
+		if m.Thanos.Output != nil && namesASource(m.Thanos.Output.Blocks) {
+			collect(m.Thanos.Output.Blocks)
+		}
+	}
+	out := make([]ulid.ULID, 0, len(siblings))
+	for id := range siblings {
+		out = append(out, id)
+	}
+	slices.SortFunc(out, func(a, b ulid.ULID) int { return a.Compare(b) })
+	return out
 }
 
 // SingleBlockPlanner is implemented by planners that can have work for a

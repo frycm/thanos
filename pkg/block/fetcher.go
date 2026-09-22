@@ -86,6 +86,7 @@ const (
 	timeExcludedMeta  = "time-excluded"
 	tooFreshMeta      = "too-fresh"
 	duplicateMeta     = "duplicate"
+	unpublishedMeta   = "unpublished"
 	// Blocks that are marked for deletion can be loaded as well. This is done to make sure that we load blocks that are meant to be deleted,
 	// but don't have a replacement block yet.
 	MarkedForDeletionMeta = "marked-for-deletion"
@@ -172,6 +173,7 @@ func DefaultSyncedStateLabelValues() [][]string {
 		{labelExcludedMeta},
 		{timeExcludedMeta},
 		{duplicateMeta},
+		{unpublishedMeta},
 		{MarkedForDeletionMeta},
 		{MarkedForNoCompactionMeta},
 		{ParquetMigratedMeta},
@@ -817,6 +819,10 @@ type DefaultDeduplicateFilter struct {
 	// published, if set, says whether a block may supersede the blocks it was
 	// made from, beyond what its metadata says. See SetPublishedFunc.
 	published func(*metadata.Meta) bool
+	// hideUnpublished withholds unpublished blocks from the view; see
+	// HideUnpublished.
+	hideUnpublished bool
+	unpublishedIDs  []ulid.ULID
 }
 
 // NewDeduplicateFilter creates DefaultDeduplicateFilter.
@@ -829,6 +835,29 @@ func NewDeduplicateFilter(concurrency int) *DefaultDeduplicateFilter {
 // sources, and is itself superseded by a published block with the same
 // sources. A manager that verifies its workers' results uses it to keep a
 // result it rejected from retiring the plan's sources.
+// HideUnpublished makes the filter withhold unpublished blocks from the view
+// altogether, not only from superseding anything. A compactor needs this: an
+// unpublished block is the staged output of a plan that has not replaced its
+// sources, and were it compacted further - a shard merged with the next range
+// of its group, say - the result would be a block with no set of its own,
+// published by default, whose sources include the unsplit sources of the
+// failed plan. It would supersede them with the series of the missing
+// siblings gone. Leftovers still count as duplicates of a later, published
+// attempt at the same plan first, so that garbage collection retires them.
+// Blocks withheld this way are reported by UnpublishedIDs.
+func (f *DefaultDeduplicateFilter) HideUnpublished() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.hideUnpublished = true
+}
+
+// UnpublishedIDs returns the blocks the last Filter withheld as unpublished.
+func (f *DefaultDeduplicateFilter) UnpublishedIDs() []ulid.ULID {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.unpublishedIDs
+}
+
 func (f *DefaultDeduplicateFilter) SetPublishedFunc(published func(*metadata.Meta) bool) {
 	f.published = published
 }
@@ -839,19 +868,32 @@ func (f *DefaultDeduplicateFilter) Filter(_ context.Context, metas map[ulid.ULID
 	var filterWg, dupWg sync.WaitGroup
 	var groupChan = make(chan groupWork)
 
-	var dupsChan = make(chan ulid.ULID)
+	var dupsChan = make(chan filtered)
+
+	f.mu.Lock()
+	hideUnpublished := f.hideUnpublished
+	f.mu.Unlock()
 
 	dupWg.Go(func() {
 		dups := make([]ulid.ULID, 0)
-		for dup := range dupsChan {
-			if metas[dup] != nil {
-				dups = append(dups, dup)
+		unpublished := make([]ulid.ULID, 0)
+		for out := range dupsChan {
+			if out.unpublished {
+				if metas[out.id] != nil {
+					unpublished = append(unpublished, out.id)
+				}
+				synced.WithLabelValues(unpublishedMeta).Inc()
+			} else {
+				if metas[out.id] != nil {
+					dups = append(dups, out.id)
+				}
+				synced.WithLabelValues(duplicateMeta).Inc()
 			}
-			synced.WithLabelValues(duplicateMeta).Inc()
-			delete(metas, dup)
+			delete(metas, out.id)
 		}
 		f.mu.Lock()
 		f.duplicateIDs = dups
+		f.unpublishedIDs = unpublished
 		f.mu.Unlock()
 	})
 
@@ -859,7 +901,7 @@ func (f *DefaultDeduplicateFilter) Filter(_ context.Context, metas map[ulid.ULID
 	for i := 0; i < f.concurrency; i++ {
 		filterWg.Go(func() {
 			for group := range groupChan {
-				f.filterGroup(group.metas, group.published, dupsChan)
+				f.filterGroup(group.metas, group.published, hideUnpublished, dupsChan)
 			}
 		})
 	}
@@ -877,8 +919,28 @@ func (f *DefaultDeduplicateFilter) Filter(_ context.Context, metas map[ulid.ULID
 		_, ok := present[id]
 		return ok
 	}
+	// A block is published by its own complete set, or by another block's
+	// complete set that names it: a compaction of some blocks of a set names
+	// the rest as its siblings, so that they keep a complete set once the
+	// blocks they shared one with are gone.
+	certified := make(map[ulid.ULID]struct{})
+	for _, m := range metas {
+		if m.Thanos.Output == nil || !m.Thanos.Published(m.ULID, exists) {
+			continue
+		}
+		for _, id := range m.Thanos.Output.Blocks {
+			certified[id] = struct{}{}
+		}
+	}
 	published := func(m *metadata.Meta) bool {
-		return m.Thanos.Published(m.ULID, exists) && (f.published == nil || f.published(m))
+		if f.published != nil && !f.published(m) {
+			return false
+		}
+		if m.Thanos.Published(m.ULID, exists) {
+			return true
+		}
+		_, ok := certified[m.ULID]
+		return ok
 	}
 
 	// We need only look within a compaction group for duplicates, so splitting by group key gives us parallelizable streams.
@@ -906,7 +968,14 @@ type groupWork struct {
 	published func(*metadata.Meta) bool
 }
 
-func (f *DefaultDeduplicateFilter) filterGroup(metaSlice []*metadata.Meta, published func(*metadata.Meta) bool, dupsChan chan ulid.ULID) {
+// filtered is a block Filter takes out of the view: a duplicate, or an
+// unpublished block when the filter hides those.
+type filtered struct {
+	id          ulid.ULID
+	unpublished bool
+}
+
+func (f *DefaultDeduplicateFilter) filterGroup(metaSlice []*metadata.Meta, published func(*metadata.Meta) bool, hideUnpublished bool, dupsChan chan filtered) {
 	isPublished := make(map[ulid.ULID]bool, len(metaSlice))
 	for _, m := range metaSlice {
 		isPublished[m.ULID] = published(m)
@@ -952,7 +1021,18 @@ childLoop:
 	}
 
 	for _, duplicate := range duplicates {
-		dupsChan <- duplicate
+		dupsChan <- filtered{id: duplicate}
+	}
+	if !hideUnpublished {
+		return
+	}
+	// What is left unpublished is a staged output whose plan has not
+	// replaced its sources: not to be compacted or downsampled further, and
+	// not to be served in place of them.
+	for _, m := range coveringSet {
+		if !isPublished[m.ULID] {
+			dupsChan <- filtered{id: m.ULID, unpublished: true}
+		}
 	}
 }
 

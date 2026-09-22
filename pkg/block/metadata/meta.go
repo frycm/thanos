@@ -124,16 +124,22 @@ type ThanosOutput struct {
 	Index int `json:"index"`
 	Count int `json:"count"`
 	// Blocks are every block the compaction produced, this one included, in
-	// no particular order. A planned output missing from it held no series.
-	// The set is published once every block in it exists.
+	// no particular order, and any block outside the compaction the outputs
+	// complete a set with: the blocks the compaction's sources shared their
+	// own set with, which keep a complete set this way once the sources are
+	// gone. A planned output missing from it held no series. The set is
+	// published once every block in it exists, and so is every block a
+	// published set names.
 	Blocks []ulid.ULID `json:"blocks"`
 }
 
-// Published reports whether every block of the set the block belongs to is
-// present, as told by exists. A block without an Output is its own set, and
-// so is a block whose Output does not name it: such a set was copied from a
-// source by a tool that kept the source's metadata, and says nothing about
-// this block.
+// Published reports whether every block of the block's own set is present,
+// as told by exists. A block without an Output is its own set, and so is a
+// block whose Output does not name it: such a set was copied from a source
+// by a tool that kept the source's metadata, and says nothing about this
+// block. A block whose own set is incomplete may still be published by
+// another block's complete set that names it; readers with a view of every
+// block judge that, see block.DefaultDeduplicateFilter.
 func (m *Thanos) Published(id ulid.ULID, exists func(ulid.ULID) bool) bool {
 	if m.Output == nil || !slices.Contains(m.Output.Blocks, id) {
 		return true

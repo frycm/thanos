@@ -1494,14 +1494,22 @@ func (ex LocalPlanExecutor) Execute(ctx context.Context, dir string, cg *Group, 
 			SegmentFiles: block.GetSegmentFiles(bdir),
 			Extensions:   cg.Extensions(),
 		}
-		if len(plan.Outputs) > 0 {
+		if len(plan.Outputs) > 0 || len(plan.Siblings) > 0 {
 			// The outputs of a plan replace the sources as a set, and only a
 			// complete set may: each block records the whole set, so that a
-			// reader seeing one of them knows what else has to be there.
+			// reader seeing one of them knows what else has to be there. The
+			// set also names the plan's siblings, so that they keep a
+			// complete set once the sources they shared one with are gone.
+			set := slices.Clone(compIDs)
+			for _, sibling := range plan.Siblings {
+				if !slices.Contains(set, sibling) {
+					set = append(set, sibling)
+				}
+			}
 			thanosMeta.Output = &metadata.ThanosOutput{
 				Index:  outputOf[compID].index,
 				Count:  len(outputs),
-				Blocks: slices.Clone(compIDs),
+				Blocks: set,
 			}
 		}
 		if stats.ChunkMaxSize > 0 {

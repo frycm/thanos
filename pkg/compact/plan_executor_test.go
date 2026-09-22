@@ -13,6 +13,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/tsdb"
 	"github.com/thanos-io/objstore"
 
 	"github.com/efficientgo/core/testutil"
@@ -236,4 +237,44 @@ func TestExportedErrorConstructors(t *testing.T) {
 	testutil.Equals(t, true, IsRetryError(NewRetryError(errors.New("boom"))))
 	testutil.Equals(t, true, IsIssue347Error(NewIssue347Error(errors.New("boom"), id)))
 	testutil.Equals(t, true, IsOutOfOrderChunkError(NewOutOfOrderChunksError(errors.New("boom"), id)))
+}
+
+// TestSetSiblings: a plan names the live blocks that share a set with one of
+// its sources - through the sources' own sets or through sets of other blocks
+// that named a source - never the sources themselves or blocks gone from the
+// view, and nothing when no set is involved.
+func TestSetSiblings(t *testing.T) {
+	id := func(i int) ulid.ULID { return ulid.MustNew(uint64(i), nil) }
+	meta := func(i int, set ...int) *metadata.Meta {
+		m := &metadata.Meta{BlockMeta: tsdb.BlockMeta{ULID: id(i)}}
+		if len(set) > 0 {
+			m.Thanos.Output = &metadata.ThanosOutput{Index: 0, Count: 1}
+			for _, s := range set {
+				m.Thanos.Output.Blocks = append(m.Thanos.Output.Blocks, id(s))
+			}
+		}
+		return m
+	}
+	view := map[ulid.ULID]*metadata.Meta{}
+	add := func(ms ...*metadata.Meta) {
+		for _, m := range ms {
+			view[m.ULID] = m
+		}
+	}
+	// 1 and 2 were split together: set {1, 2, 9}, where 9 is gone. 3 named 1
+	// as its sibling: set {3, 1}. 4 names 2 and 5: set {4, 2, 5}. 6 is
+	// unrelated, 7 names only gone blocks.
+	add(meta(1, 1, 2, 9), meta(2, 1, 2, 9), meta(3, 3, 1), meta(4, 4, 2, 5), meta(5), meta(6), meta(7, 7, 8))
+
+	got := SetSiblings(view, []*metadata.Meta{view[id(1)]})
+	testutil.Equals(t, []ulid.ULID{id(2), id(3)}, got, "1's own set and 3's set name it")
+
+	got = SetSiblings(view, []*metadata.Meta{view[id(1)], view[id(2)]})
+	testutil.Equals(t, []ulid.ULID{id(3), id(4), id(5)}, got, "both sources' sets, without the sources")
+
+	got = SetSiblings(view, []*metadata.Meta{view[id(6)]})
+	testutil.Equals(t, 0, len(got))
+
+	got = SetSiblings(view, []*metadata.Meta{view[id(7)]})
+	testutil.Equals(t, 0, len(got), "gone blocks are not named")
 }

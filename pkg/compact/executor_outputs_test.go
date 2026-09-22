@@ -158,3 +158,52 @@ func TestLocalPlanExecutorRefusesPartitionsThatLoseSeries(t *testing.T) {
 	_, err = ex.Execute(ctx, t.TempDir(), cg, plan)
 	testutil.Ok(t, err)
 }
+
+// TestLocalPlanExecutorPublishesSiblingsInTheSet: a plan that names siblings
+// - blocks outside the plan its outputs complete a set with - records them in
+// every output's set, also when the plan has the one default output.
+func TestLocalPlanExecutorPublishesSiblingsInTheSet(t *testing.T) {
+	ctx := context.Background()
+	bkt := objstore.NewInMemBucket()
+	logger := log.NewNopLogger()
+	dir := t.TempDir()
+
+	var series []labels.Labels
+	for i := range 8 {
+		series = append(series, labels.FromStrings("__name__", "metric", "instance", fmt.Sprintf("host-%d", i)))
+	}
+	ext := labels.FromStrings("ext", "1")
+	var sources []*metadata.Meta
+	for _, tr := range [][2]int64{{0, time.Hour.Milliseconds()}, {time.Hour.Milliseconds(), 2 * time.Hour.Milliseconds()}} {
+		id, err := e2eutil.CreateBlock(ctx, dir, series, 10, tr[0], tr[1], ext, 0, metadata.NoneFunc, nil)
+		testutil.Ok(t, err)
+		testutil.Ok(t, block.Upload(ctx, logger, bkt, filepath.Join(dir, id.String()), metadata.NoneFunc))
+		m, err := metadata.ReadFromDir(filepath.Join(dir, id.String()))
+		testutil.Ok(t, err)
+		sources = append(sources, m)
+	}
+	cnt := func() prometheus.Counter { return promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"}) }
+	cg, err := NewGroup(logger, bkt, "0@test", ext, 0, false, false, cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), metadata.NoneFunc, 1, 1)
+	testutil.Ok(t, err)
+	for _, m := range sources {
+		testutil.Ok(t, cg.AppendMeta(m))
+	}
+	comp, err := tsdb.NewLeveledCompactor(ctx, nil, slog.Default(), []int64{time.Hour.Milliseconds(), 2 * time.Hour.Milliseconds()}, chunkenc.NewPool(),
+		storage.NewCompactingChunkSeriesMerger(storage.ChainedSeriesMerge))
+	testutil.Ok(t, err)
+	ex := LocalPlanExecutor{Comp: comp, BlockDeletableChecker: DefaultBlockDeletableChecker{}, Callback: DefaultCompactionLifecycleCallback{}, MarkSourcesForDeletion: true}
+
+	siblings := []ulid.ULID{ulid.MustNew(7, nil), ulid.MustNew(8, nil)}
+	compIDs, err := ex.Execute(ctx, t.TempDir(), cg, Plan{Sources: sources, Siblings: siblings})
+	testutil.Ok(t, err)
+	testutil.Equals(t, 1, len(compIDs))
+	m, err := block.DownloadMeta(ctx, logger, bkt, compIDs[0])
+	testutil.Ok(t, err)
+	testutil.Assert(t, m.Thanos.Output != nil, "a plan with siblings records a set")
+	testutil.Equals(t, 0, m.Thanos.Output.Index)
+	testutil.Equals(t, 1, m.Thanos.Output.Count, "the count is of planned outputs, not of the set")
+	want := append([]ulid.ULID{compIDs[0]}, siblings...)
+	testutil.Equals(t, want, m.Thanos.Output.Blocks)
+	testutil.Equals(t, false, m.Thanos.Published(m.ULID, func(id ulid.ULID) bool { return id == m.ULID }), "the set is incomplete while a sibling is missing")
+	testutil.Equals(t, true, m.Thanos.Published(m.ULID, func(ulid.ULID) bool { return true }))
+}
