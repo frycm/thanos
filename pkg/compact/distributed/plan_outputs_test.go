@@ -5,6 +5,7 @@ package distributed
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -144,20 +145,29 @@ func TestClaimOutputs(t *testing.T) {
 	})
 }
 
-// TestOversizedReasonJudgesPerOutput: a plan that spreads its sources over
-// several outputs is measured by what each output has to hold.
-func TestOversizedReasonJudgesPerOutput(t *testing.T) {
+// TestOversizedReasonJudgesSeriesPerOutputAndIndexPerTask: a plan that
+// spreads its sources over several outputs is measured, for series, by what
+// each output has to hold - the worker builds them one at a time - but, for
+// index bytes, by the whole input: the worker downloads and keeps every
+// source however many outputs it writes from them.
+func TestOversizedReasonJudgesSeriesPerOutputAndIndexPerTask(t *testing.T) {
 	conf := ManagerConfig{MaxTaskSeries: 100, MaxTaskIndexBytes: 1000}
-	whole := Task{SourceBlocks: []string{"a", "b"}, ExpectedSeries: 300, ExpectedIndexBytes: 3000}
-	testutil.Assert(t, oversizedReason(whole, conf) != "", "300 series in one block exceed the limit")
+	whole := Task{SourceBlocks: []string{"a", "b"}, ExpectedSeries: 300, ExpectedIndexBytes: 900}
+	testutil.Assert(t, strings.Contains(oversizedReason(whole, conf), "max-task-series"), "300 series in one block exceed the limit")
 
 	split := whole
 	for i := range 4 {
 		split.Outputs = append(split.Outputs, compact.PlanOutput{Series: &compact.SeriesPartition{Index: uint64(i), Count: 4}})
 	}
-	testutil.Equals(t, "", oversizedReason(split, conf), "75 series and 750 bytes per output fit")
+	testutil.Equals(t, "", oversizedReason(split, conf), "75 series per output fit and 900 bytes of input fit")
 
 	tooBig := whole
 	tooBig.Outputs = split.Outputs[:2]
-	testutil.Assert(t, oversizedReason(tooBig, conf) != "", "150 series per output still exceed the limit")
+	testutil.Assert(t, strings.Contains(oversizedReason(tooBig, conf), "max-task-series"), "150 series per output still exceed the limit")
+
+	heavy := split
+	heavy.ExpectedIndexBytes = 3000
+	reason := oversizedReason(heavy, conf)
+	testutil.Assert(t, strings.Contains(reason, "max-task-index-size"), "3000 bytes of input exceed the limit whatever the number of outputs: %q", reason)
+	testutil.Assert(t, strings.Contains(reason, "3000 bytes"), "the whole input is reported: %q", reason)
 }

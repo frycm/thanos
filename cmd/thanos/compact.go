@@ -886,10 +886,10 @@ func (cc *compactConfig) registerFlag(cmd extkingpin.FlagClause) {
 	cmd.Flag("compact.manager.max-inflight-per-group", "Experimental. How many non-overlapping plans the manager keeps in flight for a single compaction group. Raising this is what lets one block stream be compacted by several workers at once.").
 		Default("4").Hidden().IntVar(&cc.managerMaxInflightPerGroup)
 
-	cmd.Flag("compact.manager.max-task-series", "Experimental. Refuse to dispatch a task whose source blocks report more series than this, in total. Such a plan is recorded as oversized in the journal and its blocks are withheld from planning until an operator intervenes. 0 disables the limit.").
+	cmd.Flag("compact.manager.max-task-series", "Experimental. Refuse to dispatch a task whose source blocks report more series than this, in total, or per output block when the plan names several. Such a plan is recorded as oversized in the journal and its blocks are withheld from planning until an operator intervenes. 0 disables the limit.").
 		Default("0").Hidden().Uint64Var(&cc.managerMaxTaskSeries)
 
-	cmd.Flag("compact.manager.max-task-index-size", "Experimental. Refuse to dispatch a task whose source blocks carry more index data than this, in total. Such a plan is recorded as oversized in the journal and its blocks are withheld from planning until an operator intervenes. 0 disables the limit.").
+	cmd.Flag("compact.manager.max-task-index-size", "Experimental. Refuse to dispatch a task whose source blocks carry more index data than this, in total, whatever the number of output blocks: the worker downloads them all. Such a plan is recorded as oversized in the journal and its blocks are withheld from planning until an operator intervenes. 0 disables the limit.").
 		Default("0").Hidden().BytesVar(&cc.managerMaxTaskIndexSize)
 
 	cmd.Flag("compact.worker.manager-address", "Experimental. Address of the compactor manager, either host:port or a Thanos service discovery address such as dnssrv+_http._tcp.thanos-compact-manager.thanos.svc. Required in 'worker' mode.").

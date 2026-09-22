@@ -640,14 +640,18 @@ func (s *Scheduler) MarkOversized(task Task, reason string) {
 
 // oversizedReason returns why a task exceeds the limits, or "" when it fits.
 //
-// The limits bound what a worker has to build, so a plan that names several
-// partitioned outputs is judged per output: its sources' series and index
-// bytes are spread over as many blocks as the plan produces.
+// The two limits bound different things. The series limit bounds what a
+// worker has to build in memory at once, so a plan that names several
+// partitioned outputs is judged per output: its sources' series are spread
+// over as many blocks as the plan produces, and the worker builds them one
+// after another. The index size limit bounds what a worker has to download
+// and hold on disk, which is the whole input however many outputs the plan
+// names, so it is judged per task.
 func oversizedReason(task Task, conf ManagerConfig) string {
-	series, indexBytes := task.ExpectedSeries, task.ExpectedIndexBytes
+	series := task.ExpectedSeries
 	perOutput := ""
 	if n := uint64(len(task.Outputs)); n > 1 {
-		series, indexBytes = series/n, indexBytes/int64(n)
+		series = series / n
 		perOutput = fmt.Sprintf(" per output, over %d outputs,", n)
 	}
 	switch {
@@ -655,10 +659,10 @@ func oversizedReason(task Task, conf ManagerConfig) string {
 		return fmt.Sprintf("task expects %d series%s from %d source blocks, over the configured --compact.manager.max-task-series of %d; "+
 			"split the plan, raise worker capacity together with the limit, or no-compact-mark the blocks",
 			series, perOutput, len(task.SourceBlocks), conf.MaxTaskSeries)
-	case conf.MaxTaskIndexBytes > 0 && indexBytes > conf.MaxTaskIndexBytes:
-		return fmt.Sprintf("task expects %d bytes of source index%s from %d source blocks, over the configured --compact.manager.max-task-index-size of %d; "+
+	case conf.MaxTaskIndexBytes > 0 && task.ExpectedIndexBytes > conf.MaxTaskIndexBytes:
+		return fmt.Sprintf("task expects %d bytes of source index from %d source blocks, over the configured --compact.manager.max-task-index-size of %d; "+
 			"split the plan, raise worker capacity together with the limit, or no-compact-mark the blocks",
-			indexBytes, perOutput, len(task.SourceBlocks), conf.MaxTaskIndexBytes)
+			task.ExpectedIndexBytes, len(task.SourceBlocks), conf.MaxTaskIndexBytes)
 	}
 	return ""
 }
