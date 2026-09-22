@@ -114,6 +114,23 @@ func TestClaimOutputs(t *testing.T) {
 		testutil.NotOk(t, claimOutputs(cg, compact.Plan{}, report(OutputResult{Index: 0, Block: idA.String()}), map[ulid.ULID]metadata.Meta{idA: meta(idA, group, nil)}),
 			"an account of outputs for a plan that named none")
 	})
+	t.Run("the set names the plan's siblings too, and nothing else", func(t *testing.T) {
+		sibling, stranger := ulid.MustNew(20, nil), ulid.MustNew(21, nil)
+		withSiblings := compact.Plan{Outputs: plan.Outputs, Siblings: []ulid.ULID{sibling}}
+		full := report(OutputResult{Index: 0, Block: idA.String()}, OutputResult{Index: 1, Block: idB.String()})
+		named := map[ulid.ULID]metadata.Meta{idA: meta(idA, a, set(0, idA, idB, sibling)), idB: meta(idB, b, set(1, idA, idB, sibling))}
+		testutil.Ok(t, claimOutputs(cg, withSiblings, full, named))
+		testutil.NotOk(t, claimOutputs(cg, withSiblings, full, both), "the sibling is missing from the set")
+		testutil.NotOk(t, claimOutputs(cg, plan, full, named), "a sibling the plan did not name")
+		odd := map[ulid.ULID]metadata.Meta{idA: meta(idA, a, set(0, idA, idB, stranger)), idB: meta(idB, b, set(1, idA, idB, stranger))}
+		testutil.NotOk(t, claimOutputs(cg, withSiblings, full, odd), "another block in the sibling's place")
+		// A plan with the default output and siblings records a set of one
+		// output and the siblings.
+		lone := compact.Plan{Siblings: []ulid.ULID{sibling}}
+		testutil.Ok(t, claimOutputs(cg, lone, Result{}, map[ulid.ULID]metadata.Meta{idA: meta(idA, group, &metadata.ThanosOutput{Index: 0, Count: 1, Blocks: []ulid.ULID{idA, sibling}})}))
+		testutil.NotOk(t, claimOutputs(cg, lone, Result{}, map[ulid.ULID]metadata.Meta{idA: meta(idA, group, nil)}), "no set recorded")
+		testutil.NotOk(t, claimOutputs(cg, lone, Result{}, map[ulid.ULID]metadata.Meta{idA: meta(idA, group, &metadata.ThanosOutput{Index: 0, Count: 1, Blocks: []ulid.ULID{idA}})}), "the sibling is missing from the set")
+	})
 	t.Run("every output accounted for, in any order", func(t *testing.T) {
 		testutil.Ok(t, claimOutputs(cg, plan, report(OutputResult{Index: 1, Block: idB.String()}, OutputResult{Index: 0, Block: idA.String()}), both))
 	})

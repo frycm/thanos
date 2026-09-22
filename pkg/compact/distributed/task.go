@@ -12,6 +12,7 @@ package distributed
 
 import (
 	"encoding/json"
+	"github.com/oklog/ulid/v2"
 	"time"
 
 	"github.com/thanos-io/thanos/pkg/compact"
@@ -80,6 +81,11 @@ type Task struct {
 	// worker produces exactly these; it decides nothing about them, since
 	// only the manager sees the whole bucket.
 	Outputs []compact.PlanOutput `json:"outputs,omitempty"`
+	// Siblings are blocks outside the plan that its outputs complete a set
+	// with, as the manager's planner named them: the blocks the sources
+	// shared a set with, which stay published this way once the sources
+	// are gone. The worker records them in every output's set.
+	Siblings []ulid.ULID `json:"siblings,omitempty"`
 
 	// TargetResolution is set for TaskDownsample only.
 	TargetResolution int64 `json:"target_resolution,omitzero"`

@@ -1407,6 +1407,33 @@ func (e *RemotePlanExecutor) rejectOutputs(ctx context.Context, taskID string, o
 // a result could omit a shard and still pass the source and time checks,
 // since every shard lists every source and spans the whole range.
 func claimOutputs(cg *compact.Group, plan compact.Plan, res Result, outMetas map[ulid.ULID]metadata.Meta) error {
+	// The set every result block must record: the uploaded blocks and the
+	// siblings the plan named.
+	wantSet := map[ulid.ULID]struct{}{}
+	for id := range outMetas {
+		wantSet[id] = struct{}{}
+	}
+	for _, id := range plan.Siblings {
+		wantSet[id] = struct{}{}
+	}
+	recordsSet := func(id ulid.ULID, set *metadata.ThanosOutput, index, count int) error {
+		if set == nil {
+			return errors.Errorf("result block %s does not record which output it is", id)
+		}
+		if set.Index != index || set.Count != count {
+			return errors.Errorf("result block %s says it is output %d of %d, the report says output %d of %d", id, set.Index, set.Count, index, count)
+		}
+		if len(set.Blocks) != len(wantSet) {
+			return errors.Errorf("result block %s records a set of %d blocks, the report and the plan's siblings make %d", id, len(set.Blocks), len(wantSet))
+		}
+		for _, member := range set.Blocks {
+			if _, ok := wantSet[member]; !ok {
+				return errors.Errorf("result block %s records %s in its set, which is neither reported nor a sibling the plan named", id, member)
+			}
+		}
+		return nil
+	}
+
 	if len(plan.Outputs) == 0 {
 		if len(res.Outputs) > 0 {
 			return errors.Errorf("the report accounts for %d outputs, the plan named none", len(res.Outputs))
@@ -1417,6 +1444,11 @@ func claimOutputs(cg *compact.Group, plan compact.Plan, res Result, outMetas map
 		for id, meta := range outMetas {
 			if !labels.Equal(labels.FromMap(meta.Thanos.Labels), cg.Labels()) {
 				return errors.Errorf("result block %s carries labels %v, the plan's output has %v", id, meta.Thanos.Labels, cg.Labels())
+			}
+			if len(plan.Siblings) > 0 {
+				if err := recordsSet(id, meta.Thanos.Output, 0, 1); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
@@ -1462,20 +1494,8 @@ func claimOutputs(cg *compact.Group, plan compact.Plan, res Result, outMetas map
 		if !labels.Equal(labels.FromMap(meta.Thanos.Labels), labels.FromMap(want)) {
 			return errors.Errorf("result block %s carries labels %v, output %d of the plan has %v", id, meta.Thanos.Labels, o.Index, want)
 		}
-		set := meta.Thanos.Output
-		if set == nil {
-			return errors.Errorf("result block %s does not record which output it is", id)
-		}
-		if set.Index != o.Index || set.Count != len(plan.Outputs) {
-			return errors.Errorf("result block %s says it is output %d of %d, the report says output %d of %d", id, set.Index, set.Count, o.Index, len(plan.Outputs))
-		}
-		if len(set.Blocks) != len(reported) {
-			return errors.Errorf("result block %s records a set of %d blocks, the report %d", id, len(set.Blocks), len(reported))
-		}
-		for _, sibling := range set.Blocks {
-			if _, ok := reported[sibling]; !ok {
-				return errors.Errorf("result block %s records %s in its set, which the report does not mention", id, sibling)
-			}
+		if err := recordsSet(id, meta.Thanos.Output, o.Index, len(plan.Outputs)); err != nil {
+			return err
 		}
 	}
 	if len(claimed) != len(reported) {
@@ -1617,6 +1637,7 @@ func CompactionTask(cg *compact.Group, plan compact.Plan) (Task, error) {
 		ExpectedMaxTime:    maxTime,
 		OverlappingBlocks:  overlappingBlocks,
 		Outputs:            plan.Outputs,
+		Siblings:           plan.Siblings,
 		ExpectedSeries:     series,
 		ExpectedIndexBytes: indexBytes,
 	}, nil
