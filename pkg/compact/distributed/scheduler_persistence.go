@@ -57,6 +57,12 @@ func (s *Scheduler) persistSnapshot(ctx context.Context, snap journalSnapshot) e
 	if snap.seq <= s.persistedSeq {
 		return nil
 	}
+	// A manager that was stopped writes nothing more: its successor may
+	// already own the journal, and a store that ignores the context would
+	// let the write through.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	// The generation and owner are fixed at construction, so reading them
 	// without the state lock is safe.
