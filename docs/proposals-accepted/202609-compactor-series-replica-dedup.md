@@ -12,6 +12,9 @@ menu: proposals-accepted
 * **Related Tickets:**
   * [#4239 Add penalty based deduplication mode for compactor](https://github.com/thanos-io/thanos/pull/4239)
   * [#4328 About HA prometheus instances with remote write](https://github.com/thanos-io/thanos/issues/4328)
+  * [#8317 Vertical Compaction not working with OpenShift Monitoring remote-write due to missing prometheus_replica label in Receive blocks](https://github.com/thanos-io/thanos/issues/8317)
+  * [#6004 Thanos compactor & receiver: vertical compaction not working as expected](https://github.com/thanos-io/thanos/issues/6004)
+  * [#3871 Deduplication labels per tenant](https://github.com/thanos-io/thanos/issues/3871)
   * Proposal and discussion: [frycm/thanos#12](https://github.com/frycm/thanos/issues/12)
 
 * **Other docs:**
