@@ -52,9 +52,9 @@ func (d *dedupChunksIterator) At() chunks.Meta {
 // The difference is that it handles both XOR/Histogram/FloatHistogram and Aggr chunk Encoding.
 func (d *dedupChunksIterator) Next() bool {
 	if d.h == nil {
-		for _, iter := range d.iterators {
+		for i, iter := range d.iterators {
 			if iter.Next() {
-				heap.Push(&d.h, iter)
+				heap.Push(&d.h, indexedChunkIterator{Iterator: iter, index: i})
 			}
 		}
 	}
@@ -62,8 +62,9 @@ func (d *dedupChunksIterator) Next() bool {
 		return false
 	}
 
-	iter := heap.Pop(&d.h).(chunks.Iterator)
+	iter := heap.Pop(&d.h).(indexedChunkIterator)
 	d.curr = iter.At()
+	base := iter.index
 	if iter.Next() {
 		heap.Push(&d.h, iter)
 	}
@@ -97,7 +98,7 @@ func (d *dedupChunksIterator) Next() bool {
 			prev = next
 		}
 
-		iter := heap.Pop(&d.h).(chunks.Iterator)
+		iter := heap.Pop(&d.h).(indexedChunkIterator)
 		if iter.Next() {
 			heap.Push(&d.h, iter)
 		}
@@ -106,16 +107,16 @@ func (d *dedupChunksIterator) Next() bool {
 		return true
 	}
 
-	iter = om.iterator(d.curr)
-	if !iter.Next() {
-		if d.err = iter.Err(); d.err != nil {
+	merged := om.iterator(d.curr)
+	if !merged.Next() {
+		if d.err = merged.Err(); d.err != nil {
 			return false
 		}
 		panic("unexpected seriesToChunkEncoder lack of iterations")
 	}
-	d.curr = iter.At()
-	if iter.Next() {
-		heap.Push(&d.h, iter)
+	d.curr = merged.At()
+	if merged.Next() {
+		heap.Push(&d.h, indexedChunkIterator{Iterator: merged, index: base})
 	}
 	return true
 }
@@ -124,22 +125,38 @@ func (d *dedupChunksIterator) Err() error {
 	return d.err
 }
 
-type chunkIteratorHeap []chunks.Iterator
+// indexedChunkIterator is a chunk iterator with the position of its series
+// among the merged ones.
+type indexedChunkIterator struct {
+	chunks.Iterator
+	index int
+}
+
+type chunkIteratorHeap []indexedChunkIterator
 
 func (h chunkIteratorHeap) Len() int      { return len(h) }
 func (h chunkIteratorHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
 
+// Less orders chunks by time and, between chunks with the same time range,
+// by the position of their series: the chunk that is popped first becomes
+// the base the overlapping ones are merged into, and the penalty algorithm
+// keeps the base's samples where replicas have one at the same timestamp,
+// so without the position the replica that wins would depend on how the
+// heap happened to settle rather than on the order of the series.
 func (h chunkIteratorHeap) Less(i, j int) bool {
 	at := h[i].At()
 	bt := h[j].At()
-	if at.MinTime == bt.MinTime {
+	if at.MinTime != bt.MinTime {
+		return at.MinTime < bt.MinTime
+	}
+	if at.MaxTime != bt.MaxTime {
 		return at.MaxTime < bt.MaxTime
 	}
-	return at.MinTime < bt.MinTime
+	return h[i].index < h[j].index
 }
 
 func (h *chunkIteratorHeap) Push(x any) {
-	*h = append(*h, x.(chunks.Iterator))
+	*h = append(*h, x.(indexedChunkIterator))
 }
 
 func (h *chunkIteratorHeap) Pop() any {
