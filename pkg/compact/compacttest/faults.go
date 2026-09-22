@@ -21,6 +21,25 @@ type HookBucket struct {
 	onGet       func(ctx context.Context, name string) error
 	onUpload    func(ctx context.Context, name string) error
 	afterUpload func(ctx context.Context, name string) error
+	fenced      bool
+}
+
+// ErrFenced is what every operation of a fenced view returns.
+var ErrFenced = errors.New("the process owning this view is dead")
+
+// Fence cuts the view off from the bucket for good: every operation fails
+// from now on. A replaced node's view is fenced, since a crashed process
+// cannot reach the bucket, whatever goroutines of it the test still holds.
+func (b *HookBucket) Fence() {
+	b.mtx.Lock()
+	defer b.mtx.Unlock()
+	b.fenced = true
+}
+
+func (b *HookBucket) isFenced() bool {
+	b.mtx.Lock()
+	defer b.mtx.Unlock()
+	return b.fenced
 }
 
 // NewHookBucket wraps a bucket in a fault-injectable view.
@@ -61,6 +80,9 @@ func (b *HookBucket) SetAfterUpload(f func(ctx context.Context, name string) err
 
 // Get implements objstore.Bucket.
 func (b *HookBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
+	if b.isFenced() {
+		return nil, ErrFenced
+	}
 	if onGet, _, _ := b.hooks(); onGet != nil {
 		if err := onGet(ctx, name); err != nil {
 			return nil, err
@@ -71,6 +93,9 @@ func (b *HookBucket) Get(ctx context.Context, name string) (io.ReadCloser, error
 
 // Upload implements objstore.Bucket.
 func (b *HookBucket) Upload(ctx context.Context, name string, r io.Reader, opts ...objstore.ObjectUploadOption) error {
+	if b.isFenced() {
+		return ErrFenced
+	}
 	_, onUpload, afterUpload := b.hooks()
 	if onUpload != nil {
 		if err := onUpload(ctx, name); err != nil {
@@ -84,6 +109,54 @@ func (b *HookBucket) Upload(ctx context.Context, name string, r io.Reader, opts 
 		return afterUpload(ctx, name)
 	}
 	return nil
+}
+
+// GetRange implements objstore.Bucket.
+func (b *HookBucket) GetRange(ctx context.Context, name string, off, length int64) (io.ReadCloser, error) {
+	if b.isFenced() {
+		return nil, ErrFenced
+	}
+	return b.Bucket.GetRange(ctx, name, off, length)
+}
+
+// Exists implements objstore.Bucket.
+func (b *HookBucket) Exists(ctx context.Context, name string) (bool, error) {
+	if b.isFenced() {
+		return false, ErrFenced
+	}
+	return b.Bucket.Exists(ctx, name)
+}
+
+// Attributes implements objstore.Bucket.
+func (b *HookBucket) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
+	if b.isFenced() {
+		return objstore.ObjectAttributes{}, ErrFenced
+	}
+	return b.Bucket.Attributes(ctx, name)
+}
+
+// Iter implements objstore.Bucket.
+func (b *HookBucket) Iter(ctx context.Context, dir string, f func(string) error, opts ...objstore.IterOption) error {
+	if b.isFenced() {
+		return ErrFenced
+	}
+	return b.Bucket.Iter(ctx, dir, f, opts...)
+}
+
+// IterWithAttributes implements objstore.Bucket.
+func (b *HookBucket) IterWithAttributes(ctx context.Context, dir string, f func(objstore.IterObjectAttributes) error, opts ...objstore.IterOption) error {
+	if b.isFenced() {
+		return ErrFenced
+	}
+	return b.Bucket.IterWithAttributes(ctx, dir, f, opts...)
+}
+
+// Delete implements objstore.Bucket.
+func (b *HookBucket) Delete(ctx context.Context, name string) error {
+	if b.isFenced() {
+		return ErrFenced
+	}
+	return b.Bucket.Delete(ctx, name)
 }
 
 // ErrInjected is the error every injected fault returns.

@@ -37,6 +37,9 @@ type Run struct {
 	mtx   sync.Mutex
 	node  *Node
 	views []*HookBucket
+	// replacing counts Replace calls in progress: the old node is dead and
+	// its successor not yet in place, so a convergence loop has to wait.
+	replacing int
 	// background tracks the scenario's fault-injection goroutines, so that a
 	// scenario never ends with one still running.
 	background sync.WaitGroup
@@ -73,19 +76,35 @@ func (r *Run) Current() *Node {
 }
 
 // Replace stops the running node mid-pass and starts another with the given
-// configuration, as a restart would. The successor is in place before the old
-// node dies, so a convergence loop carries on with it.
+// configuration, as a restart would. The process dies first, and only then
+// does its replacement start: a crashed process cannot reach the bucket, so
+// whatever goroutines of the old node are still winding down - a journal
+// write racing the successor's takeover, say - must not. A convergence loop
+// waits for the successor meanwhile.
 func (r *Run) Replace(conf NodeConfig) *Node {
 	r.T.Helper()
 	old := r.Current()
+	r.mtx.Lock()
+	r.replacing++
+	r.mtx.Unlock()
+	old.AbortIteration()
+	old.Stop()
+	old.Bkt.Fence()
 	n := r.NewNode(conf.WithDefaults())
 	r.mtx.Lock()
 	r.node = n
+	r.replacing--
 	r.mtx.Unlock()
 	r.AddView(n.Bkt)
-	old.AbortIteration()
-	old.Stop()
 	return n
+}
+
+// Replacing reports whether a Replace is in progress: the current node is
+// dead and its successor not yet in place.
+func (r *Run) Replacing() bool {
+	r.mtx.Lock()
+	defer r.mtx.Unlock()
+	return r.replacing > 0
 }
 
 // Install makes a node built outside Replace the current one without stopping
@@ -201,10 +220,11 @@ func (r *Run) Converge(timeout time.Duration) ConvergeResult {
 			// Stopped from outside, as a scenario killing the process does. A
 			// dead process reports nothing, so whatever the pass returned is
 			// not a verdict; with no successor the run ends here, otherwise
-			// the successor carries on.
-			if r.Current() == n {
+			// the successor carries on, once it is in place.
+			if r.Current() == n && !r.Replacing() {
 				return res
 			}
+			time.Sleep(20 * time.Millisecond)
 			continue
 		}
 		if err != nil && compact.IsHaltError(err) || n.Halted.Load() {
