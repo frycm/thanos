@@ -266,6 +266,13 @@ func runCompact(
 			"msg", "deduplication.replica-label specified, enabling vertical compaction", "dedupReplicaLabels", strings.Join(dedupReplicaLabels, ","),
 		)
 	}
+	seriesReplicaLabels := compact.NormalizeSeriesReplicaLabels(strutil.ParseFlagLabels(conf.seriesReplicaLabels))
+	if len(seriesReplicaLabels) > 0 {
+		level.Info(logger).Log("msg", "deduplicating series replicas at compaction", "seriesReplicaLabels", strings.Join(seriesReplicaLabels, ","), "func", conf.dedupFunc)
+		if conf.dedupFunc != compact.DedupAlgorithmPenalty {
+			level.Warn(logger).Log("msg", "series replicas are merged with the default merger, which keeps one sample per timestamp; --deduplication.func=penalty suits Prometheus HA pairs better")
+		}
+	}
 	if enableVerticalCompaction {
 		level.Info(logger).Log(
 			"msg", "vertical compaction is enabled", "compact.enable-vertical-compaction", fmt.Sprintf("%v", conf.enableVerticalCompaction),
@@ -396,12 +403,22 @@ func runCompact(
 		planner = largeIndexFilterPlanner
 	}
 	blocksCleaner := compact.NewBlocksCleaner(logger, insBkt, ignoreDeletionMarkFilter, deleteDelay, compactMetrics.blocksCleaned, compactMetrics.blockCleanupFailures)
-	compactor, err := compact.NewBucketCompactor(
+	executor := compact.LocalPlanExecutor{
+		Comp:                   comp,
+		BlockDeletableChecker:  compact.DefaultBlockDeletableChecker{},
+		Callback:               compact.DefaultCompactionLifecycleCallback{},
+		MarkSourcesForDeletion: true,
+		SeriesReplicaLabels:    seriesReplicaLabels,
+	}
+	if len(seriesReplicaLabels) > 0 {
+		executor.SeriesDedupMetrics = compact.NewSeriesDedupMetrics(reg)
+	}
+	compactor, err := compact.NewBucketCompactorWithExecutor(
 		logger,
 		sy,
 		grouper,
 		planner,
-		comp,
+		executor,
 		compactDir,
 		insBkt,
 		conf.compactionConcurrency,
@@ -733,6 +750,7 @@ type compactConfig struct {
 	compactBlocksFetchConcurrency                  int
 	deleteDelay                                    model.Duration
 	dedupReplicaLabels                             []string
+	seriesReplicaLabels                            []string
 	selectorRelabelConf                            extflag.PathOrContent
 	disableWeb                                     bool
 	webConf                                        webConfig
@@ -830,6 +848,13 @@ func (cc *compactConfig) registerFlag(cmd extkingpin.FlagClause) {
 		"Please note that by default this uses a NAIVE algorithm for merging which works well for deduplication of blocks with **precisely the same samples** like produced by Receiver replication."+
 		"If you need a different deduplication algorithm (e.g one that works well with Prometheus replicas), please set it via --deduplication.func.").
 		StringsVar(&cc.dedupReplicaLabels)
+
+	cmd.Flag("deduplication.series-replica-label", "Experimental. Series label to treat as a replica indicator of series that can be deduplicated (repeated flag): "+
+		"every compaction merges series that differ only in these labels, with the algorithm --deduplication.func selects, and drops the labels from the result. "+
+		"For HA replicas whose replica label is inside the series rather than an external label of the block, such as Prometheus pairs writing through Receive, agents or collectors. "+
+		"Keep the labels in the querier's --query.replica-label. With block splitting, list the same labels in --compact.block-split.ignore-labels from the start. This process is irreversible. "+
+		"Flag may be specified multiple times as well as a comma separated list of labels.").
+		StringsVar(&cc.seriesReplicaLabels)
 
 	// TODO(bwplotka): This is short term fix for https://github.com/thanos-io/thanos/issues/1424, replace with vertical block sharding https://github.com/thanos-io/thanos/pull/3390.
 	cmd.Flag("compact.block-max-index-size", "Maximum index size for the resulted block during any compaction. Note that"+

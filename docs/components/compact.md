@@ -89,6 +89,16 @@ The main risk is the **irreversible** implications of potential configuration er
 * If you merge disjoint series in multiple of blocks together, there is currently no easy way to split them back.
 * The `penalty` offline deduplication algorithm has its own limitations. Even though it has been battle-tested for quite a long time, very few issues still come up from time to time (such as [breaking rate/irate](https://github.com/thanos-io/thanos/issues/2890)). If you'd like to enable this deduplication algorithm, do so at your own risk and back up your data first!
 
+#### Deduplicating Replicas Whose Replica Label Is Inside the Series
+
+`--deduplication.replica-label` names external labels, which is where the replica label lives when each replica uploads its own blocks. When HA replicas write through Thanos Receive, an agent or an OpenTelemetry collector, the replica label of the Prometheus pair or collector pair ends up inside every series instead, and both copies of every series survive every compaction, downsampling pass and store gateway; only the querier hides them, on every query.
+
+The experimental flag `--deduplication.series-replica-label=LABEL` (repeatable) makes every compaction - vertical or not - merge series that differ only in the given series labels, with the algorithm `--deduplication.func` selects (`penalty` suits Prometheus HA pairs), and drop those labels from the result. A series lacking the labels merges with its replicas, so a late replica joins an already deduplicated series. Replicas are offered to the merge function in a fixed order - source blocks in the plan's order, then the replica labels compared as a label set - and the penalty merger gives ties between chunks with the same time range to the series offered first, so the result depends on the source blocks alone. Where replicas have a sample at the same timestamp, the chosen one may differ from the one a querier picks, which depends on the order responses arrive in; every kept sample is one a replica really has. Compacted blocks record the labels in `meta.json` as `thanos.series_replica_labels`; downsampled blocks inherit it.
+
+Keep the labels in the querier's `--query.replica-label`: blocks written before the flag, and the newest blocks the compactor has not compacted yet, still carry both replicas, and a querier deduplicating by the same labels serves the same data from old and new blocks. What changes is visible to anything that uses the label itself: selectors and `label_values()` on it return nothing for deduplicated ranges, and rules grouping by it see one series where they saw two. With block splitting, list the same labels in `--compact.block-split.ignore-labels` before the first split, so that both replicas of a series land in the same shard; a compaction that would split replicas of one series into different shards is refused. Blocks that are never compacted again keep their replicas until retention.
+
+Metrics: `thanos_compact_series_dedup_input_series_total` and `thanos_compact_series_dedup_output_series_total`. The design is in [the proposal](../proposals-accepted/202609-compactor-series-replica-dedup.md).
+
 #### Enabling Vertical Compaction
 
 **NOTE:** See the ["risks" section](#vertical-compaction-risks) to understand the implications and experimental nature of this feature.
@@ -430,6 +440,23 @@ Flags:
                                 need a different deduplication algorithm (e.g
                                 one that works well with Prometheus replicas),
                                 please set it via --deduplication.func.
+      --deduplication.series-replica-label=DEDUPLICATION.SERIES-REPLICA-LABEL ...
+                                Experimental. Series label to treat as a replica
+                                indicator of series that can be deduplicated
+                                (repeated flag): every compaction merges
+                                series that differ only in these labels,
+                                with the algorithm --deduplication.func selects,
+                                and drops the labels from the result.
+                                For HA replicas whose replica label is inside
+                                the series rather than an external label of
+                                the block, such as Prometheus pairs writing
+                                through Receive, agents or collectors. Keep the
+                                labels in the querier's --query.replica-label.
+                                With block splitting, list the same labels in
+                                --compact.block-split.ignore-labels from the
+                                start. This process is irreversible. Flag may
+                                be specified multiple times as well as a comma
+                                separated list of labels.
       --hash-func=              Specify which hash function to use when
                                 calculating the hashes of produced files.
                                 If no function has been specified, it does not

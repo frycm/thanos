@@ -43,6 +43,7 @@ type NodeConfig struct {
 	DeleteDelay          time.Duration
 	Levels               []int64
 	Concurrency          int
+	SeriesReplicaLabels  []string
 	AcceptMalformedIndex bool
 }
 
@@ -177,6 +178,7 @@ func NewNode(t *testing.T, shared objstore.Bucket, conf NodeConfig, hooks Hooks)
 		BlockDeletableChecker:  compact.DefaultBlockDeletableChecker{},
 		Callback:               compact.DefaultCompactionLifecycleCallback{},
 		MarkSourcesForDeletion: true,
+		SeriesReplicaLabels:    conf.SeriesReplicaLabels,
 	}
 	if hooks.Executor != nil {
 		executor = hooks.Executor(n, planner)

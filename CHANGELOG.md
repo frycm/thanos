@@ -16,7 +16,10 @@ It is recommend to upgrade the storage components first (Receive, Store, etc.) a
 
 ### Added
 
+- [#12](https://github.com/frycm/thanos/issues/12) Compactor: experimental `--deduplication.series-replica-label` merges series that differ only in the given series labels at compaction and drops the labels, for HA replicas whose replica label is inside the series (Prometheus pairs behind Receive, agents, collector pairs). Compacted blocks record the labels as `thanos.series_replica_labels`.
+
 ### Changed
+- [#12](https://github.com/frycm/thanos/issues/12) Compactor: penalty deduplication gives ties between replica chunks with the same time range to the replica that comes first in the plan, instead of whichever its heap popped first, so vertical compaction output no longer depends on heap order.
 
 ### Removed
 

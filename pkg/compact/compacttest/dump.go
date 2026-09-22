@@ -23,6 +23,7 @@ import (
 	"github.com/oklog/ulid/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
@@ -71,11 +72,20 @@ type ServedBlock struct {
 type BucketDump struct {
 	Series map[string]map[downsample.AggrType][]Sample
 	Blocks []ServedBlock
+
+	// keys holds, for every key of Series, its resolution and the series
+	// labels merged with the external labels, as a querier sees them.
+	keys map[string]dumpKey
+}
+
+type dumpKey struct {
+	res  int64
+	lset labels.Labels
 }
 
 // NewBucketDump returns an empty dump to be filled with ReadBlock.
 func NewBucketDump() *BucketDump {
-	return &BucketDump{Series: map[string]map[downsample.AggrType][]Sample{}}
+	return &BucketDump{Series: map[string]map[downsample.AggrType][]Sample{}, keys: map[string]dumpKey{}}
 }
 
 // DumpBucket reads every served block of the bucket.
@@ -171,6 +181,13 @@ func (d *BucketDump) ReadBlock(t *testing.T, ctx context.Context, bkt objstore.B
 		if byAggr == nil {
 			byAggr = map[downsample.AggrType][]Sample{}
 			d.Series[key] = byAggr
+			// The external labels as the key has them - which is how a
+			// store gateway serves them - merged into the series labels.
+			extLabels, err := parser.ParseMetric(ext)
+			testutil.Ok(t, err)
+			lb := labels.NewBuilder(extLabels)
+			builder.Labels().Range(func(l labels.Label) { lb.Set(strings.Clone(l.Name), strings.Clone(l.Value)) })
+			d.keys[key] = dumpKey{res: m.Thanos.Downsample.Resolution, lset: lb.Labels()}
 		}
 		for _, c := range chks {
 			chk, _, err := chunkr.ChunkOrIterable(c)
@@ -317,9 +334,97 @@ func (d *BucketDump) Without(ext func(string) bool) *BucketDump {
 		e := strings.SplitN(strings.TrimPrefix(k[strings.Index(k, " ext="):], " ext="), " series=", 2)[0]
 		if !ext(e) {
 			out.Series[k] = v
+			out.keys[k] = d.keys[k]
 		}
 	}
 	return out
+}
+
+// replicaCandidates is what a querier deduplicating by the given labels -
+// external or series labels alike - could serve from the dump: for every
+// series without those labels, per resolution and aggregate, the samples its
+// replicas hold at each timestamp.
+func (d *BucketDump) replicaCandidates(replicaLabels []string) map[string]map[downsample.AggrType]map[int64][]Sample {
+	out := map[string]map[downsample.AggrType]map[int64][]Sample{}
+	for k, byAggr := range d.Series {
+		dk := d.keys[k]
+		key := fmt.Sprintf("res=%d series=%s", dk.res, labels.NewBuilder(dk.lset).Del(replicaLabels...).Labels().String())
+		if out[key] == nil {
+			out[key] = map[downsample.AggrType]map[int64][]Sample{}
+		}
+		for at, samples := range byAggr {
+			if out[key][at] == nil {
+				out[key][at] = map[int64][]Sample{}
+			}
+			for _, s := range samples {
+				if !slices.Contains(out[key][at][s.T], s) {
+					out[key][at][s.T] = append(out[key][at][s.T], s)
+				}
+			}
+		}
+	}
+	return out
+}
+
+// AssertSameDeduplicated fails unless a querier deduplicating by the given
+// labels serves the same series from both dumps, at the same timestamps, and
+// every sample it can serve from got is one it could serve from want. Which
+// replica's sample wins a timestamp both replicas have is left open: the
+// querier's own choice depends on the order responses arrive in, and a
+// compaction that deduplicates series replicas makes its own, fixed one.
+func AssertSameDeduplicated(t *testing.T, want, got *BucketDump, replicaLabels []string, what string) {
+	t.Helper()
+	w, g := want.replicaCandidates(replicaLabels), got.replicaCandidates(replicaLabels)
+	var diffs []string
+	keys := map[string]struct{}{}
+	for k := range w {
+		keys[k] = struct{}{}
+	}
+	for k := range g {
+		keys[k] = struct{}{}
+	}
+	sorted := make([]string, 0, len(keys))
+	for k := range keys {
+		sorted = append(sorted, k)
+	}
+	sort.Strings(sorted)
+	for _, k := range sorted {
+		ws, gs := w[k], g[k]
+		switch {
+		case ws == nil:
+			diffs = append(diffs, fmt.Sprintf("unexpected %s", k))
+			continue
+		case gs == nil:
+			diffs = append(diffs, fmt.Sprintf("missing %s", k))
+			continue
+		}
+		for _, at := range append([]downsample.AggrType{AggrRaw}, AggrTypes...) {
+			wt, gt := ws[at], gs[at]
+			if len(wt) != len(gt) {
+				diffs = append(diffs, fmt.Sprintf("%s aggr %d: %d timestamps, want %d", k, at, len(gt), len(wt)))
+				continue
+			}
+			for ts, cands := range gt {
+				allowed, ok := wt[ts]
+				if !ok {
+					diffs = append(diffs, fmt.Sprintf("%s aggr %d: unexpected timestamp %d", k, at, ts))
+					break
+				}
+				for _, s := range cands {
+					if !slices.Contains(allowed, s) {
+						diffs = append(diffs, fmt.Sprintf("%s aggr %d at %d: %+v is no replica's sample (want one of %+v)", k, at, ts, s, allowed))
+						break
+					}
+				}
+			}
+		}
+		if len(diffs) > 10 {
+			break
+		}
+	}
+	if len(diffs) > 0 {
+		t.Fatalf("%s: deduplicated content differs:\n  %s", what, strings.Join(diffs, "\n  "))
+	}
 }
 
 // AssertNoOverlaps checks that within one external label set and resolution
