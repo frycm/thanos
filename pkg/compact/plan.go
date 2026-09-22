@@ -5,7 +5,9 @@ package compact
 
 import (
 	"context"
+	"slices"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/model/labels"
 
@@ -43,9 +45,18 @@ type PlanOutput struct {
 
 // SeriesPartition names one part of a series set partitioned by hash: the
 // series whose stable label hash is congruent to Index modulo Count.
+//
+// The hash is labels.StableHash of the series' labels, less the labels named
+// in Without, so that series differing only in those - replicas that carry
+// their replica label inside the series, say - fall into the same partition
+// and can be deduplicated there. Partitions of the same lineage must agree
+// on Without: a shard block re-partitioned under a different hash keeps
+// series that no finer partition claims, and the executor refuses such a
+// plan rather than lose them.
 type SeriesPartition struct {
-	Index uint64 `json:"index"`
-	Count uint64 `json:"count"`
+	Index   uint64   `json:"index"`
+	Count   uint64   `json:"count"`
+	Without []string `json:"without,omitempty"`
 }
 
 // Validate checks that the partition is well-formed.
@@ -53,12 +64,50 @@ func (p SeriesPartition) Validate() error {
 	if p.Count == 0 || p.Index >= p.Count {
 		return errors.Errorf("invalid series partition %d of %d", p.Index, p.Count)
 	}
+	if slices.Contains(p.Without, "") {
+		return errors.Errorf("series partition %d of %d leaves out a label with no name", p.Index, p.Count)
+	}
 	return nil
 }
 
 // Contains reports whether the series belongs to the partition.
 func (p SeriesPartition) Contains(lset labels.Labels) bool {
-	return labels.StableHash(lset)%p.Count == p.Index
+	return p.contains(lset, nil)
+}
+
+// contains is Contains with a digest to reuse across calls; nil allocates one
+// when needed.
+func (p SeriesPartition) contains(lset labels.Labels, h *xxhash.Digest) bool {
+	return p.hash(lset, h)%p.Count == p.Index
+}
+
+// seps separates names and values in the byte layout labels.StableHash
+// hashes, which hash mirrors.
+var seps = []byte{'\xff'}
+
+// hash is labels.StableHash of lset without the labels in Without: the same
+// byte layout, name and value each followed by a separator, fed to xxhash for
+// every label kept. A series that carries none of the labels hashes exactly
+// as labels.StableHash would.
+func (p SeriesPartition) hash(lset labels.Labels, h *xxhash.Digest) uint64 {
+	if len(p.Without) == 0 {
+		return labels.StableHash(lset)
+	}
+	if h == nil {
+		h = xxhash.New()
+	} else {
+		h.Reset()
+	}
+	lset.Range(func(l labels.Label) {
+		if slices.Contains(p.Without, l.Name) {
+			return
+		}
+		_, _ = h.WriteString(l.Name)
+		_, _ = h.Write(seps)
+		_, _ = h.WriteString(l.Value)
+		_, _ = h.Write(seps)
+	})
+	return h.Sum64()
 }
 
 // OutputPlanner is implemented by planners that decide what blocks a plan
