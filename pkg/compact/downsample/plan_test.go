@@ -143,65 +143,50 @@ func TestPlanScopesCoverageByExternalLabels(t *testing.T) {
 	testutil.Equals(t, raw2, got[0].Meta.ULID)
 }
 
-// TestPlanCoverageAcrossShards: once an unsplit block's downsampled block was
+// TestCoverageAcrossShards: once an unsplit block's downsampled block was
 // compacted into a split one, the shards hold its series between them and
 // cover it together - otherwise it would be downsampled again every pass,
 // and the result retired again by the shards' set. A coarser downsampled
 // block covers each of its shards, and one shard never covers another.
-func TestPlanCoverageAcrossShards(t *testing.T) {
+func TestCoverageAcrossShards(t *testing.T) {
 	source, other := ulid.MustNew(9, nil), ulid.MustNew(8, nil)
-	withShard := func(m *metadata.Meta, v string) *metadata.Meta {
-		m.Thanos.Labels = map[string]string{"tenant": "a"}
-		if v != "" {
-			m.Thanos.Labels[metadata.CompactorShardLabel] = v
+	meta := func(id ulid.ULID, tenant, shard string, sources ...ulid.ULID) *metadata.Meta {
+		m := &metadata.Meta{}
+		m.ULID = id
+		m.Compaction.Sources = sources
+		m.Thanos.Labels = map[string]string{"tenant": tenant}
+		if shard != "" {
+			m.Thanos.Labels[metadata.CompactorShardLabel] = shard
 		}
 		return m
 	}
-	raw := func(v string) *metadata.Meta {
-		return withShard(planMeta(ulid.MustNew(1, nil), ResLevel0, ResLevel1DownsampleRange, source), v)
-	}
-	down := func(shards ...string) map[ulid.ULID]*metadata.Meta {
-		metas := map[ulid.ULID]*metadata.Meta{}
+	raw := func(shard string) *metadata.Meta { return meta(ulid.MustNew(1, nil), "a", shard, source) }
+	covering := func(tenant string, shards ...string) coverage {
+		c := coverage{}
 		for i, v := range shards {
-			id := ulid.MustNew(uint64(100+i), nil)
 			// A shard of a compaction lists every source of the plan.
-			metas[id] = withShard(planMeta(id, ResLevel1, ResLevel1DownsampleRange, source, other), v)
+			c.add(meta(ulid.MustNew(uint64(100+i), nil), tenant, v, source, other))
 		}
-		return metas
+		return c
 	}
 	for _, tc := range []struct {
 		name    string
 		block   *metadata.Meta
-		down    map[ulid.ULID]*metadata.Meta
+		cover   coverage
 		covered bool
 	}{
-		{name: "unsplit by every shard", block: raw(""), down: down("1_of_2", "2_of_2"), covered: true},
-		{name: "unsplit by shards of mixed counts", block: raw(""), down: down("1_of_2", "2_of_4", "4_of_4"), covered: true},
-		{name: "unsplit by one shard", block: raw(""), down: down("1_of_2"), covered: false},
-		{name: "a shard by the unsplit block", block: raw("3_of_4"), down: down(""), covered: true},
-		{name: "a shard by a coarser shard holding it", block: raw("3_of_4"), down: down("1_of_2"), covered: true},
-		{name: "a shard by a coarser shard not holding it", block: raw("2_of_4"), down: down("1_of_2"), covered: false},
-		{name: "a shard by its finer shards", block: raw("1_of_2"), down: down("1_of_4", "3_of_4"), covered: true},
-		{name: "a shard by another shard", block: raw("2_of_2"), down: down("1_of_2"), covered: false},
+		{name: "unsplit by every shard", block: raw(""), cover: covering("a", "1_of_2", "2_of_2"), covered: true},
+		{name: "unsplit by shards of mixed counts", block: raw(""), cover: covering("a", "1_of_2", "2_of_4", "4_of_4"), covered: true},
+		{name: "unsplit by one shard", block: raw(""), cover: covering("a", "1_of_2"), covered: false},
+		{name: "a shard by the unsplit block", block: raw("3_of_4"), cover: covering("a", ""), covered: true},
+		{name: "a shard by a coarser shard holding it", block: raw("3_of_4"), cover: covering("a", "1_of_2"), covered: true},
+		{name: "a shard by a coarser shard not holding it", block: raw("2_of_4"), cover: covering("a", "1_of_2"), covered: false},
+		{name: "a shard by its finer shards", block: raw("1_of_2"), cover: covering("a", "1_of_4", "3_of_4"), covered: true},
+		{name: "a shard by another shard", block: raw("2_of_2"), cover: covering("a", "1_of_2"), covered: false},
+		{name: "unsplit by another stream's shards", block: raw(""), cover: covering("b", "1_of_2", "2_of_2"), covered: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			metas := tc.down
-			metas[tc.block.ULID] = tc.block
-			got, err := Plan(metas)
-			testutil.Ok(t, err)
-			testutil.Equals(t, !tc.covered, len(got) == 1 && got[0].Meta.ULID == tc.block.ULID)
+			testutil.Equals(t, tc.covered, tc.cover.covers(tc.block))
 		})
 	}
-
-	// Another stream's shards cover nothing here.
-	metas := map[ulid.ULID]*metadata.Meta{}
-	for id, m := range down("1_of_2", "2_of_2") {
-		m.Thanos.Labels["tenant"] = "b"
-		metas[id] = m
-	}
-	block := raw("")
-	metas[block.ULID] = block
-	got, err := Plan(metas)
-	testutil.Ok(t, err)
-	testutil.Equals(t, 1, len(got))
 }

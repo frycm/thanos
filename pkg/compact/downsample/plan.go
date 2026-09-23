@@ -91,10 +91,10 @@ func Plan(metas map[ulid.ULID]*metadata.Meta) ([]Candidate, error) {
 	return candidates, nil
 }
 
-// coverage records which sources the downsampled blocks of each block stream
-// account for, per shard. A stream is a set of external labels without the
-// compactor's shard label: the shards a compaction split by series into hold
-// the stream's series between them, each only its own part.
+// coverage records which sources the downsampled blocks of a block stream -
+// a set of external labels without the compactor's shard label - account
+// for, per shard: the shards a compaction split by series into hold the
+// stream's series between them, each only its own part.
 type coverage map[uint64]*streamCoverage
 
 type streamCoverage struct {
