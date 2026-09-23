@@ -124,15 +124,17 @@ func SourceShard(metas []*metadata.Meta) (index, count uint64, err error) {
 // count grows by that factor, not to k. The count is a power of two, never
 // below floor - the count the stream already has, so that a later split of
 // the stream never creates shard groups that could not merge with the
-// existing ones - never below the sources' own count, and never above the
-// maximum. A count equal to the sources' own count means no split; so does
-// one for unsplit sources.
+// existing ones - unless that is above the maximum, never above the maximum,
+// and never below the sources' own count, even when a lowered maximum is. A
+// count equal to the sources' own count means no split; so does one for
+// unsplit sources.
 //
 // Only the index size is a hard limit, and only it can make a plan not fit:
 // when the parts it needs would take the lineage over the maximum, the plan
-// has to be refused, as the index size filter refuses one. The series target
-// merely sizes the split: a plan that would want more shards than allowed
-// for its series is split into the maximum and compacted.
+// has to be refused, as the index size filter refuses one, and the count
+// returned is the one it would need. The series target merely sizes the
+// split: a plan that would want more shards than allowed for its series is
+// split into the maximum and compacted.
 func (c SplitConfig) ShardCount(metas []*metadata.Meta, sourceShards, floor uint64) (count uint64, fits bool) {
 	if !c.Enabled() {
 		return max(sourceShards, 1), true
@@ -148,12 +150,19 @@ func (c SplitConfig) ShardCount(metas []*metadata.Meta, sourceShards, floor uint
 	lineage := max(sourceShards, 1)
 	// A plan that needs no further split always fits, whatever its lineage's
 	// count: lowering the cap below a count the stream already has must not
-	// stop ordinary compaction within its shards.
-	fits = nextPow2(byIndex) == 1 || nextPow2(byIndex)*lineage <= c.effectiveMaxShards()
+	// stop ordinary compaction within its shards. A plan that does not fit
+	// reports the count it would need.
+	need := nextPow2(byIndex) * lineage
+	if nextPow2(byIndex) > 1 && need > c.effectiveMaxShards() {
+		return need, false
+	}
 	count = nextPow2(max(byIndex, bySeries)) * lineage
 	count = max(count, floor)
-	count = min(count, c.effectiveMaxShards())
-	return count, fits
+	// The cap bounds how far a plan is split, but never below the count its
+	// sources already have: a coarser shard made from one finer shard would
+	// carry a label that claims series it does not hold.
+	count = max(min(count, c.effectiveMaxShards()), lineage)
+	return count, true
 }
 
 // MaxShardCount is the largest shard count the configuration allows.
@@ -311,7 +320,7 @@ func (p *splitPlanner) decide(ctx context.Context, groupLabels map[string]string
 	// sources the lineage is the whole stream.
 	floor := p.streamShards(streamLabels(groupLabels), resolution, source)
 	count, fits = p.conf.ShardCount(sources, sourceShards, floor)
-	if !fits || count <= 1 || count == sourceShards {
+	if !fits || count <= max(sourceShards, 1) {
 		return nil, count, fits, nil
 	}
 	for _, j := range ShardsToProduce(sourceShard, sourceShards, count) {
@@ -440,9 +449,12 @@ func (p *splitPlanner) Plan(ctx context.Context, metasByMinTime []*metadata.Meta
 	// A shard block whose lineage has moved on to a finer count anywhere in
 	// the stream has no future at its own: no range at that count can ever
 	// be completed again. It is split up to the lineage's count, covered or
-	// not. An unsplit block is different - it may be a fresh upload waiting
-	// for its siblings - so for it coverage remains the only guard.
-	behind := source.Count > 0 && p.streamShards(streamLabels(metasByMinTime[0].Thanos.Labels), metasByMinTime[0].Thanos.Downsample.Resolution, source) > source.Count
+	// not - as far as the cap allows; a count the cap no longer allows is not
+	// one the block can be split towards. An unsplit block is different - it
+	// may be a fresh upload waiting for its siblings - so for it coverage
+	// remains the only guard.
+	lineage := p.streamShards(streamLabels(metasByMinTime[0].Thanos.Labels), metasByMinTime[0].Thanos.Downsample.Resolution, source)
+	behind := source.Count > 0 && min(lineage, p.conf.MaxShardCount()) > source.Count
 	if len(covered) == 0 && !behind {
 		return nil, nil
 	}
@@ -454,12 +466,28 @@ func (p *splitPlanner) Plan(ctx context.Context, metasByMinTime []*metadata.Meta
 	// stream's shards already cover is not a fresh upload waiting for
 	// siblings, whatever its position in the unsplit group - after the other
 	// stragglers are gone it is the group's newest block, and it must still
-	// be split.
-	for _, m := range metasByMinTime {
+	// be split. The candidates exclude blocks refused above, whose marks the
+	// snapshot of no-compact marks does not hold yet.
+	for _, m := range candidates {
 		if _, excluded := noCompact[m.ULID]; excluded {
 			continue
 		}
 		if !behind && !coversRange(covered, m.MinTime, m.MaxTime) {
+			continue
+		}
+		// A block planned alone is refused like any plan when its split
+		// would need more shards than allowed, and skipped when it would
+		// not be split at all: it would only be rewritten as itself, pass
+		// after pass.
+		pieces, count, fits, err := p.decide(ctx, m.Thanos.Labels, m.Thanos.Downsample.Resolution, []*metadata.Meta{m})
+		if err != nil {
+			return nil, err
+		}
+		if !fits {
+			p.refuse(ctx, []*metadata.Meta{m}, count)
+			continue
+		}
+		if len(pieces) == 0 {
 			continue
 		}
 		level.Info(p.logger).Log("msg", "splitting a block left behind in a split stream", "block", m.ULID, "shard", source.Label(), "mint", m.MinTime, "maxt", m.MaxTime)

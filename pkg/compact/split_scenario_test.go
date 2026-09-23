@@ -115,12 +115,15 @@ func splitScenarios() []compacttest.Scenario {
 				// A shard a split produced records the set it was produced
 				// with: that is what lets readers tell a complete replacement
 				// of the sources from a partial one. A shard made by an
-				// ordinary compaction inside its group, or by the downsampler,
-				// is its own set and records none. A recorded set need not be
-				// complete any more once the stream has moved on - a sibling
-				// re-split into finer shards is superseded and collected - so
-				// completeness itself is what split_survives_partial_publication
-				// exercises, at the moment it matters.
+				// ordinary compaction inside its group records a set of one
+				// output and the siblings its sources shared a set with, so
+				// that those stay published once the sources are gone; one
+				// the downsampler made records none. A recorded set need not
+				// be complete any more once the stream has moved on - a
+				// sibling re-split into finer shards is superseded and
+				// collected - so completeness itself is what
+				// split_survives_partial_publication exercises, at the moment
+				// it matters.
 				var recorded int
 				for _, b := range got.Blocks {
 					if _, _, ok, _ := metadata.Shard(b.Meta.Thanos.Labels); !ok {
@@ -132,7 +135,8 @@ func splitScenarios() []compacttest.Scenario {
 					}
 					recorded++
 					testutil.Assert(t, slices.Contains(set.Blocks, b.ID), "shard %s is not in its own set", b.ID)
-					testutil.Assert(t, set.Count >= 2 && set.Index < set.Count, "shard %s records output %d of %d", b.ID, set.Index, set.Count)
+					testutil.Assert(t, set.Index < set.Count, "shard %s records output %d of %d", b.ID, set.Index, set.Count)
+					testutil.Assert(t, set.Count >= 2 || len(set.Blocks) > set.Count, "shard %s records a set of one output without siblings", b.ID)
 				}
 				testutil.Assert(t, recorded > 0, "no served shard records the set it was split into")
 

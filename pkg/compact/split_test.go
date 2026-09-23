@@ -54,7 +54,7 @@ func TestSplitConfigShardCount(t *testing.T) {
 		{name: "fits", conf: sixtyFour, metas: []*metadata.Meta{metaWith(20*gib, 0, nil), metaWith(20*gib, 0, nil)}, want: 1, fits: true},
 		{name: "two replicas over the headroom", conf: sixtyFour, metas: []*metadata.Meta{metaWith(30*gib, 0, nil), metaWith(30*gib, 0, nil)}, want: 2, fits: true},
 		{name: "rounds up to a power of two", conf: sixtyFour, metas: []*metadata.Meta{metaWith(100*gib, 0, nil), metaWith(100*gib, 0, nil), metaWith(60*gib, 0, nil)}, want: 8, fits: true},
-		{name: "over the cap by index, cap rounded down", conf: SplitConfig{MaxShards: 6, MaxIndexSizeBytes: gib}, metas: []*metadata.Meta{metaWith(100*gib, 0, nil)}, want: 4, fits: false},
+		{name: "over the cap by index, cap rounded down, reports what it needs", conf: SplitConfig{MaxShards: 6, MaxIndexSizeBytes: gib}, metas: []*metadata.Meta{metaWith(100*gib, 0, nil)}, want: 128, fits: false},
 		{name: "over the cap by series is capped, not refused", conf: SplitConfig{MaxShards: 4, MaxSeries: 10}, metas: []*metadata.Meta{metaWith(0, 60, nil)}, want: 4, fits: true},
 		{name: "series criterion", conf: SplitConfig{MaxShards: 16, MaxSeries: 10}, metas: []*metadata.Meta{metaWith(0, 12, nil), metaWith(0, 12, nil)}, want: 4, fits: true},
 		{name: "never below the stream's count", conf: sixtyFour, metas: []*metadata.Meta{metaWith(gib, 0, nil)}, floor: 4, want: 4, fits: true},
@@ -67,11 +67,15 @@ func TestSplitConfigShardCount(t *testing.T) {
 		{name: "a shard needing two parts doubles the count", conf: sixtyFour, metas: []*metadata.Meta{metaWith(40*gib, 0, nil), metaWith(40*gib, 0, nil)}, sourceShards: 4, want: 8, fits: true},
 		{name: "a shard needing three parts quadruples the count", conf: sixtyFour, metas: []*metadata.Meta{metaWith(60*gib, 0, nil), metaWith(60*gib, 0, nil), metaWith(40*gib, 0, nil)}, sourceShards: 4, want: 16, fits: true},
 		{name: "a shard's series count works the same", conf: SplitConfig{MaxShards: 16, MaxSeries: 10}, metas: []*metadata.Meta{metaWith(0, 12, nil), metaWith(0, 12, nil)}, sourceShards: 2, want: 8, fits: true},
-		{name: "a shard at the cap that needs more index does not fit", conf: SplitConfig{MaxShards: 8, MaxIndexSizeBytes: 64 * gib}, metas: []*metadata.Meta{metaWith(40*gib, 0, nil), metaWith(40*gib, 0, nil)}, sourceShards: 8, want: 8, fits: false},
+		{name: "a shard at the cap that needs more index does not fit", conf: SplitConfig{MaxShards: 8, MaxIndexSizeBytes: 64 * gib}, metas: []*metadata.Meta{metaWith(40*gib, 0, nil), metaWith(40*gib, 0, nil)}, sourceShards: 8, want: 16, fits: false},
 		// The cap was lowered below a count the stream already has: what
-		// needs no further split still compacts within its shard.
-		{name: "a shard beyond a lowered cap still fits when it needs no split", conf: SplitConfig{MaxShards: 4, MaxIndexSizeBytes: 64 * gib}, metas: []*metadata.Meta{metaWith(20*gib, 0, nil), metaWith(20*gib, 0, nil)}, sourceShards: 8, want: 4, fits: true},
-		{name: "a shard beyond a lowered cap that needs a split does not fit", conf: SplitConfig{MaxShards: 4, MaxIndexSizeBytes: 64 * gib}, metas: []*metadata.Meta{metaWith(40*gib, 0, nil), metaWith(40*gib, 0, nil)}, sourceShards: 8, want: 4, fits: false},
+		// needs no further split still compacts within its shard, at its own
+		// count - a coarser label would claim series the shard does not hold.
+		{name: "a shard beyond a lowered cap keeps its count when it needs no split", conf: SplitConfig{MaxShards: 4, MaxIndexSizeBytes: 64 * gib}, metas: []*metadata.Meta{metaWith(20*gib, 0, nil), metaWith(20*gib, 0, nil)}, sourceShards: 8, want: 8, fits: true},
+		{name: "a shard beyond a lowered cap keeps its count although its series want more", conf: SplitConfig{MaxShards: 4, MaxSeries: 4}, metas: []*metadata.Meta{metaWith(0, 6, nil), metaWith(0, 6, nil)}, sourceShards: 8, floor: 8, want: 8, fits: true},
+		{name: "a shard beyond a lowered cap that needs a split does not fit", conf: SplitConfig{MaxShards: 4, MaxIndexSizeBytes: 64 * gib}, metas: []*metadata.Meta{metaWith(40*gib, 0, nil), metaWith(40*gib, 0, nil)}, sourceShards: 8, want: 16, fits: false},
+		{name: "a fresh range under a lowered cap splits at the cap, not the stream's count", conf: SplitConfig{MaxShards: 4, MaxIndexSizeBytes: 64 * gib}, metas: []*metadata.Meta{metaWith(60*gib, 0, nil), metaWith(60*gib, 0, nil)}, floor: 8, want: 4, fits: true},
+		{name: "a shard at a lowered cap is not split towards the stream's count", conf: SplitConfig{MaxShards: 4, MaxIndexSizeBytes: 64 * gib}, metas: []*metadata.Meta{metaWith(gib, 0, nil)}, sourceShards: 4, floor: 8, want: 4, fits: true},
 		{name: "a shard at the cap that wants more for its series stays", conf: SplitConfig{MaxShards: 8, MaxSeries: 4}, metas: []*metadata.Meta{metaWith(0, 3, nil), metaWith(0, 3, nil), metaWith(0, 3, nil)}, sourceShards: 8, want: 8, fits: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -649,4 +653,109 @@ func TestSplitPlannerPlanSiblings(t *testing.T) {
 	got, err = planner.PlanSiblings(ctx, nil, []*metadata.Meta{unsplit})
 	testutil.Ok(t, err)
 	testutil.Equals(t, 0, len(got))
+}
+
+// TestSplitPlannerStragglersRespectTheCap: a block planned alone because its
+// stream moved on is held to the same limits as any plan. It is refused and
+// marked when its split would need more shards than allowed, instead of
+// failing planning, and it is not split towards a count the cap no longer
+// allows, which would only rewrite it as itself, pass after pass.
+func TestSplitPlannerStragglersRespectTheCap(t *testing.T) {
+	ctx := context.Background()
+	shard := func(v string) map[string]string {
+		return map[string]string{"tenant": "a", metadata.CompactorShardLabel: v}
+	}
+	view := func(ms ...*metadata.Meta) func() map[ulid.ULID]*metadata.Meta {
+		all := map[ulid.ULID]*metadata.Meta{}
+		for _, m := range ms {
+			all[m.ULID] = m
+		}
+		return func() map[ulid.ULID]*metadata.Meta { return all }
+	}
+	sized := func(id int, lbls map[string]string, mint, maxt, indexBytes int64) *metadata.Meta {
+		m := rangeMeta(id, lbls, mint, maxt)
+		m.Thanos.Files = []metadata.File{{RelPath: block.IndexFilename, SizeBytes: indexBytes}}
+		return m
+	}
+	marked := func(bkt objstore.Bucket, m *metadata.Meta) bool {
+		ok, err := bkt.Exists(ctx, m.ULID.String()+"/"+metadata.NoCompactMarkFilename)
+		testutil.Ok(t, err)
+		return ok
+	}
+	conf := SplitConfig{MaxShards: 8, MaxIndexSizeBytes: 64 * gib}
+	// The stream has gone to 4 shards elsewhere, so 1 of 2 is behind.
+	finer := rangeMeta(50, shard("1_of_4"), 500, 600)
+
+	t.Run("a straggler whose split does not fit is refused, not planned", func(t *testing.T) {
+		// 400 GiB of shard 1 of 2 need eight parts: 16 shards, over the cap.
+		lone := sized(1, shard("1_of_2"), 0, 100, 400*gib)
+		bkt := objstore.NewInMemBucket()
+		metrics := NewSplitMetrics(nil)
+		p := WithBlockSplitting(fixedPlanner{}, log.NewNopLogger(), conf, metrics, bkt, noopCounter(), view(finer), nil)
+		plan, err := p.Plan(ctx, []*metadata.Meta{lone}, nil, nil)
+		testutil.Ok(t, err)
+		testutil.Equals(t, 0, len(plan))
+		testutil.Equals(t, true, marked(bkt, lone))
+		testutil.Equals(t, 1.0, promtestutil.ToFloat64(metrics.Fallbacks))
+	})
+	t.Run("a block refused in the same pass is not planned alone", func(t *testing.T) {
+		big := sized(1, shard("1_of_2"), 0, 100, 400*gib)
+		small := sized(2, shard("1_of_2"), 100, 200, 10*gib)
+		bkt := objstore.NewInMemBucket()
+		metrics := NewSplitMetrics(nil)
+		p := WithBlockSplitting(candidatePlanner{plan: []*metadata.Meta{big, small}}, log.NewNopLogger(), conf, metrics, bkt, noopCounter(), view(finer), nil)
+		plan, err := p.Plan(ctx, []*metadata.Meta{big, small}, nil, nil)
+		testutil.Ok(t, err)
+		testutil.Equals(t, []*metadata.Meta{small}, plan, "the plan's biggest block is refused; the other one is still behind")
+		testutil.Equals(t, true, marked(bkt, big))
+		testutil.Equals(t, 1.0, promtestutil.ToFloat64(metrics.Fallbacks), "refused once")
+	})
+	t.Run("a shard at a lowered cap is not split towards the stream's count", func(t *testing.T) {
+		lone := rangeMeta(1, shard("1_of_4"), 0, 100)
+		p := WithBlockSplitting(fixedPlanner{}, log.NewNopLogger(), SplitConfig{MaxShards: 4}, nil, objstore.NewInMemBucket(), noopCounter(), view(rangeMeta(51, shard("5_of_8"), 100, 200)), nil)
+		plan, err := p.Plan(ctx, []*metadata.Meta{lone}, nil, nil)
+		testutil.Ok(t, err)
+		testutil.Equals(t, 0, len(plan))
+	})
+	t.Run("shards beyond a lowered cap compact within their shard", func(t *testing.T) {
+		a, b := rangeMeta(1, shard("1_of_8"), 0, 100), rangeMeta(2, shard("1_of_8"), 100, 200)
+		p := WithBlockSplitting(fixedPlanner{}, log.NewNopLogger(), SplitConfig{MaxShards: 4, MaxSeries: 1}, nil, objstore.NewInMemBucket(), noopCounter(), view(a, b), nil).(*splitPlanner)
+		pieces, count, fits, err := p.decide(ctx, shard("1_of_8"), 0, []*metadata.Meta{a, b})
+		testutil.Ok(t, err)
+		testutil.Equals(t, true, fits)
+		testutil.Equals(t, uint64(8), count)
+		testutil.Equals(t, 0, len(pieces), "a coarser label would claim series shard 1 of 8 does not hold")
+	})
+}
+
+// TestSplitPlannerSiblingsReachThePlan: the siblings the split planner names
+// reach the plan the group hands its executor, so that a shard compacted on
+// keeps the set of the shards it was split with complete.
+func TestSplitPlannerSiblingsReachThePlan(t *testing.T) {
+	shardLabels := map[string]string{"tenant": "a", metadata.CompactorShardLabel: "1_of_2"}
+	set := func(m *metadata.Meta, index, count int, blocks ...*metadata.Meta) {
+		m.Thanos.Output = &metadata.ThanosOutput{Index: index, Count: count}
+		for _, b := range blocks {
+			m.Thanos.Output.Blocks = append(m.Thanos.Output.Blocks, b.ULID)
+		}
+	}
+	a := rangeMeta(1, shardLabels, 0, 100)
+	b := rangeMeta(2, map[string]string{"tenant": "a", metadata.CompactorShardLabel: "2_of_2"}, 0, 100)
+	set(a, 0, 2, a, b)
+	set(b, 1, 2, a, b)
+	next := rangeMeta(3, shardLabels, 100, 200)
+	all := map[ulid.ULID]*metadata.Meta{a.ULID: a, b.ULID: b, next.ULID: next}
+
+	cnt := func() prometheus.Counter { return promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"}) }
+	cg, err := NewGroup(log.NewNopLogger(), objstore.NewInMemBucket(), "0@shard", labels.FromMap(shardLabels), 0, false, false,
+		cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), metadata.NoneFunc, 1, 1)
+	testutil.Ok(t, err)
+	testutil.Ok(t, cg.AppendMeta(a))
+	testutil.Ok(t, cg.AppendMeta(next))
+
+	p := WithBlockSplitting(candidatePlanner{plan: []*metadata.Meta{a, next}}, log.NewNopLogger(), SplitConfig{MaxShards: 8, MaxSeries: 100}, nil, objstore.NewInMemBucket(), noopCounter(), func() map[ulid.ULID]*metadata.Meta { return all }, nil)
+	plan, err := cg.Plan(context.Background(), p, make(chan error, 1))
+	testutil.Ok(t, err)
+	testutil.Equals(t, []*metadata.Meta{a, next}, plan.Sources)
+	testutil.Equals(t, []ulid.ULID{b.ULID}, plan.Siblings, "b's set with a stays complete through the plan's outputs")
 }
