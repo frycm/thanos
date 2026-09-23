@@ -165,6 +165,56 @@ func TestGroupPlanCarriesPlannerOutputs(t *testing.T) {
 	testutil.Equals(t, 0, exec.calls)
 }
 
+type siblingPlanner struct {
+	stubPlanner
+	siblings    []ulid.ULID
+	siblingsErr error
+	gotSources  []*metadata.Meta
+}
+
+func (s *siblingPlanner) PlanSiblings(_ context.Context, _ *Group, sources []*metadata.Meta) ([]ulid.ULID, error) {
+	s.gotSources = sources
+	return s.siblings, s.siblingsErr
+}
+
+// TestGroupPlanCarriesPlannerSiblings pins down that the siblings a planner
+// names reach the plan the executor gets. Tests of the executor build their
+// plans by hand, so they cannot catch a planning path that drops them.
+func TestGroupPlanCarriesPlannerSiblings(t *testing.T) {
+	ctx := context.Background()
+
+	m1 := meta(ulid.MustNew(1, nil), 0, 100)
+	m2 := meta(ulid.MustNew(2, nil), 100, 200)
+	cg := testGroup(t, m1, m2)
+	siblings := []ulid.ULID{ulid.MustNew(3, nil), ulid.MustNew(4, nil)}
+
+	planner := &siblingPlanner{stubPlanner: stubPlanner{plan: []*metadata.Meta{m1, m2}}, siblings: siblings}
+	plan, err := cg.Plan(ctx, planner, make(chan error, 1))
+	testutil.Ok(t, err)
+	testutil.Equals(t, []*metadata.Meta{m1, m2}, planner.gotSources)
+	testutil.Equals(t, siblings, plan.Siblings)
+
+	exec := &recordingExecutor{}
+	_, _, err = cg.compact(ctx, "/tmp/does-not-matter", planner, exec, make(chan error, 1))
+	testutil.Ok(t, err)
+	testutil.Equals(t, siblings, exec.gotPlan.Siblings)
+
+	// Siblings are only asked for when there is a plan.
+	idle := &siblingPlanner{siblings: siblings}
+	plan, err = cg.Plan(ctx, idle, make(chan error, 1))
+	testutil.Ok(t, err)
+	testutil.Equals(t, []*metadata.Meta(nil), idle.gotSources)
+	testutil.Equals(t, 0, len(plan.Siblings))
+
+	// A planner that cannot name them fails the plan rather than letting it
+	// run without them.
+	failing := &siblingPlanner{stubPlanner: stubPlanner{plan: []*metadata.Meta{m1, m2}}, siblingsErr: errors.New("no view")}
+	exec = &recordingExecutor{}
+	_, _, err = cg.compact(ctx, "/tmp/does-not-matter", failing, exec, make(chan error, 1))
+	testutil.NotOk(t, err)
+	testutil.Equals(t, 0, exec.calls)
+}
+
 // TestGroupCompactTreatsDeferredPlanAsNoWork asserts that an executor that
 // declines a plan neither fails the group nor asks for a rerun.
 func TestGroupCompactTreatsDeferredPlanAsNoWork(t *testing.T) {

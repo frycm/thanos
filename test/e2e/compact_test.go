@@ -828,8 +828,7 @@ func testCompactWithStoreGateway(t *testing.T, penaltyDedup bool) {
 		// pre-aggregated sum/count should be used.
 		testutil.Ok(t, block.Delete(ctx, log.NewNopLogger(), bkt, downsampledRawID))
 
-		testutil.Ok(t, str.Stop())
-		testutil.Ok(t, e2e.StartAndWaitReady(str))
+		testutil.Ok(t, e2ethanos.Restart(e, str))
 		testutil.Ok(t, runutil.Retry(time.Second, ctx.Done(), func() error {
 			return str.WaitSumMetricsWithOptions(
 				e2emon.Equals(20),
