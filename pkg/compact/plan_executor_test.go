@@ -328,3 +328,45 @@ func TestSetSiblings(t *testing.T) {
 	got = SetSiblings(view, []*metadata.Meta{view[id(7)]})
 	testutil.Equals(t, 0, len(got), "gone blocks are not named")
 }
+
+// TestGroupPlanNamesSiblingsFromItsView pins down that plans name their
+// siblings whatever planner runs: a bucket holding sets keeps needing them
+// once the planner that made the sets is gone - block splitting turned off,
+// say - or a shard compacted on would leave its siblings withheld for good.
+// Groups keep the view the grouper cut them from, and planning falls back
+// to it.
+func TestGroupPlanNamesSiblingsFromItsView(t *testing.T) {
+	shardMeta := func(i int, shard string, mint, maxt int64, set ...int) *metadata.Meta {
+		m := meta(ulid.MustNew(uint64(i), nil), mint, maxt)
+		m.Thanos.Labels = map[string]string{"ext": "1", "shard": shard}
+		m.Thanos.Version = metadata.ThanosVersion1
+		if len(set) > 0 {
+			m.Thanos.Output = &metadata.ThanosOutput{Index: 0, Count: len(set)}
+			for _, s := range set {
+				m.Thanos.Output.Blocks = append(m.Thanos.Output.Blocks, ulid.MustNew(uint64(s), nil))
+			}
+		}
+		return m
+	}
+	// 1 and 2 are the shards of one split; 3 is the next range of shard a.
+	view := map[ulid.ULID]*metadata.Meta{}
+	for _, m := range []*metadata.Meta{shardMeta(1, "a", 0, 100, 1, 2), shardMeta(2, "b", 0, 100, 1, 2), shardMeta(3, "a", 100, 200)} {
+		view[m.ULID] = m
+	}
+	reg := prometheus.NewRegistry()
+	cnt := promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"})
+	groups, err := NewDefaultGrouper(log.NewNopLogger(), objstore.NewInMemBucket(), false, false, reg, cnt, cnt, cnt, "", 1, 1).Groups(view)
+	testutil.Ok(t, err)
+	var shardA *Group
+	for _, g := range groups {
+		if g.Labels().Get("shard") == "a" {
+			shardA = g
+		}
+	}
+	testutil.Assert(t, shardA != nil, "no group for shard a")
+
+	planner := stubPlanner{plan: []*metadata.Meta{view[ulid.MustNew(1, nil)], view[ulid.MustNew(3, nil)]}}
+	plan, err := shardA.Plan(context.Background(), planner, make(chan error, 1))
+	testutil.Ok(t, err)
+	testutil.Equals(t, []ulid.ULID{ulid.MustNew(2, nil)}, plan.Siblings)
+}

@@ -395,6 +395,9 @@ func (g *DefaultGrouper) Groups(blocks map[ulid.ULID]*metadata.Meta) (res []*Gro
 			if err != nil {
 				return nil, errors.Wrap(err, "create compaction group")
 			}
+			// A plan's siblings live in other groups; the view is what
+			// names them, whatever planner the compactor runs.
+			group.view = blocks
 			groups[groupKey] = group
 			res = append(res, group)
 		}
@@ -457,6 +460,9 @@ type Group struct {
 	blockFilesConcurrency         int
 	compactBlocksFetchConcurrency int
 	extensions                    any
+	// view is the synced view the group was cut from, if the grouper kept
+	// it: planning names a plan's siblings from it when the planner does not.
+	view map[ulid.ULID]*metadata.Meta
 }
 
 // NewGroup returns a new compaction group.
@@ -1275,12 +1281,17 @@ func (cg *Group) planLocked(ctx context.Context, planner Planner, errChan chan e
 		}
 		plan.Outputs = outputs
 	}
+	// Sets outlive their members only if every plan names its siblings, so
+	// without a planner that does, the group's view does: a bucket holding
+	// sets needs them named whether or not what made the sets still runs.
 	if sp, ok := planner.(SiblingPlanner); ok {
 		siblings, err := sp.PlanSiblings(ctx, cg, toCompact)
 		if err != nil {
 			return Plan{}, errors.Wrap(err, "plan compaction siblings")
 		}
 		plan.Siblings = siblings
+	} else if cg.view != nil {
+		plan.Siblings = SetSiblings(cg.view, toCompact)
 	}
 	return plan, nil
 }
