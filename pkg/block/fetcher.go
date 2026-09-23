@@ -977,9 +977,10 @@ type resolutionUncoveredReporter struct {
 	f *ResolutionMetaFilter
 }
 
-// Filter reports the blocks below the minimum resolution still present. Every
-// such block is one the resolution filter kept for lack of coverage: covered
-// ones were hidden by it, and no later filter adds blocks.
+// Filter reports the blocks below the minimum resolution still present: the
+// ones the resolution filter kept for lack of coverage, and the fallbacks the
+// store loaded back because a cover could not be used. Either way they are
+// served below the minimum, which is what the gauge alerts on.
 func (r *resolutionUncoveredReporter) Filter(_ context.Context, metas map[ulid.ULID]*metadata.Meta, _ GaugeVec, _ GaugeVec) error {
 	f := r.f
 	if f.minResolution <= 0 {

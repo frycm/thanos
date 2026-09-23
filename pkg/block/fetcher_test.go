@@ -615,7 +615,8 @@ func TestResolutionMetaFilter_Filter(t *testing.T) {
 }
 
 // TestResolutionMetaFilter_CoveringBlockRemovedByOtherFilter asserts the contract
-// behind running the resolution filter last in the store gateway chain: a block
+// behind running the resolution filter after every filter that drops blocks
+// for good - only the time partition runs after it: a block
 // another filter removed (too fresh, marked for deletion, parquet-migrated) must
 // not count as coverage, so the finer block it was built from stays served.
 func TestResolutionMetaFilter_CoveringBlockRemovedByOtherFilter(t *testing.T) {

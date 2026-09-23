@@ -797,11 +797,14 @@ func (s *BucketStore) SyncBlocks(ctx context.Context) error {
 	close(blockc)
 	wg.Wait()
 
+	// Fallbacks whose cover did not load are restored from a partial view
+	// too: restoring only adds blocks, and waiting for a clean sync would
+	// leave their ranges unserved meanwhile.
+	if err := s.syncResolutionFallbacks(ctx, metas); err != nil && metaFetchErr == nil {
+		return err
+	}
 	if metaFetchErr != nil {
 		return metaFetchErr
-	}
-	if err := s.syncResolutionFallbacks(ctx, metas); err != nil {
-		return err
 	}
 
 	s.mtx.RLock()
