@@ -92,9 +92,14 @@ func RunDownsample(
 	insBkt := objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(bkt, extprom.WrapRegistererWithPrefix("thanos_", reg), bkt.Name()))
 
 	// While fetching blocks, filter out blocks that were marked for no downsample.
+	// Staged outputs of a compaction are withheld, as the compactor does:
+	// downsampling one would put a published block beside sources its set
+	// has not replaced yet.
 	baseBlockIDsFetcher := block.NewConcurrentLister(logger, insBkt)
+	deduplicateFilter := block.NewDeduplicateFilter(block.FetcherConcurrency)
+	deduplicateFilter.HideUnpublished()
 	metaFetcher, err := block.NewMetaFetcher(logger, block.FetcherConcurrency, insBkt, baseBlockIDsFetcher, "", extprom.WrapRegistererWithPrefix("thanos_", reg), []block.MetadataFilter{
-		block.NewDeduplicateFilter(block.FetcherConcurrency),
+		deduplicateFilter,
 		downsample.NewGatherNoDownsampleMarkFilter(logger, insBkt, block.FetcherConcurrency),
 	})
 	if err != nil {

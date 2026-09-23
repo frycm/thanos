@@ -823,7 +823,7 @@ type DefaultDeduplicateFilter struct {
 	// hideUnpublished withholds unpublished blocks from the view; see
 	// HideUnpublished.
 	hideUnpublished bool
-	unpublishedIDs  []ulid.ULID
+	unpublished     []*metadata.Meta
 }
 
 // NewDeduplicateFilter creates DefaultDeduplicateFilter.
@@ -831,11 +831,6 @@ func NewDeduplicateFilter(concurrency int) *DefaultDeduplicateFilter {
 	return &DefaultDeduplicateFilter{concurrency: concurrency}
 }
 
-// SetPublishedFunc lets the caller declare further blocks unpublished: a block
-// for which it returns false supersedes nothing, however complete its
-// sources, and is itself superseded by a published block with the same
-// sources. A manager that verifies its workers' results uses it to keep a
-// result it rejected from retiring the plan's sources.
 // HideUnpublished makes the filter withhold unpublished blocks from the view
 // altogether, not only from superseding anything. A compactor needs this: an
 // unpublished block is the staged output of a plan that has not replaced its
@@ -856,10 +851,30 @@ func (f *DefaultDeduplicateFilter) HideUnpublished() {
 func (f *DefaultDeduplicateFilter) UnpublishedIDs() []ulid.ULID {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.unpublishedIDs
+	ids := make([]ulid.ULID, 0, len(f.unpublished))
+	for _, m := range f.unpublished {
+		ids = append(ids, m.ULID)
+	}
+	return ids
 }
 
+// Unpublished returns the metadata of the blocks the last Filter withheld as
+// unpublished. Withheld blocks are out of every view built on the filter, so
+// whatever must still reach them - retention, for one - takes them from here.
+func (f *DefaultDeduplicateFilter) Unpublished() []*metadata.Meta {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.unpublished)
+}
+
+// SetPublishedFunc lets the caller declare further blocks unpublished: a block
+// for which it returns false supersedes nothing, however complete its
+// sources, and is itself superseded by a published block with the same
+// sources. A manager that verifies its workers' results uses it to keep a
+// result it rejected from retiring the plan's sources.
 func (f *DefaultDeduplicateFilter) SetPublishedFunc(published func(*metadata.Meta) bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.published = published
 }
 
@@ -872,16 +887,16 @@ func (f *DefaultDeduplicateFilter) Filter(_ context.Context, metas map[ulid.ULID
 	var dupsChan = make(chan filtered)
 
 	f.mu.Lock()
-	hideUnpublished := f.hideUnpublished
+	hideUnpublished, publishedFunc := f.hideUnpublished, f.published
 	f.mu.Unlock()
 
 	dupWg.Go(func() {
 		dups := make([]ulid.ULID, 0)
-		unpublished := make([]ulid.ULID, 0)
+		unpublished := make([]*metadata.Meta, 0)
 		for out := range dupsChan {
 			if out.unpublished {
-				if metas[out.id] != nil {
-					unpublished = append(unpublished, out.id)
+				if m := metas[out.id]; m != nil {
+					unpublished = append(unpublished, m)
 				}
 				synced.WithLabelValues(unpublishedMeta).Inc()
 			} else {
@@ -894,7 +909,7 @@ func (f *DefaultDeduplicateFilter) Filter(_ context.Context, metas map[ulid.ULID
 		}
 		f.mu.Lock()
 		f.duplicateIDs = dups
-		f.unpublishedIDs = unpublished
+		f.unpublished = unpublished
 		f.mu.Unlock()
 	})
 
@@ -910,8 +925,11 @@ func (f *DefaultDeduplicateFilter) Filter(_ context.Context, metas map[ulid.ULID
 	// A block supersedes the blocks it was made from only once it is
 	// published: every block of the set its compaction produced is present,
 	// and the caller has nothing against it. Until then the sources are the
-	// only complete copy of the data. Presence is judged on the view before
-	// deduplication, which is what the bucket holds.
+	// only complete copy of the data. Presence is judged on the view the
+	// filters before this one left, not on the bucket: a compactor sharded by
+	// a selector relabeling that separates the shards of one stream sees
+	// incomplete sets and withholds them, so such a selector must keep a
+	// stream's shards together.
 	present := make(map[ulid.ULID]struct{}, len(metas))
 	for id := range metas {
 		present[id] = struct{}{}
@@ -923,10 +941,12 @@ func (f *DefaultDeduplicateFilter) Filter(_ context.Context, metas map[ulid.ULID
 	// A block is published by its own complete set, or by another block's
 	// complete set that names it: a compaction of some blocks of a set names
 	// the rest as its siblings, so that they keep a complete set once the
-	// blocks they shared one with are gone.
+	// blocks they shared one with are gone. Only a set that names its holder
+	// vouches for others: a set a tool copied under a new ID without renaming
+	// says nothing about the copy, and whether it is complete is unknown.
 	certified := make(map[ulid.ULID]struct{})
 	for _, m := range metas {
-		if m.Thanos.Output == nil || !m.Thanos.Published(m.ULID, exists) {
+		if m.Thanos.Output == nil || !slices.Contains(m.Thanos.Output.Blocks, m.ULID) || !m.Thanos.Published(m.ULID, exists) {
 			continue
 		}
 		for _, id := range m.Thanos.Output.Blocks {
@@ -934,7 +954,7 @@ func (f *DefaultDeduplicateFilter) Filter(_ context.Context, metas map[ulid.ULID
 		}
 	}
 	published := func(m *metadata.Meta) bool {
-		if f.published != nil && !f.published(m) {
+		if publishedFunc != nil && !publishedFunc(m) {
 			return false
 		}
 		if m.Thanos.Published(m.ULID, exists) {

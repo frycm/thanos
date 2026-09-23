@@ -14,8 +14,12 @@ It is recommend to upgrade the storage components first (Receive, Store, etc.) a
 
 ### Fixed
 
+- [#8667](https://github.com/thanos-io/thanos/pull/8667): Query: fix data race in GetStoreClients by making endpointRef mutex a pointer
+
 ### Added
 - [#5](https://github.com/frycm/thanos/issues/5) Compactor: experimental block splitting by series behind the hidden `--compact.block-split.max-shards` flag. A compaction estimated to exceed the index size limit is written as a power-of-two number of shard blocks carrying the external label `__compactor_shard__` instead of freezing its biggest source block; Store Gateway strips the label from what it serves. `--compact.block-split.ignore-labels` leaves series labels, such as in-series replica labels, out of the shard hash. Shards of an incomplete set are withheld from the compactor's view, and every plan over shards names the blocks that share a set with its sources so that they stay published.
+
+- [#4](https://github.com/frycm/thanos/issues/4) Compactor: blocks record the set of blocks their compaction produced in `thanos.output` of `meta.json`, and replace their sources only once the whole set is in the bucket. The compactor and `tools bucket downsample` withhold blocks whose set is incomplete, counted as `state="unpublished"` in `thanos_blocks_meta_synced`; retention still applies to them. Block repair and `tools bucket rewrite` keep the set with the new block in the original's place.
 
 ### Changed
 
@@ -30,7 +34,6 @@ It is recommend to upgrade the storage components first (Receive, Store, etc.) a
 - [#8254](https://github.com/thanos-io/thanos/issues/8254) Receive: Endless loop of retried replication with capnproto and distributors
 - [#8618](https://github.com/thanos-io/thanos/pull/8618): Query-Frontend: ensure slow query and stats logging on request failures
 - [#8480](https://github.com/thanos-io/thanos/pull/8480): Store: fix(readerpool): avoid inserting nil LazyBinaryReader on error to avoid panic
-- [#8667](https://github.com/thanos-io/thanos/pull/8667): Query: fix data race in GetStoreClients by making endpointRef mutex a pointer
 
 ### Added
 
