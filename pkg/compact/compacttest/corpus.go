@@ -76,6 +76,10 @@ type TenantSpec struct {
 	NoCompact              map[int]metadata.NoCompactReason
 	SampleTypes            []chunkenc.ValueType
 	MissingReceiverWindows bool
+	// ReplicaScrapeOffset shifts the samples of the i-th PromReplica by i
+	// times this much, as HA replicas scraping at different moments do.
+	// Zero keeps the replicas in lockstep.
+	ReplicaScrapeOffset time.Duration
 }
 
 // CorpusBlock is one uploaded block of the corpus.
@@ -156,7 +160,15 @@ func BuildCorpus(t *testing.T, name string, tenants []TenantSpec) *Corpus {
 				if rcv != "" {
 					b.Set(tn.ExternalReplicaLabel, rcv)
 				}
-				id, err := e2eutil.CreateBlock(ctx, dir, series, tn.Samples, mint, maxt, b.Labels(), 0, metadata.NoneFunc, tn.SampleTypes)
+				var id ulid.ULID
+				var err error
+				if tn.ReplicaScrapeOffset > 0 {
+					id, err = e2eutil.CreateBlockWithSampleOffsets(ctx, dir, series, tn.Samples, mint, maxt, b.Labels(), func(lset labels.Labels) int64 {
+						return int64(slices.Index(promReplicas, lset.Get(tn.SeriesReplicaLabel))) * tn.ReplicaScrapeOffset.Milliseconds()
+					})
+				} else {
+					id, err = e2eutil.CreateBlock(ctx, dir, series, tn.Samples, mint, maxt, b.Labels(), 0, metadata.NoneFunc, tn.SampleTypes)
+				}
 				testutil.Ok(t, err)
 				c.Blocks = append(c.Blocks, CorpusBlock{
 					ID: id, Dir: filepath.Join(dir, id.String()), Tenant: tn.Name, Window: w, Mark: tn.NoCompact[w],

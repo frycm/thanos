@@ -305,3 +305,68 @@ func TestLocalPlanExecutorDeduplicatesSeriesReplicas(t *testing.T) {
 	testutil.Equals(t, uint64(20), pm.Stats.NumSeries)
 	testutil.Equals(t, 0, len(pm.Thanos.SeriesReplicaLabels))
 }
+
+// queryTimePenalty is what a querier's penalty deduplication returns for the
+// replicas, offered in the given order.
+func queryTimePenalty(t *testing.T, lset labels.Labels, replicas ...[]chunks.Sample) []string {
+	t.Helper()
+	var series []storage.Series
+	for _, r := range replicas {
+		series = append(series, storage.NewListSeries(lset, r))
+	}
+	set := dedup.NewSeriesSet(&listSeriesSet{series: series}, "", dedup.AlgorithmPenalty)
+	var out []string
+	for set.Next() {
+		it := set.At().Iterator(nil)
+		for it.Next() != chunkenc.ValNone {
+			ts, v := it.At()
+			out = append(out, fmt.Sprintf("%d/%v", ts, v))
+		}
+		testutil.Ok(t, it.Err())
+	}
+	testutil.Ok(t, set.Err())
+	slices.Sort(out)
+	return out
+}
+
+// TestDeduplicatingBlockPopulatorAfterAGap pins down what compaction-time
+// penalty deduplication does after a gap, which differs from a querier
+// reading across a chunk group boundary. The merger deduplicates each group
+// of overlapping chunks on its own, starting afresh. After A's gap the first
+// window continues with B, as a querier does; the second window starts
+// again from A, where a querier reading both windows at once stays with B.
+// Each window is exactly what a querier returns for that window alone, and
+// every sample is a real one.
+func TestDeduplicatingBlockPopulatorAfterAGap(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	lset := func(r string) labels.Labels { return labels.FromStrings("__name__", "up", "replica", r) }
+	window := func(from int64, gap bool) (a, b []chunks.Sample) {
+		for ts := from; ts < from+3600; ts += 15 {
+			if !gap || ts < from+1200 || ts >= from+2400 {
+				a = append(a, floatSample{t: ts * 1000, f: 1})
+			}
+			b = append(b, floatSample{t: ts*1000 + 5000, f: 2})
+		}
+		return a, b
+	}
+	a1, b1 := window(0, true)
+	a2, b2 := window(3600, false)
+	w1 := writeBlock(t, dir, storage.NewListSeries(lset("A"), a1), storage.NewListSeries(lset("B"), b1))
+	w2 := writeBlock(t, dir, storage.NewListSeries(lset("A"), a2), storage.NewListSeries(lset("B"), b2))
+
+	comp, err := tsdb.NewLeveledCompactor(ctx, nil, slog.Default(), []int64{time.Hour.Milliseconds(), 2 * time.Hour.Milliseconds()}, chunkenc.NewPool(), dedup.NewChunkSeriesMerger())
+	testutil.Ok(t, err)
+	out := t.TempDir()
+	ids, err := comp.CompactWithBlockPopulator(out, []string{w1, w2}, nil, DeduplicatingBlockPopulator{ReplicaLabels: []string{"replica"}})
+	testutil.Ok(t, err)
+	content, _, _ := blockContent(t, out, ids[0])
+
+	stripped := labels.FromStrings("__name__", "up")
+	perWindow := append(queryTimePenalty(t, stripped, a1, b1), queryTimePenalty(t, stripped, a2, b2)...)
+	slices.Sort(perWindow)
+	testutil.Equals(t, map[string][]string{stripped.String(): perWindow}, content)
+
+	across := queryTimePenalty(t, stripped, append(slices.Clone(a1), a2...), append(slices.Clone(b1), b2...))
+	testutil.Assert(t, !slices.Equal(across, perWindow), "a querier reading across the windows stays with B; if it no longer does, the documentation is wrong")
+}

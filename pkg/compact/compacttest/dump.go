@@ -22,17 +22,21 @@ import (
 	"github.com/go-kit/log"
 	"github.com/oklog/ulid/v2"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
 	"github.com/prometheus/prometheus/tsdb/index"
+	"github.com/prometheus/prometheus/util/annotations"
 	"github.com/thanos-io/objstore"
 
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/compact/downsample"
+	"github.com/thanos-io/thanos/pkg/dedup"
 	"github.com/thanos-io/thanos/pkg/errors"
 	"github.com/thanos-io/thanos/pkg/logutil"
 )
@@ -340,42 +344,139 @@ func (d *BucketDump) Without(ext func(string) bool) *BucketDump {
 	return out
 }
 
-// replicaCandidates is what a querier deduplicating by the given labels -
-// external or series labels alike - could serve from the dump: for every
-// series without those labels, per resolution and aggregate, the samples its
-// replicas hold at each timestamp.
-func (d *BucketDump) replicaCandidates(replicaLabels []string) map[string]map[downsample.AggrType]map[int64][]Sample {
-	out := map[string]map[downsample.AggrType]map[int64][]Sample{}
-	for k, byAggr := range d.Series {
+// replicaGroups groups the dump's series the way a querier deduplicating by
+// the given labels - external or series labels alike - sees them: per
+// resolution and labels without the replica labels, the samples of every
+// replica, per aggregate.
+func (d *BucketDump) replicaGroups(replicaLabels []string) map[string][]map[downsample.AggrType][]Sample {
+	out := map[string][]map[downsample.AggrType][]Sample{}
+	keys := make([]string, 0, len(d.Series))
+	for k := range d.Series {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
 		dk := d.keys[k]
 		key := fmt.Sprintf("res=%d series=%s", dk.res, labels.NewBuilder(dk.lset).Del(replicaLabels...).Labels().String())
-		if out[key] == nil {
-			out[key] = map[downsample.AggrType]map[int64][]Sample{}
-		}
-		for at, samples := range byAggr {
-			if out[key][at] == nil {
-				out[key][at] = map[int64][]Sample{}
-			}
-			for _, s := range samples {
-				if !slices.Contains(out[key][at][s.T], s) {
-					out[key][at][s.T] = append(out[key][at][s.T], s)
+		out[key] = append(out[key], d.Series[k])
+	}
+	return out
+}
+
+// penaltySequences returns every sequence the querier's penalty
+// deduplication yields for the replicas, one per order they may reach it in:
+// the querier's replica order follows the order responses arrive in, so any
+// order is legitimate. The algorithm decides by timestamps alone, so each
+// sample is fed to it as its index and mapped back, which lets histogram and
+// aggregate samples through unchanged.
+func penaltySequences(t *testing.T, replicas [][]Sample) map[string][]Sample {
+	t.Helper()
+	testutil.Assert(t, len(replicas) <= 6, "%d replicas of one series; the permutations would be too many", len(replicas))
+	out := map[string][]Sample{}
+	lset := labels.FromStrings("__name__", "replica")
+	var permute func(order []int, rest []int)
+	permute = func(order, rest []int) {
+		if len(rest) == 0 {
+			var all []Sample
+			series := make([]storage.Series, 0, len(order))
+			for _, r := range order {
+				var encoded []chunks.Sample
+				for _, s := range replicas[r] {
+					encoded = append(encoded, indexSample{t: s.T, i: len(all)})
+					all = append(all, s)
 				}
+				series = append(series, storage.NewListSeries(lset, encoded))
 			}
+			set := dedup.NewSeriesSet(&seriesList{series: series}, "", dedup.AlgorithmPenalty)
+			var seq []Sample
+			for set.Next() {
+				it := set.At().Iterator(nil)
+				for it.Next() != chunkenc.ValNone {
+					_, v := it.At()
+					seq = append(seq, all[int(v)])
+				}
+				testutil.Ok(t, it.Err())
+			}
+			testutil.Ok(t, set.Err())
+			// A lone series passes through the querier untouched, while the
+			// algorithm only moves forward in time; a counter aggregate
+			// chunk ends with the raw series' last sample, which may not.
+			// Drop what does not move forward on both paths alike.
+			seq = forwardOnly(seq)
+			out[fmt.Sprint(seq)] = seq
+			return
+		}
+		for i, r := range rest {
+			next := append(append([]int{}, rest[:i]...), rest[i+1:]...)
+			permute(append(append([]int{}, order...), r), next)
+		}
+	}
+	idx := make([]int, len(replicas))
+	for i := range idx {
+		idx[i] = i
+	}
+	permute(nil, idx)
+	return out
+}
+
+func forwardOnly(seq []Sample) []Sample {
+	out := seq[:0:0]
+	for _, s := range seq {
+		if len(out) == 0 || s.T > out[len(out)-1].T {
+			out = append(out, s)
 		}
 	}
 	return out
 }
 
+type indexSample struct {
+	t int64
+	i int
+}
+
+func (s indexSample) T() int64                      { return s.t }
+func (s indexSample) F() float64                    { return float64(s.i) }
+func (s indexSample) H() *histogram.Histogram       { return nil }
+func (s indexSample) FH() *histogram.FloatHistogram { return nil }
+func (s indexSample) Type() chunkenc.ValueType      { return chunkenc.ValFloat }
+func (s indexSample) Copy() chunks.Sample           { return s }
+
+type seriesList struct {
+	series []storage.Series
+	i      int
+}
+
+func (s *seriesList) Next() bool                        { s.i++; return s.i <= len(s.series) }
+func (s *seriesList) At() storage.Series                { return s.series[s.i-1] }
+func (s *seriesList) Err() error                        { return nil }
+func (s *seriesList) Warnings() annotations.Annotations { return nil }
+
 // AssertSameDeduplicated fails unless a querier deduplicating by the given
-// labels serves the same series from both dumps, at the same timestamps, and
-// every sample it can serve from got is one it could serve from want. Which
-// replica's sample wins a timestamp both replicas have is left open: the
-// querier's own choice depends on the order responses arrive in, and a
-// compaction that deduplicates series replicas makes its own, fixed one.
-func AssertSameDeduplicated(t *testing.T, want, got *BucketDump, replicaLabels []string, what string) {
+// labels, with the penalty algorithm, serves the same series from both dumps
+// and, for each series and aggregate, some order of want's replicas yields
+// exactly the sequence some order of got's replicas yields. Whole sequences
+// are compared, so a result that alternates between replicas where the
+// algorithm would stay with one does not pass.
+//
+// With window zero the whole time range is read at once. Compaction-time
+// penalty deduplication satisfies that only where the replicas' chunks line
+// up, as for replicas scraping in lockstep: the compactor deduplicates each
+// group of overlapping chunks on its own - for HA replicas written through
+// the same receivers, one block window - starting afresh, where a querier
+// reading across groups carries its state on. With a window, raw samples are
+// compared window by window, each read alone, which is what compaction
+// matches for replicas scraping at different moments; aggregates of
+// downsampled blocks, which span many windows, are then not compared.
+func AssertSameDeduplicated(t *testing.T, want, got *BucketDump, replicaLabels []string, window time.Duration, what string) {
 	t.Helper()
-	w, g := want.replicaCandidates(replicaLabels), got.replicaCandidates(replicaLabels)
-	var diffs []string
+	if diffs := deduplicatedDifferences(t, want, got, replicaLabels, window); len(diffs) > 0 {
+		t.Fatalf("%s: deduplicated content differs:\n  %s", what, strings.Join(diffs, "\n  "))
+	}
+}
+
+func deduplicatedDifferences(t *testing.T, want, got *BucketDump, replicaLabels []string, window time.Duration) []string {
+	t.Helper()
+	w, g := want.replicaGroups(replicaLabels), got.replicaGroups(replicaLabels)
 	keys := map[string]struct{}{}
 	for k := range w {
 		keys[k] = struct{}{}
@@ -388,6 +489,7 @@ func AssertSameDeduplicated(t *testing.T, want, got *BucketDump, replicaLabels [
 		sorted = append(sorted, k)
 	}
 	sort.Strings(sorted)
+	var diffs []string
 	for _, k := range sorted {
 		ws, gs := w[k], g[k]
 		switch {
@@ -399,22 +501,34 @@ func AssertSameDeduplicated(t *testing.T, want, got *BucketDump, replicaLabels [
 			continue
 		}
 		for _, at := range append([]downsample.AggrType{AggrRaw}, AggrTypes...) {
-			wt, gt := ws[at], gs[at]
-			if len(wt) != len(gt) {
-				diffs = append(diffs, fmt.Sprintf("%s aggr %d: %d timestamps, want %d", k, at, len(gt), len(wt)))
+			of := func(replicas []map[downsample.AggrType][]Sample) [][]Sample {
+				var out [][]Sample
+				for _, r := range replicas {
+					if len(r[at]) > 0 {
+						out = append(out, r[at])
+					}
+				}
+				return out
+			}
+			if window > 0 && at != AggrRaw {
 				continue
 			}
-			for ts, cands := range gt {
-				allowed, ok := wt[ts]
-				if !ok {
-					diffs = append(diffs, fmt.Sprintf("%s aggr %d: unexpected timestamp %d", k, at, ts))
-					break
-				}
-				for _, s := range cands {
-					if !slices.Contains(allowed, s) {
-						diffs = append(diffs, fmt.Sprintf("%s aggr %d at %d: %+v is no replica's sample (want one of %+v)", k, at, ts, s, allowed))
+			wr, gr := of(ws), of(gs)
+			if len(wr) == 0 && len(gr) == 0 {
+				continue
+			}
+			for _, part := range windows(append(append([][]Sample{}, wr...), gr...), window) {
+				wseq, gseq := penaltySequences(t, within(wr, part)), penaltySequences(t, within(gr, part))
+				matched := false
+				for s := range gseq {
+					if _, ok := wseq[s]; ok {
+						matched = true
 						break
 					}
+				}
+				if !matched {
+					diffs = append(diffs, fmt.Sprintf("%s aggr %d in [%d, %d): no replica order serves the same sequence (%d from got, %d from want); first difference: %s", k, at, part[0], part[1], len(gseq), len(wseq), firstDifference(gseq, wseq)))
+					break
 				}
 			}
 		}
@@ -422,9 +536,60 @@ func AssertSameDeduplicated(t *testing.T, want, got *BucketDump, replicaLabels [
 			break
 		}
 	}
-	if len(diffs) > 0 {
-		t.Fatalf("%s: deduplicated content differs:\n  %s", what, strings.Join(diffs, "\n  "))
+	return diffs
+}
+
+// windows returns the time ranges to compare: the whole range for a zero
+// window, otherwise every window-aligned range holding a sample.
+func windows(replicas [][]Sample, window time.Duration) [][2]int64 {
+	if window <= 0 {
+		return [][2]int64{{math.MinInt64, math.MaxInt64}}
 	}
+	w := window.Milliseconds()
+	seen := map[int64]struct{}{}
+	for _, r := range replicas {
+		for _, s := range r {
+			seen[s.T-((s.T%w)+w)%w] = struct{}{}
+		}
+	}
+	var out [][2]int64
+	for start := range seen {
+		out = append(out, [2]int64{start, start + w})
+	}
+	slices.SortFunc(out, func(a, b [2]int64) int { return int(a[0] - b[0]) })
+	return out
+}
+
+// within returns the replicas' samples in [part[0], part[1]), dropping
+// replicas with none.
+func within(replicas [][]Sample, part [2]int64) [][]Sample {
+	var out [][]Sample
+	for _, r := range replicas {
+		var in []Sample
+		for _, s := range r {
+			if s.T >= part[0] && s.T < part[1] {
+				in = append(in, s)
+			}
+		}
+		if len(in) > 0 {
+			out = append(out, in)
+		}
+	}
+	return out
+}
+
+func firstDifference(got, want map[string][]Sample) string {
+	for _, g := range got {
+		for _, w := range want {
+			for i := range min(len(g), len(w)) {
+				if g[i] != w[i] {
+					return fmt.Sprintf("at %d got %+v, want %+v", i, g[i], w[i])
+				}
+			}
+			return fmt.Sprintf("got %d samples, want %d", len(g), len(w))
+		}
+	}
+	return "no sequence"
 }
 
 // AssertNoOverlaps checks that within one external label set and resolution

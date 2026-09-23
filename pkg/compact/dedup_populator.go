@@ -76,9 +76,12 @@ func NormalizeSeriesReplicaLabels(names []string) []string {
 // penalty merger keeps the samples of the chunk it merges the others into,
 // and gives ties between chunks with the same time range to the series
 // offered first, so a fixed order is what makes the output depend on the
-// sources alone and not on how a heap happened to settle. Either choice is a
-// sample one replica really has; query-time deduplication, whose replica
-// order follows the order responses arrive in, may pick the other.
+// sources alone and not on how a heap happened to settle. The merger runs
+// the penalty algorithm on each group of overlapping chunks on its own - for
+// replicas written through the same receivers, one block window - so each
+// window holds what a querier reading that window alone returns; a querier
+// reading across windows carries its state on and may stay with another
+// replica. Every sample kept is one a replica really has.
 //
 // Optionally the populator writes one partition of the series only, like
 // PartitionedBlockPopulator; the partition must then leave the replica labels
