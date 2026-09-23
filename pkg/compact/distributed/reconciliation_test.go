@@ -252,7 +252,9 @@ func TestParkedSourcesRemainParkedWhenPlanGrows(t *testing.T) {
 func TestFinalizeRetriesTransientMetadataReads(t *testing.T) {
 	for _, persistent := range []bool{false, true} {
 		t.Run(map[bool]string{false: "recovers", true: "bounded failure"}[persistent], func(t *testing.T) {
-			c := newTestCluster(t)
+			// Nothing renews the lease here, so it must outlast the task on a
+			// slow runner, or the ownership check aborts it.
+			c := newTestClusterConf(t, ManagerConfig{LeaseTTL: time.Minute})
 			cg, metas := c.makeGroup(labels.FromStrings("tenant", "retry"))
 			comp, err := tsdb.NewLeveledCompactor(t.Context(), nil, logutil.GoKitLogToSlog(c.logger), []int64{1000, 3000}, downsample.NewPool(), nil)
 			testutil.Ok(t, err)

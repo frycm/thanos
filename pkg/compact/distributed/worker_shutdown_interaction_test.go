@@ -39,7 +39,9 @@ func TestWorkerShutdownAtExecutionStages(t *testing.T) {
 				continue
 			}
 			t.Run(string(taskType)+"/"+stage, func(t *testing.T) {
-				c := newTestCluster(t)
+				// Nothing renews the lease here, so it must outlast the task
+				// on a slow runner, or the ownership check aborts first.
+				c := newTestClusterConf(t, ManagerConfig{LeaseTTL: time.Minute})
 				cg, metas := c.makeGroup(labels.FromStrings("ext", "1"))
 				task, err := CompactionTask(cg, compact.Plan{Sources: metas})
 				testutil.Ok(t, err)
