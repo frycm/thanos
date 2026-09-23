@@ -755,3 +755,58 @@ func TestPlanScopesCoverageByExternalLabels(t *testing.T) {
 	testutil.Equals(t, 1, len(got))
 	testutil.Equals(t, raw2, got[0].Meta.ULID)
 }
+
+// TestPlanStuckBlocksPerShard: the shards of a compaction split by series
+// share their sources and time range and differ only in the compactor's shard
+// label, so each is a block stream of its own. Waivers, coverage and fences
+// must hold per shard: a downsampled shard covers only itself, and a fence in
+// one shard's group fences nothing in another's.
+func TestPlanStuckBlocksPerShard(t *testing.T) {
+	shardMeta := func(id ulid.ULID, res, mint, maxt int64, shard string, sources ...ulid.ULID) *metadata.Meta {
+		m := planMeta(id, res, mint, maxt, sources...)
+		m.Thanos.Labels = map[string]string{"tenant": "a"}
+		if shard != "" {
+			// The label block splitting (frycm/thanos#11) puts on its shards.
+			m.Thanos.Labels["__compactor_shard__"] = shard
+		}
+		return m
+	}
+	src := ulid.MustNew(100, nil)
+
+	t.Run("marked shards are waived each, and covered each", func(t *testing.T) {
+		s1, s2, d1 := ulid.MustNew(1, nil), ulid.MustNew(2, nil), ulid.MustNew(3, nil)
+		metas := map[ulid.ULID]*metadata.Meta{
+			s1: shardMeta(s1, ResLevel0, 0, 100, "1_of_2", src),
+			s2: shardMeta(s2, ResLevel0, 0, 100, "2_of_2", src),
+		}
+		marks := map[ulid.ULID]*metadata.NoCompactMark{
+			s1: noCompactMark(s1, metadata.IndexSizeExceedingNoCompactReason),
+			s2: noCompactMark(s2, metadata.IndexSizeExceedingNoCompactReason),
+		}
+		got, err := Plan(metas, marks, nil, true)
+		testutil.Ok(t, err)
+		testutil.Assert(t, planned(got, s1) && planned(got, s2), "both marked shards are waived: %v", got)
+
+		metas[d1] = shardMeta(d1, ResLevel1, 0, 100, "1_of_2", src)
+		got, err = Plan(metas, marks, nil, true)
+		testutil.Ok(t, err)
+		testutil.Assert(t, !planned(got, s1) && planned(got, s2), "shard 1's downsampled block covers shard 1 only: %v", got)
+	})
+	t.Run("fences hold within one shard's group", func(t *testing.T) {
+		f1, b1, f2, b2 := ulid.MustNew(1, nil), ulid.MustNew(2, nil), ulid.MustNew(3, nil), ulid.MustNew(4, nil)
+		metas := map[ulid.ULID]*metadata.Meta{
+			f1: shardMeta(f1, ResLevel0, 0, 100, "1_of_2"),
+			b1: shardMeta(b1, ResLevel0, 200, 300, "1_of_2", src),
+			f2: shardMeta(f2, ResLevel0, 400, 500, "1_of_2"),
+			b2: shardMeta(b2, ResLevel0, 200, 300, "2_of_2", src),
+		}
+		marks := map[ulid.ULID]*metadata.NoCompactMark{
+			f1: noCompactMark(f1, metadata.IndexSizeExceedingNoCompactReason),
+			f2: noCompactMark(f2, metadata.IndexSizeExceedingNoCompactReason),
+		}
+		got, err := Plan(metas, marks, nil, true)
+		testutil.Ok(t, err)
+		testutil.Assert(t, planned(got, f1) && planned(got, b1) && planned(got, f2), "shard 1's fenced block and its fences are waived: %v", got)
+		testutil.Assert(t, !planned(got, b2), "shard 2's block with the same sources and range is not fenced in: %v", got)
+	})
+}

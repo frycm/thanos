@@ -794,7 +794,7 @@ func (cc *compactConfig) registerFlag(cmd extkingpin.FlagClause) {
 	cmd.Flag("downsampling.disable", "Disables downsampling. This is not recommended "+
 		"as querying long time ranges without non-downsampled data is not efficient and useful e.g it is not possible to render all samples for a human eye anyway").
 		Default("false").BoolVar(&cc.disableDownsampling)
-	cmd.Flag("downsampling.enable-stuck-blocks", "Experimental. Allow downsampling below the normal minimum block span when permanent index-size no-compact marks prove that blocks cannot grow. Applies in standalone and manager modes.").
+	cmd.Flag("downsampling.enable-stuck-blocks", "Experimental. Allow downsampling below the normal minimum block span when index-size no-compact marks prove that blocks cannot grow.").
 		Default("false").BoolVar(&cc.enableStuckBlockDownsampling)
 
 	strategies := strings.Join([]string{string(concurrentDiscovery), string(recursiveDiscovery)}, ", ")

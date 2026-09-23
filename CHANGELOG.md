@@ -19,6 +19,7 @@ It is recommend to upgrade the storage components first (Receive, Store, etc.) a
 ### Added
 
 - [#4](https://github.com/frycm/thanos/issues/4) Compactor: blocks record the set of blocks their compaction produced in `thanos.output` of `meta.json`, and replace their sources only once the whole set is in the bucket. The compactor and `tools bucket downsample` withhold blocks whose set is incomplete, counted as `state="unpublished"` in `thanos_blocks_meta_synced`; retention still applies to them. Block repair and `tools bucket rewrite` keep the set with the new block in the original's place.
+- [#6](https://github.com/frycm/thanos/issues/6) Compactor: experimental `--downsampling.enable-stuck-blocks` (also on `tools bucket downsample`) downsamples blocks below the minimum span for their resolution when index-size no-compact marks prove they can no longer grow: a marked block itself, or the last compactable block fenced in by marked ones. `tools bucket downsample` gains `--deduplication.replica-label`, to plan against the same groups as the compactor, and now honours no-downsample marks.
 
 ### Changed
 

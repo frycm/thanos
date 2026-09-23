@@ -166,9 +166,9 @@ Compactor downsampling is done in two passes:
 1) All raw resolution metrics that are older than **40 hours** are downsampled at a 5m resolution
 2) All 5m resolution metrics older than **10 days** are downsampled at a 1h resolution
 
-The experimental `--downsampling.enable-stuck-blocks` flag defaults to `false`. When enabled, blocks below the usual minimum time span can also be downsampled if permanent index-size no-compact marks prove that they cannot grow. This includes an isolated block with such a mark and the last compactable block between permanent fences when the reachable window is too short. Overlapping blocks, other no-compact reasons, and no-downsample marks still prevent the exception. Both raw-to-5m and 5m-to-1h planning use the same policy.
+The experimental `--downsampling.enable-stuck-blocks` flag defaults to `false`. When enabled, blocks below the usual minimum time span can also be downsampled if index-size no-compact marks prove that they cannot grow. This includes an isolated block with such a mark and the last compactable block between permanent fences when the reachable window is too short. Overlapping blocks, other no-compact reasons, and no-downsample marks still prevent the exception. Both raw-to-5m and 5m-to-1h planning use the same policy.
 
-This flag works with `thanos compact` in standalone or manager mode and with `thanos tools bucket downsample`. Set it on the manager when using workers; workers execute the manager's tasks. The bucket downsampling command must use the same `--deduplication.replica-label` values as the compactor for its block groups to agree. Leaving the flag off preserves the compactor's existing downsampling eligibility; normal downsampling remains enabled unless `--downsampling.disable` is set. Disabling the new flag later stops new stuck-block exceptions but leaves already produced blocks in the bucket.
+This flag works with `thanos compact` and with `thanos tools bucket downsample`. The compactor never removes an index-size mark, but an operator may, for instance when block splitting can take such blocks; a block waived before that grows on afterwards, and the downsampled block it got early is superseded by the grown block's. The bucket downsampling command must use the same `--deduplication.replica-label` values as the compactor for its block groups to agree. Leaving the flag off preserves the compactor's existing downsampling eligibility; normal downsampling remains enabled unless `--downsampling.disable` is set. Disabling the new flag later stops new stuck-block exceptions but leaves already produced blocks in the bucket.
 
 > **NOTE:** If retention at each resolution is lower than minimum age for the successive downsampling pass, data will be deleted before downsampling can be completed. As a rule of thumb retention for each downsampling level should be the same, and should be greater than the maximum date range (10 days for 5m to 1h downsampling).
 
@@ -355,10 +355,8 @@ Flags:
                                 a human eye anyway
       --[no-]downsampling.enable-stuck-blocks
                                 Experimental. Allow downsampling below the
-                                normal minimum block span when permanent
-                                index-size no-compact marks prove that blocks
-                                cannot grow. Applies in standalone and manager
-                                modes.
+                                normal minimum block span when index-size
+                                no-compact marks prove that blocks cannot grow.
       --block-discovery-strategy="concurrent"
                                 One of concurrent, recursive. When set to
                                 concurrent, stores will concurrently issue

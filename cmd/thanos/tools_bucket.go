@@ -261,7 +261,7 @@ func (tbc *bucketRewriteConfig) registerBucketRewriteFlag(cmd extkingpin.FlagCla
 }
 
 func (tbc *bucketDownsampleConfig) registerBucketDownsampleFlag(cmd extkingpin.FlagClause) {
-	cmd.Flag("downsampling.enable-stuck-blocks", "Experimental. Allow downsampling below the normal minimum block span when permanent index-size no-compact marks prove that blocks cannot grow.").
+	cmd.Flag("downsampling.enable-stuck-blocks", "Experimental. Allow downsampling below the normal minimum block span when index-size no-compact marks prove that blocks cannot grow.").
 		Default("false").BoolVar(&tbc.enableStuckBlockDownsampling)
 	cmd.Flag("wait-interval", "Wait interval between downsample runs.").
 		Default("5m").DurationVar(&tbc.waitInterval)
@@ -273,9 +273,8 @@ func (tbc *bucketDownsampleConfig) registerBucketDownsampleFlag(cmd extkingpin.F
 		Default("./data").StringVar(&tbc.dataDir)
 	cmd.Flag("hash-func", "Specify which hash function to use when calculating the hashes of produced files. If no function has been specified, it does not happen. This permits avoiding downloading some files twice albeit at some performance cost. Possible values are: \"\", \"SHA256\".").
 		Default("").EnumVar(&tbc.hashFunc, "SHA256", "")
-	cmd.Flag("deduplication.replica-label", "Set to the same value(s) as on the compactor. The compactor plans against a view with these labels removed, and the downsample planner has to compute the same compaction groups to judge which blocks are permanently stuck below the downsample range; with different views the two components reach opposite verdicts for the same bucket. Downsampled blocks produced by this command are written without these labels, as the compactor writes them.").
+	cmd.Flag("deduplication.replica-label", "Set to the same value(s) as on the compactor. The compactor plans against a view with these labels removed, and the downsample planner has to compute the same compaction groups to judge which blocks are stuck below the downsample range; with different views the two components reach opposite verdicts for the same bucket. Downsampled blocks produced by this command are written without these labels, as the compactor writes them.").
 		StringsVar(&tbc.dedupReplicaLabels)
-
 }
 
 func (tbc *bucketMarkBlockConfig) registerBucketMarkBlockFlag(cmd extkingpin.FlagClause) *bucketMarkBlockConfig {

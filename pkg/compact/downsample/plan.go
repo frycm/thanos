@@ -70,8 +70,8 @@ func Plan(metas map[ulid.ULID]*metadata.Meta, noCompactMarked map[ulid.ULID]*met
 
 	ids := slices.SortedFunc(maps.Keys(metas), func(a, b ulid.ULID) int { return a.Compare(b) })
 
-	// Group membership is needed only to judge stuck blocks, and only permanent
-	// (index-size) no-compact marks make a block provably final, so the whole
+	// Group membership is needed only to judge stuck blocks, and only
+	// index-size no-compact marks make a block provably final, so the whole
 	// waiver machinery - including the per-block GroupKey hashing - is skipped
 	// when no such mark is in view. GroupKey includes the resolution, so fences
 	// and siblings never cross resolution levels.
@@ -81,20 +81,20 @@ func Plan(metas map[ulid.ULID]*metadata.Meta, noCompactMarked map[ulid.ULID]*met
 	// removal also removes the data the fence would have protected, so nothing
 	// is silently starved by that.
 	byGroup := map[string][]*metadata.Meta{}
-	permanentlyMarked := func(id ulid.ULID) bool {
+	indexSizeMarked := func(id ulid.ULID) bool {
 		mark, ok := noCompactMarked[id]
 		return ok && mark.Reason == metadata.IndexSizeExceedingNoCompactReason
 	}
-	havePermanentMarks := false
+	haveIndexSizeMarks := false
 	if enableStuckBlocks {
 		for id := range noCompactMarked {
-			if permanentlyMarked(id) {
-				havePermanentMarks = true
+			if indexSizeMarked(id) {
+				haveIndexSizeMarks = true
 				break
 			}
 		}
 	}
-	if havePermanentMarks {
+	if haveIndexSizeMarks {
 		for _, m := range metas {
 			key := m.Thanos.GroupKey()
 			byGroup[key] = append(byGroup[key], m)
@@ -113,9 +113,9 @@ func Plan(metas map[ulid.ULID]*metadata.Meta, noCompactMarked map[ulid.ULID]*met
 
 		// Only an index-size mark establishes that a block cannot grow safely.
 		// Other marks (for example out-of-order chunks) must not acquire the
-		// short-block waiver merely because permanent fences surround them.
+		// short-block waiver merely because index-size fences surround them.
 		_, marked := noCompactMarked[id]
-		waiverAllowed := !marked || permanentlyMarked(id)
+		waiverAllowed := !marked || indexSizeMarked(id)
 
 		switch m.Thanos.Downsample.Resolution {
 		case ResLevel2:
@@ -129,7 +129,7 @@ func Plan(metas map[ulid.ULID]*metadata.Meta, noCompactMarked map[ulid.ULID]*met
 			// NOTE(fabxc): this must match with at which block size the compactor creates downsampled
 			// blocks. Otherwise we may never downsample some data.
 			if m.MaxTime-m.MinTime < ResLevel1DownsampleRange &&
-				(!waiverAllowed || !havePermanentMarks || !stuckBelowRange(m, permanentlyMarked, byGroup, ResLevel1DownsampleRange)) {
+				(!waiverAllowed || !haveIndexSizeMarks || !stuckBelowRange(m, indexSizeMarked, byGroup, ResLevel1DownsampleRange)) {
 				continue
 			}
 			candidates = append(candidates, Candidate{Meta: m, TargetResolution: ResLevel1})
@@ -139,7 +139,7 @@ func Plan(metas map[ulid.ULID]*metadata.Meta, noCompactMarked map[ulid.ULID]*met
 				continue
 			}
 			if m.MaxTime-m.MinTime < ResLevel2DownsampleRange &&
-				(!waiverAllowed || !havePermanentMarks || !stuckBelowRange(m, permanentlyMarked, byGroup, ResLevel2DownsampleRange)) {
+				(!waiverAllowed || !haveIndexSizeMarks || !stuckBelowRange(m, indexSizeMarked, byGroup, ResLevel2DownsampleRange)) {
 				continue
 			}
 			candidates = append(candidates, Candidate{Meta: m, TargetResolution: ResLevel2})
@@ -152,7 +152,9 @@ func Plan(metas map[ulid.ULID]*metadata.Meta, noCompactMarked map[ulid.ULID]*met
 // of the ladder registered in cmd/thanos/compact.go). The planner aligns its
 // buckets to absolute multiples of this range, so no merge ever crosses such a
 // boundary - which both bounds how far a fenced block can grow and lets the
-// fence window be clamped to the block's own bucket.
+// fence window be clamped to the block's own bucket. It is an upper bound:
+// --debug.max-compaction-level can only cut the ladder short, which shrinks
+// the windows merges can reach and never lets a block grow past this one.
 const maxCompactionRange = int64(14 * 24 * 60 * 60 * 1000)
 
 // stuckBelowRange reports whether the block is final - the compactor can
@@ -160,11 +162,16 @@ const maxCompactionRange = int64(14 * 24 * 60 * 60 * 1000)
 // downsample range tr, so waiting for it to grow is pointless.
 //
 // Only a no-compact mark for exceeding the index size makes a block final by
-// itself: any other reason (out-of-order chunks, manual) is removable, and a
-// block whose mark might be lifted is left alone - downsampling it early would
-// leave overlapping downsampled outputs behind once it grows.
+// itself: any other reason (out-of-order chunks, manual) is routinely lifted,
+// and a block whose mark might be lifted is left alone - downsampling it early
+// would leave overlapping downsampled outputs behind once it grows. The
+// compactor never lifts an index-size mark; an operator may, as the block
+// splitting rollout does once splitting can take such blocks. A block waived
+// before that grows on afterwards, and its early downsampled block, whose
+// sources the grown block's downsampled output also holds, is superseded by
+// that output.
 //
-// An unmarked block is final when permanently marked blocks of its own group
+// An unmarked block is final when index-size marked blocks of its own group
 // fence it in on both sides, the reachable window between them is below tr,
 // and it is the LAST still-compactable block inside that window. The last
 // condition is what makes the waiver safe rather than merely plausible: any
@@ -198,11 +205,11 @@ const maxCompactionRange = int64(14 * 24 * 60 * 60 * 1000)
 // tr across such a boundary is unreachable, and the block is stuck all the
 // same. The block itself may reach past the bucket - vertical merges are not
 // aligned - so siblings are tested against the window widened to the block's
-// own extent. Blocks at the edge of the group (no permanent mark on one side)
+// own extent. Blocks at the edge of the group (no index-size mark on one side)
 // are never considered stuck - old data cannot arrive to grow the oldest run,
 // but distinguishing that from a slowly backfilling stream is not worth the
 // risk of downsampling prematurely.
-func stuckBelowRange(m *metadata.Meta, permanentlyMarked func(ulid.ULID) bool, byGroup map[string][]*metadata.Meta, tr int64) bool {
+func stuckBelowRange(m *metadata.Meta, indexSizeMarked func(ulid.ULID) bool, byGroup map[string][]*metadata.Meta, tr int64) bool {
 	group := byGroup[m.Thanos.GroupKey()]
 
 	// Whatever the block's own state, an overlapping sibling means it is not
@@ -219,7 +226,7 @@ func stuckBelowRange(m *metadata.Meta, permanentlyMarked func(ulid.ULID) bool, b
 		return false
 	}
 
-	if permanentlyMarked(m.ULID) {
+	if indexSizeMarked(m.ULID) {
 		return true
 	}
 
@@ -228,7 +235,7 @@ func stuckBelowRange(m *metadata.Meta, permanentlyMarked func(ulid.ULID) bool, b
 		havePrev, haveNext        bool
 	)
 	for _, b := range group {
-		if !permanentlyMarked(b.ULID) {
+		if !indexSizeMarked(b.ULID) {
 			continue
 		}
 		if b.MaxTime <= m.MinTime && (!havePrev || b.MaxTime > prevMax) {
@@ -265,7 +272,7 @@ func stuckBelowRange(m *metadata.Meta, permanentlyMarked func(ulid.ULID) bool, b
 	lo, hi = min(lo, m.MinTime), max(hi, m.MaxTime)
 	runStart := max(prevMin, bucketStart)
 	for _, b := range group {
-		if b.ULID == m.ULID || permanentlyMarked(b.ULID) {
+		if b.ULID == m.ULID || indexSizeMarked(b.ULID) {
 			continue
 		}
 		if b.MinTime < hi && (lo < b.MaxTime || b.MinTime >= runStart) {
