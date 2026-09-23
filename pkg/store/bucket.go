@@ -1681,6 +1681,12 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, seriesSrv storepb.Store
 		}
 	}
 
+	if warning := s.belowResolutionWarning(req, matchers, reqBlockMatchers); warning != nil {
+		if err := srv.Send(storepb.NewWarnSeriesResponse(warning)); err != nil {
+			return status.Error(codes.Unknown, errors.Wrap(err, "send series response").Error())
+		}
+	}
+
 	s.mtx.RLock()
 	for _, bs := range s.blockSets {
 		blockMatchers, ok := bs.labelMatchers(matchers...)

@@ -4,6 +4,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -37,4 +38,7 @@ func TestStoreFlags_BlockResolutionValidation(t *testing.T) {
 	testutil.NotOk(t, validateBlockResolutions(time.Minute, time.Hour), "a minimum that is not a downsampling level hides nothing and must be refused")
 	testutil.NotOk(t, validateBlockResolutions(0, 2*time.Hour), "a maximum that is not a downsampling level must be refused")
 	testutil.NotOk(t, validateBlockResolutions(time.Hour, 5*time.Minute), "min above max must be refused")
+
+	err := validateBlockResolutions(time.Minute, time.Hour)
+	testutil.Assert(t, strings.Contains(err.Error(), "use one of 0s, 5m, 1h"), "the error must name the levels as durations: %v", err)
 }

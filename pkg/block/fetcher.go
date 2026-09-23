@@ -837,6 +837,20 @@ func (f *ResolutionMetaFilter) MinimumResolution() int64 {
 	return f.minResolution
 }
 
+// Hidden returns the blocks below the minimum resolution the latest fetch hid
+// behind covers at the minimum. A request for data finer than the minimum
+// gets nothing for their ranges, unless the store loaded them back as
+// fallbacks.
+func (f *ResolutionMetaFilter) Hidden() []*metadata.Meta {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	hidden := make([]*metadata.Meta, 0, len(f.fallbacks))
+	for _, m := range f.fallbacks {
+		hidden = append(hidden, m)
+	}
+	return hidden
+}
+
 // Reporter returns the filter that reports (gauge and log) the blocks below
 // the minimum resolution still being served. It removes nothing. It has to run
 // LAST, after the time partition in particular: the resolution filter keeps a
@@ -859,18 +873,22 @@ func (f *ResolutionMetaFilter) Filter(_ context.Context, metas map[ulid.ULID]*me
 	}
 
 	// Sources of the retained blocks at exactly the minimum resolution, per
-	// external label set - the only level guaranteed reachable for every
-	// accepted query (see the type comment). The label keying is a deliberate
-	// defense, not bookkeeping: source ULIDs can recur across label sets when
-	// a lineage was relabeled (thanos tools bucket rewrite), and coverage from
-	// another label set would hide a block whose own labels then lose the
-	// range. Unlike the deduplicate filter's single-parent rule, coverage may
-	// be assembled from several blocks together, since serving is per range,
-	// not per parent. Note that replica labels stripped by a compactor mean a
-	// pre-deduplication raw block never matches its deduplicated cover's label
-	// set; such blocks stay served (fail open) until the compactor deletes
-	// them, which is the transient, safe direction.
-	var minLevelSources map[string]metadata.SourceCoverage
+	// block stream - the only level guaranteed reachable for every accepted
+	// query (see the type comment). The stream keying is a deliberate defense,
+	// not bookkeeping: source ULIDs can recur across label sets when a lineage
+	// was relabeled (thanos tools bucket rewrite), and coverage from another
+	// label set would hide a block whose own labels then lose the range. A
+	// stream is a label set without the compactor's shard label: the shards
+	// of a block split by series hold its series between them, so they cover
+	// it together, and a coarser block covers each of its shards (see
+	// resolutionCoverage). Unlike the deduplicate filter's single-parent rule,
+	// coverage may be assembled from several blocks together, since serving is
+	// per range, not per parent. Note that replica labels stripped by a
+	// compactor mean a pre-deduplication raw block never matches its
+	// deduplicated cover's label set; such blocks stay served (fail open)
+	// until the compactor deletes them, which is the transient, safe
+	// direction.
+	var minLevelSources resolutionCoverage
 	if f.minResolution > 0 {
 		minLevelSources = coverageAtResolution(metas, f.minResolution)
 	}
@@ -882,8 +900,7 @@ func (f *ResolutionMetaFilter) Filter(_ context.Context, metas map[ulid.ULID]*me
 			// Hidden unconditionally: the finer blocks it was built from are
 			// served elsewhere.
 		case res < f.minResolution:
-			sources := minLevelSources[labels.FromMap(m.Thanos.Labels).String()]
-			if !sources.Covers(m, m.MinTime, m.MaxTime-1) {
+			if !minLevelSources.covers(m) {
 				// Kept and served; Reporter accounts for it.
 				continue
 			}
@@ -892,7 +909,7 @@ func (f *ResolutionMetaFilter) Filter(_ context.Context, metas map[ulid.ULID]*me
 				f.covers = map[ulid.ULID]*metadata.Meta{}
 			}
 			f.fallbacks[id] = m
-			for _, cover := range sources.CoveringBlocks(m, m.MinTime, m.MaxTime-1) {
+			for _, cover := range minLevelSources.coveringBlocks(m) {
 				if c, ok := metas[cover]; ok {
 					f.covers[cover] = c
 				}
@@ -904,23 +921,6 @@ func (f *ResolutionMetaFilter) Filter(_ context.Context, metas map[ulid.ULID]*me
 		delete(metas, id)
 	}
 	return nil
-}
-
-// coverageAtResolution indexes the sources of the blocks at exactly the given
-// resolution, per external label set.
-func coverageAtResolution(metas map[ulid.ULID]*metadata.Meta, resolution int64) map[string]metadata.SourceCoverage {
-	coverage := map[string]metadata.SourceCoverage{}
-	for _, m := range metas {
-		if m.Thanos.Downsample.Resolution != resolution {
-			continue
-		}
-		key := labels.FromMap(m.Thanos.Labels).String()
-		if coverage[key] == nil {
-			coverage[key] = metadata.SourceCoverage{}
-		}
-		coverage[key].Add(m)
-	}
-	return coverage
 }
 
 // Replaces reports whether the block, at the minimum resolution, hid at least
@@ -963,7 +963,7 @@ func (f *ResolutionMetaFilter) FallbacksFor(retained map[ulid.ULID]*metadata.Met
 	coverage := coverageAtResolution(trusted, f.minResolution)
 	fallbacks := map[ulid.ULID]*metadata.Meta{}
 	for id, m := range hidden {
-		if !coverage[labels.FromMap(m.Thanos.Labels).String()].Covers(m, m.MinTime, m.MaxTime-1) {
+		if !coverage.covers(m) {
 			fallbacks[id] = m
 		}
 	}

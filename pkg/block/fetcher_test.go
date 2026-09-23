@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"math/rand"
 	"os"
 	"path"
@@ -1815,4 +1816,89 @@ func TestResolutionMetaFilter_CoverageAcrossTheTimePartition(t *testing.T) {
 	}
 	testutil.Equals(t, 2, len(input))
 	testutil.Equals(t, 1.0, promtest.ToFloat64(gauge))
+}
+
+// TestResolutionMetaFilter_ShardsCoverTheirStream: the compactor splits big
+// compactions into shard blocks that carry a shard label, one label set per
+// shard. A block is covered through its own shard, through a coarser shard
+// holding it, or through finer shards that together hold all of it - never
+// through part of its series, and never through another stream.
+func TestResolutionMetaFilter_ShardsCoverTheirStream(t *testing.T) {
+	const res5m = int64(300000)
+	stream := func(shard string) map[string]string {
+		if shard == "" {
+			return map[string]string{"tenant": "1"}
+		}
+		return map[string]string{"tenant": "1", compactorShardLabel: shard}
+	}
+	raw := func(shard string) *metadata.Meta {
+		m := resFilterMeta(0, stream(shard), ULIDs(1, 2)...)
+		m.ULID = ULID(1)
+		return m
+	}
+	covers := func(shards ...string) map[ulid.ULID]*metadata.Meta {
+		metas := map[ulid.ULID]*metadata.Meta{}
+		for i, s := range shards {
+			// A shard of a compaction lists every source of the plan.
+			m := resFilterMeta(res5m, stream(s), ULIDs(1, 2, 3)...)
+			m.ULID = ULID(100 + i)
+			metas[m.ULID] = m
+		}
+		return metas
+	}
+	for _, tc := range []struct {
+		name    string
+		block   *metadata.Meta
+		covers  map[ulid.ULID]*metadata.Meta
+		covered bool
+	}{
+		{name: "unsplit by unsplit", block: raw(""), covers: covers(""), covered: true},
+		{name: "unsplit by every shard", block: raw(""), covers: covers("1_of_2", "2_of_2"), covered: true},
+		{name: "unsplit by shards of mixed counts", block: raw(""), covers: covers("1_of_2", "2_of_4", "4_of_4"), covered: true},
+		{name: "unsplit by one shard of two", block: raw(""), covers: covers("1_of_2"), covered: false},
+		{name: "unsplit by shards missing one", block: raw(""), covers: covers("1_of_2", "2_of_4"), covered: false},
+		{name: "a shard by the same shard", block: raw("1_of_4"), covers: covers("1_of_4"), covered: true},
+		{name: "a shard by the unsplit block", block: raw("1_of_4"), covers: covers(""), covered: true},
+		{name: "a shard by a coarser shard holding it", block: raw("3_of_4"), covers: covers("1_of_2"), covered: true},
+		{name: "a shard by a coarser shard not holding it", block: raw("2_of_4"), covers: covers("1_of_2"), covered: false},
+		{name: "a shard by its finer shards", block: raw("1_of_2"), covers: covers("1_of_4", "3_of_4"), covered: true},
+		{name: "a shard by finer shards of its sibling", block: raw("1_of_2"), covers: covers("2_of_4", "4_of_4"), covered: false},
+		{name: "a malformed shard label is a stream of its own", block: raw("x"), covers: covers(""), covered: false},
+		{name: "a malformed shard label covers only itself", block: raw("x"), covers: covers("x"), covered: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := NewResolutionMetaFilter(log.NewNopLogger(), res5m, res5m, nil)
+			metas := maps.Clone(tc.covers)
+			metas[ULID(1)] = tc.block
+			m := newTestFetcherMetrics()
+			testutil.Ok(t, f.Filter(context.Background(), metas, m.Synced, nil))
+			_, served := metas[ULID(1)]
+			testutil.Equals(t, tc.covered, !served)
+			if tc.covered {
+				// The covers it hides behind are the ones verified before
+				// it is retired.
+				replaces := 0
+				for id := range tc.covers {
+					if f.Replaces(id) {
+						replaces++
+					}
+				}
+				testutil.Assert(t, replaces > 0, "some cover must be recorded as replacing the block")
+				// Once no cover is usable, the block comes back.
+				testutil.Equals(t, 1, len(f.FallbacksFor(metas, func(*metadata.Meta) bool { return false })))
+				testutil.Equals(t, 0, len(f.FallbacksFor(metas, func(*metadata.Meta) bool { return true })))
+			}
+		})
+	}
+
+	// Another stream's shards cover nothing here.
+	f := NewResolutionMetaFilter(log.NewNopLogger(), res5m, res5m, nil)
+	metas := map[ulid.ULID]*metadata.Meta{
+		ULID(1):   raw(""),
+		ULID(100): resFilterMeta(res5m, map[string]string{"tenant": "2", compactorShardLabel: "1_of_2"}, ULIDs(1, 2)...),
+		ULID(101): resFilterMeta(res5m, map[string]string{"tenant": "2", compactorShardLabel: "2_of_2"}, ULIDs(1, 2)...),
+	}
+	testutil.Ok(t, f.Filter(context.Background(), metas, newTestFetcherMetrics().Synced, nil))
+	_, served := metas[ULID(1)]
+	testutil.Equals(t, true, served)
 }

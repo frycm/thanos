@@ -245,7 +245,6 @@ func (sc *storeConfig) registerFlag(cmd extkingpin.FlagClause) {
 	sc.reqLogConfig = extkingpin.RegisterRequestLoggingFlags(cmd)
 }
 
-// registerStore registers a store command.
 // validateBlockResolutions rejects resolution bounds that do not name a level
 // the compactor produces: an unknown minimum would hide nothing, load every
 // raw block and report all of them as uncovered, silently.
@@ -263,6 +262,7 @@ func validateBlockResolutions(minResolution, maxResolution time.Duration) error 
 	return nil
 }
 
+// registerStore registers a store command.
 func registerStore(app *extkingpin.App) {
 	cmd := app.Command(component.Store.String(), "Store node giving access to blocks in a bucket provider. Now supported GCS, S3, Azure, Swift, Tencent COS and Aliyun OSS.")
 
@@ -452,7 +452,12 @@ func runStore(
 		// window - one deletion-mark lookup per out-of-window block per sync,
 		// same as the compactor pays. BucketStore reports uncovered blocks after
 		// loading replacements and restoring any fallbacks that are still needed.
-		filters = append(filters, resolutionFilter, timePartitionFilter)
+		// Without a minimum nothing is covered, and the window can go first.
+		if minBlockResolution > 0 {
+			filters = append(filters, resolutionFilter, timePartitionFilter)
+		} else {
+			filters = append(append([]block.MetadataFilter{timePartitionFilter}, filters...), resolutionFilter)
+		}
 	} else {
 		filters = append([]block.MetadataFilter{timePartitionFilter}, filters...)
 	}

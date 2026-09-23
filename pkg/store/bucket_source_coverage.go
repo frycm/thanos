@@ -7,6 +7,7 @@ import (
 	"cmp"
 	"context"
 	"slices"
+	"time"
 
 	"github.com/go-kit/log/level"
 	"github.com/oklog/ulid/v2"
@@ -16,6 +17,7 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 
 	"github.com/thanos-io/thanos/pkg/block/metadata"
+	"github.com/thanos-io/thanos/pkg/store/storepb"
 )
 
 // fallbackFilterGauge receives the counts of the filters re-run on fallback
@@ -154,4 +156,62 @@ func (s *bucketBlockSet) getForSourceCoverage(mint, maxt, maxResolution int64, m
 		return cmp.Or(cmp.Compare(a.meta.MinTime, b.meta.MinTime), cmp.Compare(a.meta.MaxTime, b.meta.MaxTime))
 	})
 	return result
+}
+
+// belowResolutionWarning returns the warning for a request asking for data
+// finer than the minimum resolution whose answer misses data, or nil. The
+// block set never substitutes coarser blocks for finer ones, so such a
+// request gets nothing for the ranges of the blocks the resolution filter hid
+// behind covers at the minimum. A request whose range this store serves only
+// from blocks it kept uncovered, or loaded back as fallbacks, gets a complete
+// answer and no warning: a warning there would fail it needlessly under a
+// strict partial response strategy.
+func (s *BucketStore) belowResolutionWarning(req *storepb.SeriesRequest, matchers, blockMatchers []*labels.Matcher) error {
+	if s.resolutionFilter == nil {
+		return nil
+	}
+	floor := s.resolutionFilter.MinimumResolution()
+	if floor <= 0 || req.MaxResolutionWindow >= floor {
+		return nil
+	}
+	missing := 0
+	for _, m := range s.resolutionFilter.Hidden() {
+		if m.MinTime > req.MaxTime || m.MaxTime <= req.MinTime {
+			continue
+		}
+		if s.getBlock(m.ULID) != nil {
+			continue
+		}
+		if !metaMatches(m, matchers, blockMatchers) {
+			continue
+		}
+		missing++
+	}
+	if missing == 0 {
+		return nil
+	}
+	return errors.Errorf(
+		"this store serves blocks downsampled to %s or coarser (--min-block-resolution), but the request asks for finer data (max_source_resolution=%s); "+
+			"%d block(s) in the requested range are served only at %[1]s, so their ranges are missing from this answer; "+
+			"raise the query's max_source_resolution, enable --query.auto-downsampling on the querier, or route the query to a store serving finer blocks",
+		time.Duration(floor)*time.Millisecond, time.Duration(req.MaxResolutionWindow)*time.Millisecond, missing)
+}
+
+// metaMatches reports whether a block the store does not hold could answer
+// the request: its external labels agree with every matcher naming one of
+// them, as a block set's labels do, and it passes the request's block
+// matchers.
+func metaMatches(m *metadata.Meta, matchers, blockMatchers []*labels.Matcher) bool {
+	lset := labels.FromMap(m.Thanos.Labels)
+	for _, matcher := range matchers {
+		if v := lset.Get(matcher.Name); v != "" && !matcher.Matches(v) {
+			return false
+		}
+	}
+	for _, matcher := range blockMatchers {
+		if !matcher.Matches(lset.Get(matcher.Name)) {
+			return false
+		}
+	}
+	return true
 }
