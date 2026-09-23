@@ -117,7 +117,7 @@ func TestPlanStuckBlocksRequireOptIn(t *testing.T) {
 				left:  noCompactMark(left, metadata.IndexSizeExceedingNoCompactReason),
 				right: noCompactMark(right, metadata.IndexSizeExceedingNoCompactReason),
 			}
-			// Both permanently marked and fenced short blocks must wait with
+			// Both index-size marked and fenced short blocks must wait with
 			// the feature off. Normal downsampling remains enabled.
 			for _, enabled := range []bool{false, true, false} {
 				got, err := Plan(metas, marks, nil, enabled)
@@ -361,7 +361,7 @@ func TestPlanWaitsForFencedSiblingsToMergeFirst(t *testing.T) {
 
 // TestPlanWaitsWhileAnOverlappingSiblingCanStillGrow pins down the vertical
 // compaction case: "the planner never merges across a marked block" does not
-// hold for overlapping blocks, so a fenced or even permanently-marked block
+// hold for overlapping blocks, so a fenced or even index-size-marked block
 // with an overlapping still-compactable sibling is not final - the sibling's
 // merge will span this data again and be downsampled a second time.
 func TestPlanWaitsWhileAnOverlappingSiblingCanStillGrow(t *testing.T) {
@@ -387,7 +387,7 @@ func TestPlanWaitsWhileAnOverlappingSiblingCanStillGrow(t *testing.T) {
 		testutil.Assert(t, c.Meta.ULID != mid, "a fenced block with an overlapping compactable sibling must keep waiting")
 	}
 
-	// The same guard protects a permanently marked block itself.
+	// The same guard protects a index-size marked block itself.
 	marks[mid] = noCompactMark(mid, metadata.IndexSizeExceedingNoCompactReason)
 	got, err = Plan(metas, marks, nil, true)
 	testutil.Ok(t, err)
@@ -396,11 +396,11 @@ func TestPlanWaitsWhileAnOverlappingSiblingCanStillGrow(t *testing.T) {
 	}
 }
 
-// TestPlanFencesOnlyOnPermanentMarks pins down that removable no-compact marks
+// TestPlanFencesOnlyOnIndexSizeMarks pins down that removable no-compact marks
 // (manual, out-of-order chunks) never act as fences: the mark can be lifted,
 // the fenced block then grows, and its early downsample would overlap the
 // grown block's.
-func TestPlanFencesOnlyOnPermanentMarks(t *testing.T) {
+func TestPlanFencesOnlyOnIndexSizeMarks(t *testing.T) {
 	left := ulid.MustNew(1, nil)
 	mid := ulid.MustNew(2, nil)
 	right := ulid.MustNew(3, nil)
@@ -493,7 +493,7 @@ func planned(got []Candidate, id ulid.ULID) bool {
 }
 
 // TestPlanNeverWaivesOverlappingFinalBlocks pins down that two final blocks
-// overlapping each other - a fenced replica block next to a permanently
+// overlapping each other - a fenced replica block next to an index-size
 // marked one, or two marked ones - are both left raw. Each is provably done,
 // but waiving both would leave two 5m blocks with the same labels and
 // disjoint sources over one range: the deduplication filter hides neither,

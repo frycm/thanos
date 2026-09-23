@@ -857,7 +857,7 @@ func TestDownsampleProgressCountsStuckBlocks(t *testing.T) {
 	testutil.Ok(t, plain.ProgressCalculate(t.Context(), groups))
 	testutil.Equals(t, 0.0, promtestutil.ToFloat64(plain.NumberOfBlocksDownsampled))
 
-	// A permanent no-compact mark only adds work when the feature is enabled.
+	// An index-size no-compact mark only adds work when the feature is enabled.
 	marks := map[ulid.ULID]*metadata.NoCompactMark{
 		stuck: {ID: stuck, Version: metadata.NoCompactMarkVersion1, Reason: metadata.IndexSizeExceedingNoCompactReason},
 	}
