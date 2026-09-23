@@ -860,6 +860,12 @@ Example Receive useful external labels:
 * Cluster, environment, zone, so target origin e.g `receive_cluster="eu-west1-production-1"` or `receive_cluster="1",receive_env="production",receive_region="us-west1"`
 * Tenancy information e.g `tenant="organizationABC"`
 
+##### Output sets
+
+A block may record the set of blocks it was produced with in `thanos.output`: its `index` among the `count` outputs its compaction planned, and the ULIDs of every block in the set (`blocks`). A compaction whose plan names several outputs - one per shard of a split, say - or siblings records it. Such blocks replace the blocks they were made from only as a set: until every block of the set is in the bucket, the sources are the only complete copy of the data, and no block of the set supersedes them. A block is published by its own complete set, or by another block's complete set that names it. Only a set that names its holder counts; tools that copy a block under a new ULID, such as `tools bucket rewrite` and block repair, rename the copy into the set.
+
+The compactor withholds unpublished blocks from everything it plans, and counts them under `state="unpublished"` in `thanos_blocks_meta_synced`; retention still applies to them. Store gateways serve them, since their data is a subset of the sources they serve too.
+
 #### Index Format (index)
 
 > NOTE: Currently supported index file versions: v1 and v2
