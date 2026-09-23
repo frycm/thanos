@@ -59,8 +59,12 @@ func (s *Scheduler) persistSnapshot(ctx context.Context, snap journalSnapshot) e
 	}
 	// A manager that was stopped writes nothing more: its successor may
 	// already own the journal, and a store that ignores the context would
-	// let the write through.
+	// let the write through. The scheduler's lifetime covers the callers
+	// that have no context of their own to pass.
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := s.lifetime.Err(); err != nil {
 		return err
 	}
 

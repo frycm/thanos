@@ -139,7 +139,7 @@ func TestRejectedOutputsNeverRetireTheSources(t *testing.T) {
 		// The entry outlives the retention while the block does, and
 		// maintenance finishes the deletion once the bucket allows it.
 		testutil.Equals(t, 0, sched.journal.Prune(0, sched.journal.Tasks["t1"].UpdatedAt.Add(1e12)))
-		testutil.Equals(t, true, sched.cleanupOutputsLocked(ctx))
+		testutil.Ok(t, sched.deleteRejectedOutputs(ctx))
 		exists, err = inner.Exists(ctx, path.Join(id, block.MetaFilename))
 		testutil.Ok(t, err)
 		testutil.Equals(t, false, exists)
@@ -196,32 +196,44 @@ func TestOutputPublished(t *testing.T) {
 // TestMaintenanceRejectsUnverifiedOutputs: a task reported completed whose
 // outputs were never verified - the manager stopped in between - has them
 // rejected once no verification can still come, so that the plan is redone
-// and the stale outputs never supersede the sources.
+// and the stale outputs never supersede the sources. Only blocks whose own
+// metadata says they were made for the task are deleted: the list of outputs
+// is the worker's word, and a block ID it named could be a source of the plan.
 func TestMaintenanceRejectsUnverifiedOutputs(t *testing.T) {
 	ctx := context.Background()
 	bkt := objstore.NewInMemBucket()
 	sched := testScheduler(t, bkt, ManagerConfig{})
-	id := ulid.MustNew(5, nil)
+	id, source := ulid.MustNew(5, nil), ulid.MustNew(6, nil)
 	m := resultMeta(id, 200, 0, map[string]string{"ext": "1"})
 	m.Version, m.Thanos.Version = metadata.TSDBVersion1, metadata.ThanosVersion1
+	ext, err := (Provenance{TaskID: "t1", TaskType: TaskCompaction, JournalID: sched.conf.JournalID}).For(id, nil).Stamp(nil)
+	testutil.Ok(t, err)
+	m.Thanos.Extensions = ext
 	uploadResultMeta(t, bkt, m)
-	sched.journal.Tasks["t1"] = &TaskEntry{State: StateCompleted, Outputs: []string{id.String()}}
+	src := resultMeta(source, 200, 0, map[string]string{"ext": "1"})
+	src.Version, src.Thanos.Version = metadata.TSDBVersion1, metadata.ThanosVersion1
+	uploadResultMeta(t, bkt, src)
+	sched.journal.Tasks["t1"] = &TaskEntry{State: StateCompleted, Outputs: []string{id.String(), source.String()}}
+
+	exists := func(id ulid.ULID) bool {
+		ok, err := bkt.Exists(ctx, path.Join(id.String(), block.MetaFilename))
+		testutil.Ok(t, err)
+		return ok
+	}
 
 	// While the plan that submitted the task is verifying the result, the
 	// outputs are its business alone, however long it takes.
 	sched.verifying["t1"] = struct{}{}
-	testutil.Equals(t, false, sched.cleanupOutputsLocked(ctx))
-	exists, err := bkt.Exists(ctx, path.Join(id.String(), block.MetaFilename))
-	testutil.Ok(t, err)
-	testutil.Equals(t, true, exists)
+	testutil.Ok(t, sched.Maintain())
+	testutil.Equals(t, true, exists(id))
+	testutil.Equals(t, 2, len(sched.journal.Tasks["t1"].Outputs))
 
 	// Nobody verifying - the manager that received the report is gone.
 	sched.VerificationDone("t1")
-	testutil.Equals(t, true, sched.cleanupOutputsLocked(ctx))
+	testutil.Ok(t, sched.Maintain())
 	e := sched.journal.Tasks["t1"]
 	testutil.Equals(t, 0, len(e.Outputs))
-	testutil.Equals(t, 0, len(e.RejectedOutputs), "deleted right away")
-	exists, err = bkt.Exists(ctx, path.Join(id.String(), block.MetaFilename))
-	testutil.Ok(t, err)
-	testutil.Equals(t, false, exists)
+	testutil.Equals(t, 0, len(e.RejectedOutputs), "settled right away")
+	testutil.Equals(t, false, exists(id), "the task's own block is deleted")
+	testutil.Equals(t, true, exists(source), "a block the worker named but that is not the task's is left alone")
 }

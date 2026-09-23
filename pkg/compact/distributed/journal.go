@@ -32,9 +32,11 @@ const (
 	StatePending TaskState = "pending"
 	// StateLeased is currently held by a worker.
 	StateLeased TaskState = "leased"
-	// StateCompleted finished and the output was verified in the bucket.
+	// StateCompleted finished and its worker reported the outputs. Whether the
+	// manager has verified them is TaskEntry.Verified.
 	StateCompleted TaskState = "completed"
-	// StateFailed exhausted its attempts with a reported failure.
+	// StateFailed exhausted its attempts with a reported failure, or was
+	// still unfinished when another manager took the journal over.
 	StateFailed TaskState = "failed"
 	// StateAbandoned repeatedly lost workers or exhausted its abort budget. It is not
 	// retried automatically, so that a task that kills workers cannot spin
@@ -224,9 +226,12 @@ func WriteJournal(ctx context.Context, bkt objstore.Bucket, j *Journal) error {
 func (j *Journal) Prune(retention time.Duration, now time.Time) int {
 	pruned := 0
 	for id, e := range j.Tasks {
-		// An entry still naming rejected outputs guards the bucket against
-		// them: pruned, they would count as published again.
-		if e.State.Terminal() && len(e.RejectedOutputs) == 0 && now.Sub(e.UpdatedAt) > retention {
+		// An entry still naming rejected outputs, or outputs nobody verified,
+		// guards the bucket against them: pruned, they would count as
+		// published. Maintenance rejects unverified outputs first, but a
+		// takeover prunes before any maintenance has run.
+		unverified := e.State == StateCompleted && !e.Verified && len(e.Outputs) > 0
+		if e.State.Terminal() && !unverified && len(e.RejectedOutputs) == 0 && now.Sub(e.UpdatedAt) > retention {
 			delete(j.Tasks, id)
 			pruned++
 		}

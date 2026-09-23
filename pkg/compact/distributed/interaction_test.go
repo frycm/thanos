@@ -487,7 +487,7 @@ func TestInteractionManagerTakeoverStopsOldWork(t *testing.T) {
 		return c.journalTask(StateLeased) != nil
 	})
 
-	// A new manager takes over; the old task is dropped from the journal, and
+	// A new manager takes over; the old task ends as a failed tombstone, and
 	// the old executor dies with the old manager. Then let w1 keep going.
 	c.restartManager()
 	release()
@@ -503,7 +503,10 @@ func TestInteractionManagerTakeoverStopsOldWork(t *testing.T) {
 		testutil.Ok(t, err)
 		testutil.Equals(t, false, ok)
 	}
-	testutil.Equals(t, 0, len(c.journal().Tasks))
+	for id, e := range c.journal().Tasks {
+		testutil.Equals(t, StateFailed, e.State, "task %s", id)
+		testutil.Assert(t, e.Lease == nil, "task %s must hold no lease", id)
+	}
 }
 
 // TestInteractionTwoWorkersTwoGroups runs two plans for two groups against two

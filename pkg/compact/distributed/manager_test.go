@@ -183,16 +183,19 @@ func TestSchedulerTakeoverVoidsOldLeases(t *testing.T) {
 	leased, err := first.Lease(ctx, LeaseRequest{WorkerID: "w1"})
 	testutil.Ok(t, err)
 
-	// A new manager takes over the same journal. The unfinished task is dropped
-	// rather than carried over: the new manager replans it, and carrying it in
-	// the journal would only leak it, since nothing would ever lease it.
+	// A new manager takes over the same journal. The unfinished task is not
+	// carried over: the new manager replans it. It stays only as a failed
+	// tombstone, so that blocks its worker may still upload stay unpublished.
 	second := testScheduler(t, bkt, ManagerConfig{})
 	testutil.Assert(t, second.Generation() > first.Generation(), "expected the generation to be bumped")
 
 	j, err := ReadJournal(ctx, bkt, "shard-a")
 	testutil.Ok(t, err)
-	_, carried := j.Tasks["t1"]
-	testutil.Assert(t, !carried, "an unfinished task must not survive a takeover")
+	testutil.Equals(t, StateFailed, j.Tasks["t1"].State, "an unfinished task must not survive a takeover as work")
+	testutil.Assert(t, j.Tasks["t1"].Lease == nil, "its lease must be gone")
+	again, err := second.Lease(ctx, LeaseRequest{WorkerID: "w2"})
+	testutil.Ok(t, err)
+	testutil.Assert(t, again == nil, "nothing is handed out again")
 
 	// The worker of the previous manager can no longer prove it owns the task.
 	got, _ := CheckOwnership(ctx, bkt, "shard-a", "t1", leased.LeaseToken, leased.Generation, 0)

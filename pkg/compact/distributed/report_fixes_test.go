@@ -21,6 +21,7 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/thanos-io/objstore"
 
+	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/compact"
 )
@@ -130,12 +131,15 @@ func TestSchedulerDeliversTerminalClassesImmediately(t *testing.T) {
 	}
 }
 
-// TestSchedulerTakeoverDropsUnfinishedTasks asserts a restarting manager drops
-// pending and leased journal entries instead of carrying them: the new
-// scheduler's queue starts empty, so carried entries could never be leased and,
-// being non-terminal, would never be pruned either. Terminal entries stay for
-// observability until their retention expires.
-func TestSchedulerTakeoverDropsUnfinishedTasks(t *testing.T) {
+// TestSchedulerTakeoverEndsUnfinishedTasks asserts a restarting manager ends
+// pending and leased journal entries instead of carrying them as work: the
+// new scheduler's queue starts empty, and it replans. They stay as failed
+// tombstones, which are terminal and age out with the retention: a worker
+// that passed its ownership check before the takeover may still upload a
+// block for such a task, and the tombstone keeps that block unpublished
+// instead of letting an unknown task vouch for it. Terminal entries stay as
+// they were until their retention expires.
+func TestSchedulerTakeoverEndsUnfinishedTasks(t *testing.T) {
 	ctx := context.Background()
 	bkt := objstore.NewInMemBucket()
 
@@ -145,19 +149,67 @@ func TestSchedulerTakeoverDropsUnfinishedTasks(t *testing.T) {
 	j.Tasks["leased"] = &TaskEntry{Task: Task{ID: "leased"}, State: StateLeased,
 		Lease: &Lease{WorkerID: "w1", Token: "tok", Generation: 4, ExpiresAt: now.Add(time.Minute)}, UpdatedAt: now}
 	j.Tasks["pending"] = &TaskEntry{Task: Task{ID: "pending"}, State: StatePending, UpdatedAt: now}
-	j.Tasks["done"] = &TaskEntry{Task: Task{ID: "done"}, State: StateCompleted, UpdatedAt: now}
+	j.Tasks["done"] = &TaskEntry{Task: Task{ID: "done"}, State: StateCompleted, Verified: true, UpdatedAt: now}
 	testutil.Ok(t, WriteJournal(ctx, bkt, j))
 
-	_ = testScheduler(t, bkt, ManagerConfig{})
+	sched := testScheduler(t, bkt, ManagerConfig{})
 
 	got, err := ReadJournal(ctx, bkt, "shard-a")
 	testutil.Ok(t, err)
-	_, ok := got.Tasks["leased"]
-	testutil.Assert(t, !ok, "a leased task must be dropped at takeover")
-	_, ok = got.Tasks["pending"]
-	testutil.Assert(t, !ok, "a pending task must be dropped at takeover")
-	_, ok = got.Tasks["done"]
-	testutil.Assert(t, ok, "a completed task must survive until its retention expires")
+	for _, id := range []string{"leased", "pending"} {
+		e := got.Tasks[id]
+		testutil.Equals(t, StateFailed, e.State, "task %s", id)
+		testutil.Assert(t, e.Lease == nil, "task %s must hold no lease", id)
+	}
+	testutil.Equals(t, StateCompleted, got.Tasks["done"].State, "a completed task must survive until its retention expires")
+	leased, err := sched.Lease(ctx, LeaseRequest{WorkerID: "w2"})
+	testutil.Ok(t, err)
+	testutil.Assert(t, leased == nil, "nothing unfinished is handed out again")
+
+	// A block the old worker uploads after the takeover is not published, and
+	// maintenance deletes it once the deduplication filter comes across it.
+	id := ulid.MustNew(7, nil)
+	m := resultMeta(id, 200, 0, map[string]string{"ext": "1"})
+	m.Version, m.Thanos.Version = metadata.TSDBVersion1, metadata.ThanosVersion1
+	ext, err := (Provenance{TaskID: "leased", TaskType: TaskCompaction, JournalID: "shard-a", Generation: 4}).For(id, nil).Stamp(nil)
+	testutil.Ok(t, err)
+	m.Thanos.Extensions = ext
+	uploadResultMeta(t, bkt, m)
+	testutil.Equals(t, false, sched.PublishedFunc()(&m))
+	testutil.Ok(t, sched.Maintain())
+	exists, err := bkt.Exists(ctx, path.Join(id.String(), block.MetaFilename))
+	testutil.Ok(t, err)
+	testutil.Equals(t, false, exists)
+
+	// The tombstones age out like any other finished task.
+	sched.journal.Prune(time.Minute, time.Now().Add(time.Hour))
+	for _, id := range []string{"leased", "pending"} {
+		_, kept := sched.journal.Tasks[id]
+		testutil.Assert(t, !kept, "tombstone %s must age out", id)
+	}
+}
+
+// TestTakeoverKeepsUnverifiedOutputsPastTheRetention asserts that a task
+// reported completed but never verified survives a takeover's pruning
+// however old it is, so that maintenance rejects its outputs instead of the
+// outputs counting as published once their task is forgotten.
+func TestTakeoverKeepsUnverifiedOutputsPastTheRetention(t *testing.T) {
+	ctx := context.Background()
+	bkt := objstore.NewInMemBucket()
+
+	j := NewJournal("shard-a", "")
+	old := time.Now().Add(-48 * time.Hour)
+	j.Tasks["reported"] = &TaskEntry{Task: Task{ID: "reported"}, State: StateCompleted, Outputs: []string{"b1"}, UpdatedAt: old}
+	j.Tasks["verified"] = &TaskEntry{Task: Task{ID: "verified"}, State: StateCompleted, Verified: true, Outputs: []string{"b2"}, UpdatedAt: old}
+	testutil.Ok(t, WriteJournal(ctx, bkt, j))
+
+	sched := testScheduler(t, bkt, ManagerConfig{JournalRetention: time.Hour})
+	_, kept := sched.journal.Tasks["reported"]
+	testutil.Assert(t, kept, "an unverified result must not be pruned before its outputs are rejected")
+	testutil.Equals(t, false, sched.OutputPublished("reported", "b1"))
+	_, kept = sched.journal.Tasks["verified"]
+	testutil.Assert(t, !kept, "a verified result ages out")
+	testutil.Equals(t, true, sched.OutputPublished("verified", "b2"))
 }
 
 // --- verifyAndFinalize provenance ---

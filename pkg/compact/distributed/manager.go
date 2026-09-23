@@ -178,6 +178,11 @@ type pendingTask struct {
 // Scheduler owns the task queue and the leases. It is the only writer of the
 // journal.
 type Scheduler struct {
+	// lifetime is the context the manager runs under. Once it is done the
+	// manager has stopped, and the scheduler writes nothing more to the
+	// bucket: a successor may already own the journal.
+	lifetime context.Context
+
 	logger log.Logger
 	bkt    objstore.Bucket
 	conf   ManagerConfig
@@ -215,7 +220,8 @@ type Scheduler struct {
 
 // NewScheduler takes ownership of the shard's journal, bumping its generation so
 // that leases handed out by a previous manager are void, and returns a scheduler
-// ready to hand tasks to workers.
+// ready to hand tasks to workers. The context is the manager's lifetime: once
+// it is done, the scheduler writes nothing more to the bucket.
 func NewScheduler(ctx context.Context, logger log.Logger, bkt objstore.Bucket, reg prometheus.Registerer, conf ManagerConfig) (*Scheduler, error) {
 	conf.applyDefaults()
 	if conf.JournalID == "" {
@@ -243,25 +249,36 @@ func NewScheduler(ctx context.Context, logger log.Logger, bkt objstore.Bucket, r
 		return nil, err
 	}
 
-	// Taking ownership voids every lease from an older generation, and drops
+	// Taking ownership voids every lease from an older generation, and ends
 	// every task that never finished. Planning is idempotent, so this manager
 	// will replan any work that was in flight, and a worker still executing an
-	// old task fails its ownership check and discards the work. Keeping the old
-	// entries would only leak them: nothing would ever lease or prune them.
+	// old task fails its ownership check and discards the work - unless it
+	// passed the check just before the takeover and is still uploading. Its
+	// blocks were never verified, so the task stays in the journal as a failed
+	// tombstone: a block stamped with it is unpublished, maintenance deletes
+	// it once the manager's deduplication filter comes across it, and the
+	// entry ages out with the retention like any other finished task.
 	j.Generation++
 	j.Owner = ownerID
-	for id, e := range j.Tasks {
-		if !e.State.Terminal() {
-			delete(j.Tasks, id)
+	now := time.Now()
+	for _, e := range j.Tasks {
+		if e.State.Terminal() {
+			continue
 		}
+		e.State = StateFailed
+		e.Lease = nil
+		e.Outputs, e.OutputChecksums = nil, nil
+		e.LastError = &TaskError{Outcome: OutcomeAbortedOwnershipLost, Message: fmt.Sprintf("unfinished when generation %d took over the journal", j.Generation)}
+		e.UpdatedAt = now
 	}
-	j.Prune(conf.JournalRetention, time.Now())
+	j.Prune(conf.JournalRetention, now)
 
 	if err := WriteJournal(ctx, bkt, j); err != nil {
 		return nil, errors.Wrap(err, "take ownership of journal")
 	}
 
 	s := &Scheduler{
+		lifetime:    ctx,
 		logger:      logger,
 		bkt:         bkt,
 		conf:        conf,
@@ -697,7 +714,12 @@ func (s *Scheduler) RejectOutputs(ctx context.Context, taskID string, blocks []u
 }
 
 // AcceptOutputs records that the task's outputs passed verification and may
-// supersede the blocks they were made from.
+// supersede the blocks they were made from. The verdict counts only once the
+// journal holds it: the sources are retired on its strength, and a successor
+// finding the task completed but unverified would delete the outputs. When
+// the journal cannot be written the verdict is taken back and an error
+// returned; the outputs are then rejected like any unverified result, and
+// the plan is redone.
 func (s *Scheduler) AcceptOutputs(ctx context.Context, taskID string) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
@@ -707,7 +729,13 @@ func (s *Scheduler) AcceptOutputs(ctx context.Context, taskID string) error {
 	}
 	e.Verified = true
 	e.UpdatedAt = time.Now()
-	return s.persistLocked(ctx)
+	if err := s.persistLocked(ctx); err != nil {
+		if s.journal.Tasks[taskID] == e {
+			e.Verified = false
+		}
+		return err
+	}
+	return nil
 }
 
 // OutputPublished reports whether a block a worker produced for the task may
@@ -737,8 +765,39 @@ func (s *Scheduler) PublishedFunc() func(*metadata.Meta) bool {
 		if !ok || prov.JournalID != s.conf.JournalID {
 			return true
 		}
-		return s.OutputPublished(prov.TaskID, prov.BlockID)
+		if s.OutputPublished(prov.TaskID, prov.BlockID) {
+			return true
+		}
+		s.noteUnaccounted(prov.TaskID, prov.BlockID)
+		return false
 	}
+}
+
+// noteUnaccounted records a block stamped with a finished task that the task
+// does not account for - uploaded by an attempt whose report never arrived,
+// or for a task a predecessor left unfinished at takeover - as rejected, so
+// that maintenance deletes it. Left alone it would be unpublished only while
+// the task's entry lasts: once the retention aged the entry out, nothing
+// would tell it from a block verified long ago. A task still running, or one
+// whose result is being verified, is left alone.
+func (s *Scheduler) noteUnaccounted(taskID, blockID string) {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	e, ok := s.journal.Tasks[taskID]
+	if !ok || !e.State.Terminal() {
+		return
+	}
+	if _, busy := s.verifying[taskID]; busy {
+		return
+	}
+	// Reported outputs of a result nobody verified are rejected by
+	// maintenance as a whole.
+	if slices.Contains(e.Outputs, blockID) || slices.Contains(e.RejectedOutputs, blockID) {
+		return
+	}
+	level.Warn(s.logger).Log("msg", "found a block the task it was made for does not account for; deleting it", "task", taskID, "block", blockID, "state", e.State)
+	e.RejectedOutputs = append(e.RejectedOutputs, blockID)
+	e.UpdatedAt = time.Now()
 }
 
 // SourcesParked reports whether any source belongs to an abandoned or oversized
@@ -932,7 +991,7 @@ func (s *Scheduler) updateQueueMetricsLocked() {
 // liveness signal: a journal not written for a few TTLs belongs to no running
 // manager. The rollback tool relies on that before it touches a bucket.
 func (s *Scheduler) Maintain() error {
-	ctx := context.Background()
+	ctx := s.lifetime
 
 	// Operators release parked tasks by writing a marker per task; read them
 	// before taking the state lock, listing the bucket is slow.
@@ -942,6 +1001,9 @@ func (s *Scheduler) Maintain() error {
 	}
 
 	if err := s.maintainLocked(ctx, unpark); err != nil {
+		return err
+	}
+	if err := s.deleteRejectedOutputs(ctx); err != nil {
 		return err
 	}
 
@@ -968,52 +1030,120 @@ func (s *Scheduler) unparkRequests(ctx context.Context) ([]string, error) {
 	return ids, err
 }
 
-// cleanupOutputsLocked finishes what a rejected result started: rejected
-// blocks whose deletion failed are deleted again, and a task reported
-// completed whose outputs nobody in this process is verifying - the manager
-// stopped between the report and the verification, and this is its
-// successor - has them rejected, since the plan is redone and nobody will
-// account for them. A task under verification is left alone whatever the
-// clock says: its verdict is what decides. Reports true when the journal
-// changed.
-func (s *Scheduler) cleanupOutputsLocked(ctx context.Context) bool {
+// rejectUnverifiedLocked rejects the outputs of a task reported completed that
+// nobody in this process is verifying - the manager stopped between the
+// report and the verdict, and this is its successor, or the verdict could not
+// be recorded - since the plan is redone and nobody will account for them. A
+// task under verification is left alone whatever the clock says: its verdict
+// is what decides. Reports true when the journal changed.
+func (s *Scheduler) rejectUnverifiedLocked() bool {
 	dirty := false
 	for id, e := range s.journal.Tasks {
 		if _, busy := s.verifying[id]; busy {
 			continue
 		}
-		if e.State == StateCompleted && !e.Verified && len(e.Outputs) > 0 {
-			level.Warn(s.logger).Log("msg", "a completed task was never verified; rejecting its outputs so that the plan is redone", "task", id, "blocks", len(e.Outputs))
-			for _, b := range e.Outputs {
-				if !slices.Contains(e.RejectedOutputs, b) {
-					e.RejectedOutputs = append(e.RejectedOutputs, b)
-				}
-			}
-			e.Outputs = nil
-			e.UpdatedAt = time.Now()
-			dirty = true
-		}
-		if len(e.RejectedOutputs) == 0 {
+		if e.State != StateCompleted || e.Verified || len(e.Outputs) == 0 {
 			continue
 		}
-		var left []string
-		for _, b := range e.RejectedOutputs {
-			bid, err := ulid.Parse(b)
-			if err != nil {
-				continue
-			}
-			if err := block.Delete(ctx, s.logger, s.bkt, bid); err != nil {
-				level.Warn(s.logger).Log("msg", "could not delete a rejected result block; retrying on the next tick", "task", id, "block", b, "err", err)
-				left = append(left, b)
+		level.Warn(s.logger).Log("msg", "a completed task was never verified; rejecting its outputs so that the plan is redone", "task", id, "blocks", len(e.Outputs))
+		for _, b := range e.Outputs {
+			if !slices.Contains(e.RejectedOutputs, b) {
+				e.RejectedOutputs = append(e.RejectedOutputs, b)
 			}
 		}
-		if len(left) != len(e.RejectedOutputs) {
-			e.RejectedOutputs = left
+		e.Outputs = nil
+		e.UpdatedAt = time.Now()
+		dirty = true
+	}
+	return dirty
+}
+
+// deleteRejectedOutputs deletes the blocks the journal lists as rejected. The
+// state lock is held only to read the list and to apply the result: deleting
+// a block is bucket I/O that can take long, and holding the lock across it
+// would stall every heartbeat, lease and report until workers lose their
+// leases.
+func (s *Scheduler) deleteRejectedOutputs(ctx context.Context) error {
+	s.mtx.Lock()
+	todo := map[string][]string{}
+	for id, e := range s.journal.Tasks {
+		if _, busy := s.verifying[id]; busy {
+			continue
+		}
+		if len(e.RejectedOutputs) > 0 {
+			todo[id] = slices.Clone(e.RejectedOutputs)
+		}
+	}
+	s.mtx.Unlock()
+	if len(todo) == 0 {
+		return nil
+	}
+
+	settled := map[string][]string{}
+	for id, blocks := range todo {
+		for _, b := range blocks {
+			if s.deleteIfOurs(ctx, id, b) {
+				settled[id] = append(settled[id], b)
+			}
+		}
+	}
+
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	dirty := false
+	for id, blocks := range settled {
+		e, ok := s.journal.Tasks[id]
+		if !ok {
+			continue
+		}
+		n := len(e.RejectedOutputs)
+		e.RejectedOutputs = slices.DeleteFunc(e.RejectedOutputs, func(b string) bool { return slices.Contains(blocks, b) })
+		if len(e.RejectedOutputs) != n {
 			e.UpdatedAt = time.Now()
 			dirty = true
 		}
 	}
-	return dirty
+	if !dirty {
+		return nil
+	}
+	return s.persistLocked(ctx)
+}
+
+// deleteIfOurs deletes a block the journal lists as a rejected output of the
+// task, but only once the block's own metadata says it was made for the task:
+// the list comes from a worker's report, and a block ID a worker named could
+// be anybody's - a source of the plan, say. It reports whether the ID is
+// settled and can leave the journal: deleted, gone, or not the task's to
+// delete. A block without metadata is left to the compactor's cleanup of
+// partial uploads.
+func (s *Scheduler) deleteIfOurs(ctx context.Context, taskID, blockID string) bool {
+	id, err := ulid.Parse(blockID)
+	if err != nil {
+		return true
+	}
+	raw, err := readRawMeta(ctx, s.bkt, id)
+	if err != nil {
+		if s.bkt.IsObjNotFoundErr(err) {
+			return true
+		}
+		level.Warn(s.logger).Log("msg", "could not read a rejected result block's metadata; retrying on the next tick", "task", taskID, "block", blockID, "err", err)
+		return false
+	}
+	var m metadata.Meta
+	if err := json.Unmarshal(raw, &m); err != nil {
+		level.Warn(s.logger).Log("msg", "not deleting a block listed as a rejected result: its metadata is unreadable, so whose it is cannot be told", "task", taskID, "block", blockID, "err", err)
+		return true
+	}
+	prov, ok := ProvenanceOf(&m)
+	if !ok || prov.JournalID != s.conf.JournalID || prov.TaskID != taskID || prov.BlockID != blockID {
+		level.Warn(s.logger).Log("msg", "not deleting a block listed as a rejected result: its metadata does not say it was made for the task", "task", taskID, "block", blockID)
+		return true
+	}
+	if err := block.Delete(ctx, s.logger, s.bkt, id); err != nil {
+		level.Warn(s.logger).Log("msg", "could not delete a rejected result block; retrying on the next tick", "task", taskID, "block", blockID, "err", err)
+		return false
+	}
+	return true
 }
 
 func (s *Scheduler) maintainLocked(ctx context.Context, unpark []string) error {
@@ -1025,7 +1155,7 @@ func (s *Scheduler) maintainLocked(ctx context.Context, unpark []string) error {
 	// stays bounded and a parked set is released after the retention as
 	// promised, not only on the next restart.
 	dirty := s.journal.Prune(s.conf.JournalRetention, time.Now()) > 0
-	dirty = s.cleanupOutputsLocked(ctx) || dirty
+	dirty = s.rejectUnverifiedLocked() || dirty
 
 	// Any unpark request forces a journal write, its marker is only removed
 	// after one: the entry it names may be gone from memory already because
@@ -1340,11 +1470,17 @@ func (e *RemotePlanExecutor) verifyAndFinalize(ctx context.Context, cg *compact.
 	}
 
 	// Verified: from now on the outputs may supersede the sources, in the
-	// bucket-wide view as here. Persisting that is best effort - the entry is
-	// updated in memory, and the journal catches up on the next write.
+	// bucket-wide view as here. The sources are retired on the strength of
+	// that verdict, so it has to be in the journal first: a successor that
+	// found the task unverified would delete the outputs while the sources
+	// were on their way out. Unrecorded, the verdict is void - the outputs
+	// are rejected by maintenance and the plan is redone.
 	if e.sched != nil {
 		if err := e.sched.AcceptOutputs(ctx, res.TaskID); err != nil {
-			level.Warn(e.logger).Log("msg", "could not persist the verification of a task's outputs; the journal catches up on the next write", "task", res.TaskID, "err", err)
+			if compact.IsHaltError(err) {
+				return nil, err
+			}
+			return nil, compact.NewRetryError(errors.Wrapf(err, "record the verification of task %s", res.TaskID))
 		}
 	}
 	cg.RecordCompaction(overlappingBlocks)
@@ -1449,6 +1585,14 @@ func claimOutputs(cg *compact.Group, plan compact.Plan, res Result, outMetas map
 				if err := recordsSet(id, meta.Thanos.Output, 0, 1); err != nil {
 					return err
 				}
+				continue
+			}
+			// The block the compaction has always produced records no set. One
+			// that does would be judged by it, and a set naming blocks that
+			// never appear would keep it unpublished for good while the plan's
+			// sources are retired.
+			if meta.Thanos.Output != nil {
+				return errors.Errorf("result block %s records an output set, the plan named neither outputs nor siblings", id)
 			}
 		}
 		return nil
