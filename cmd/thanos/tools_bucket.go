@@ -1283,6 +1283,7 @@ func registerBucketRewrite(app extkingpin.AppClause, objStoreConfig *extflag.Pat
 				p := compactv2.NewProgressLogger(logger, int(b.Meta().Stats.NumSeries))
 				newID := ulid.MustNew(ulid.Now(), rand.Reader)
 				meta.ULID = newID
+				meta.Thanos.RenameInOutput(id, newID)
 				meta.Thanos.Rewrites = append(meta.Thanos.Rewrites, metadata.Rewrite{
 					Sources:          meta.Compaction.Sources,
 					DeletionsApplied: deletions,

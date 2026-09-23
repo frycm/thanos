@@ -111,26 +111,34 @@ func RunDownsample(
 
 	// Both marker filters only gather; exclusion decisions belong to the
 	// downsample planner, which needs the marked blocks' metadata for fences
-	// and coverage when stuck-block downsampling is enabled.
+	// and coverage when stuck-block downsampling is enabled. Staged outputs
+	// of a compaction are withheld, as the compactor does: downsampling one
+	// would put a published block beside sources its set has not replaced
+	// yet.
 	baseBlockIDsFetcher := block.NewConcurrentLister(logger, insBkt)
 	noDownsampleMarkerFilter := downsample.NewGatherNoDownsampleMarkFilter(logger, insBkt, block.FetcherConcurrency)
 	noCompactMarkerFilter := compact.NewGatherNoCompactionMarkFilter(logger, insBkt, block.FetcherConcurrency)
+	deduplicateFilter := block.NewDeduplicateFilter(block.FetcherConcurrency)
+	deduplicateFilter.HideUnpublished()
 	filters := []block.MetadataFilter{
 		// The compactor plans against a replica-stripped view; the downsample
 		// planner has to see the same groups or its stuck-block verdicts
 		// diverge from what compaction will actually do.
 		block.NewReplicaLabelRemover(logger, dedupReplicaLabels),
-		block.NewDeduplicateFilter(block.FetcherConcurrency),
+		deduplicateFilter,
 		noDownsampleMarkerFilter,
 	}
 	if enableStuckBlocks {
 		// Best effort: the no-compact marks only make stuck-block waivers
 		// possible, and a missing mark is always the conservative direction
 		// (fewer fences, fewer waivers). A failed pass reuses the marks of the
-		// previous successful one; index-size marks are permanent, so a stale
-		// view can only lag behind new marks, never invent a fence. Failing
-		// the whole fetch - and with it this component - over one transient
-		// marker read would be a new hard dependency this command never had.
+		// previous successful one. Such a stale view can hold a mark removed
+		// since - operators remove index-size marks once block splitting can
+		// take the blocks - and waive a block that can grow again; the early
+		// downsampled block is then superseded once the block compacts on.
+		// Failing the whole fetch - and with it this component - over one
+		// transient marker read would be a new hard dependency this command
+		// never had.
 		filters = append(filters, bestEffortMetaFilter{logger: logger, inner: noCompactMarkerFilter})
 	}
 	metaFetcher, err := block.NewMetaFetcher(logger, block.FetcherConcurrency, insBkt, baseBlockIDsFetcher, "", extprom.WrapRegistererWithPrefix("thanos_", reg), filters)
