@@ -403,7 +403,7 @@ func penaltySequences(t *testing.T, replicas [][]Sample) map[string][]Sample {
 			// chunk ends with the raw series' last sample, which may not.
 			// Drop what does not move forward on both paths alike.
 			seq = forwardOnly(seq)
-			out[fmt.Sprint(seq)] = seq
+			out[fmt.Sprintf("%v", seq)] = seq
 			return
 		}
 		for i, r := range rest {
@@ -453,8 +453,8 @@ func (s *seriesList) Warnings() annotations.Annotations { return nil }
 
 // AssertSameDeduplicated fails unless a querier deduplicating by the given
 // labels, with the penalty algorithm, serves the same series from both dumps
-// and, for each series and aggregate, some order of want's replicas yields
-// exactly the sequence some order of got's replicas yields. Whole sequences
+// and, for each series and aggregate, some order of the replicas in want
+// yields exactly the sequence some order of the replicas in got yields. Whole sequences
 // are compared, so a result that alternates between replicas where the
 // algorithm would stay with one does not pass.
 //
