@@ -345,8 +345,8 @@ func runCompact(
 	case compact.DedupAlgorithmPenalty:
 		mergeFunc = dedup.NewChunkSeriesMerger()
 
-		if len(dedupReplicaLabels) == 0 {
-			return errors.New("penalty based deduplication needs at least one replica label specified")
+		if len(dedupReplicaLabels) == 0 && len(seriesReplicaLabels) == 0 {
+			return errors.New("penalty based deduplication needs at least one replica label specified, external (--deduplication.replica-label) or series (--deduplication.series-replica-label)")
 		}
 	case "":
 		mergeFunc = storage.NewCompactingChunkSeriesMerger(storage.ChainedSeriesMerge)
@@ -839,7 +839,7 @@ func (cc *compactConfig) registerFlag(cmd extkingpin.FlagClause) {
 
 	cmd.Flag("deduplication.func", "Experimental. Deduplication algorithm for merging overlapping blocks. "+
 		"Possible values are: \"\", \"penalty\". If no value is specified, the default compact deduplication merger is used, which performs 1:1 deduplication for samples. "+
-		"When set to penalty, penalty based deduplication algorithm will be used. At least one replica label has to be set via --deduplication.replica-label flag.").
+		"When set to penalty, penalty based deduplication algorithm will be used. At least one replica label has to be set via --deduplication.replica-label or --deduplication.series-replica-label.").
 		Default("").EnumVar(&cc.dedupFunc, compact.DedupAlgorithmPenalty, "")
 
 	cmd.Flag("deduplication.replica-label", "Experimental. Label to treat as a replica indicator of blocks that can be deduplicated (repeated flag). This will merge multiple replica blocks into one. This process is irreversible. "+
