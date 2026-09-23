@@ -110,7 +110,8 @@ type Thanos struct {
 	// compaction produced together. Such blocks replace their sources only as
 	// a set: until every block of the set is in the bucket, the sources are
 	// the only complete copy of the data, and readers must not let one of the
-	// set supersede them. Optional; absent for a compaction with one output.
+	// set supersede them. Optional; absent for a compaction whose plan named
+	// neither outputs nor siblings.
 	Output *ThanosOutput `json:"output,omitempty"`
 
 	// SeriesReplicaLabels, when present, are the series labels the block was
@@ -157,6 +158,24 @@ func (m *Thanos) Published(id ulid.ULID, exists func(ulid.ULID) bool) bool {
 		}
 	}
 	return true
+}
+
+// RenameInOutput makes a copy of a block, written under a new ID by a tool
+// that keeps the block's metadata, take the original's place in the block's
+// set. Without it the copy's set would not name the copy: the copy could
+// neither complete the set nor keep the blocks the set names published once
+// the original is gone.
+func (m *Thanos) RenameInOutput(from, to ulid.ULID) {
+	if m.Output == nil {
+		return
+	}
+	blocks := slices.Clone(m.Output.Blocks)
+	for i, id := range blocks {
+		if id == from {
+			blocks[i] = to
+		}
+	}
+	m.Output = &ThanosOutput{Index: m.Output.Index, Count: m.Output.Count, Blocks: blocks}
 }
 
 type IndexStats struct {

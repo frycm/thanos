@@ -544,7 +544,15 @@ func runCompact(
 			return errors.Wrap(err, "sync before retention")
 		}
 
-		if err := compact.ApplyRetentionPolicyByResolution(ctx, logger, insBkt, sy.Metas(), retentionByResolution, compactMetrics.blocksMarked.WithLabelValues(metadata.DeletionMarkFilename, "")); err != nil {
+		// Blocks withheld as unpublished are out of the synced view, but not
+		// out of retention: a staged output whose plan never completes would
+		// otherwise outlive its sources, and store gateways, which do not
+		// withhold it, would serve it past the retention.
+		retentionView := sy.Metas()
+		for _, m := range duplicateBlocksFilter.Unpublished() {
+			retentionView[m.ULID] = m
+		}
+		if err := compact.ApplyRetentionPolicyByResolution(ctx, logger, insBkt, retentionView, retentionByResolution, compactMetrics.blocksMarked.WithLabelValues(metadata.DeletionMarkFilename, "")); err != nil {
 			return errors.Wrap(err, "retention failed")
 		}
 

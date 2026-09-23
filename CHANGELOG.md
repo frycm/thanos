@@ -14,8 +14,11 @@ It is recommend to upgrade the storage components first (Receive, Store, etc.) a
 
 ### Fixed
 
+- [#8667](https://github.com/thanos-io/thanos/pull/8667): Query: fix data race in GetStoreClients by making endpointRef mutex a pointer
+
 ### Added
 
+- [#4](https://github.com/frycm/thanos/issues/4) Compactor: blocks record the set of blocks their compaction produced in `thanos.output` of `meta.json`, and replace their sources only once the whole set is in the bucket. The compactor and `tools bucket downsample` withhold blocks whose set is incomplete, counted as `state="unpublished"` in `thanos_blocks_meta_synced`; retention still applies to them. Block repair and `tools bucket rewrite` keep the set with the new block in the original's place.
 - [#12](https://github.com/frycm/thanos/issues/12) Compactor: experimental `--deduplication.series-replica-label` merges series that differ only in the given series labels at compaction and drops the labels, for HA replicas whose replica label is inside the series (Prometheus pairs behind Receive, agents, collector pairs). Compacted blocks record the labels as `thanos.series_replica_labels`.
 
 ### Changed

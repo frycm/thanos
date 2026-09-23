@@ -1027,7 +1027,6 @@ func IsOutOfOrderChunkError(err error) bool {
 	return ok
 }
 
-// HaltError is a type wrapper for errors that should halt any further progress on compactions.
 // partitionsCover checks that outputs which each hold one partition of the
 // sources' series together hold every series, from the tallies their
 // populators kept. The outputs of a plan replace its sources, so a series no
@@ -1054,6 +1053,7 @@ func partitionsCover(outputs []PlanOutput, stats []PartitionStats) error {
 	return nil
 }
 
+// HaltError is a type wrapper for errors that should halt any further progress on compactions.
 type HaltError struct {
 	err error
 }
@@ -1274,6 +1274,13 @@ func (cg *Group) planLocked(ctx context.Context, planner Planner, errChan chan e
 			}
 		}
 		plan.Outputs = outputs
+	}
+	if sp, ok := planner.(SiblingPlanner); ok {
+		siblings, err := sp.PlanSiblings(ctx, cg, toCompact)
+		if err != nil {
+			return Plan{}, errors.Wrap(err, "plan compaction siblings")
+		}
+		plan.Siblings = siblings
 	}
 	return plan, nil
 }

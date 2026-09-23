@@ -465,6 +465,7 @@ func Repair(ctx context.Context, logger log.Logger, dir string, id ulid.ULID, so
 	// that has multiple.
 	resmeta := *meta
 	resmeta.ULID = resid
+	resmeta.Thanos.RenameInOutput(meta.ULID, resid)
 	resmeta.Stats = tsdb.BlockStats{} // Reset stats.
 	resmeta.Thanos.Source = source    // Update source.
 

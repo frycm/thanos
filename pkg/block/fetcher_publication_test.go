@@ -167,6 +167,14 @@ func TestDeduplicateFilterHidesUnpublished(t *testing.T) {
 		testutil.Equals(t, []ulid.ULID{}, dups)
 		testutil.Equals(t, []ulid.ULID{A}, hidden)
 	})
+	t.Run("withheld blocks keep their metadata for what must still reach them", func(t *testing.T) {
+		a := output(A, 0, 2, []ulid.ULID{A, B}, ULID(1), ULID(2))
+		metas := map[ulid.ULID]*metadata.Meta{ULID(1): meta(ULID(1)), ULID(2): meta(ULID(2)), A: a}
+		f := NewDeduplicateFilter(1)
+		f.HideUnpublished()
+		testutil.Ok(t, f.Filter(ctx, metas, newTestFetcherMetrics().Synced, nil))
+		testutil.Equals(t, []*metadata.Meta{a}, f.Unpublished())
+	})
 	t.Run("a leftover of an earlier attempt is a duplicate of the published rerun, not withheld", func(t *testing.T) {
 		A2, B2 := ULID(12), ULID(13)
 		view, dups, hidden := run(t, nil, meta(ULID(1)), meta(ULID(2)), output(A, 0, 2, []ulid.ULID{A, B}, ULID(1), ULID(2)),
@@ -213,6 +221,39 @@ func TestDeduplicateFilterHidesUnpublished(t *testing.T) {
 		view, _, hidden = run(t, nil, output(A, 0, 2, []ulid.ULID{A, B}, ULID(1), ULID(2)), c)
 		testutil.Equals(t, []ulid.ULID{}, view)
 		testutil.Equals(t, ULIDs(10, 40), hidden)
+	})
+	t.Run("a copied set does not vouch for its blocks", func(t *testing.T) {
+		// A tool rewrote A into A2, a lineage of its own, and kept A's set,
+		// which does not name A2. A2 is its own set, but it must not publish
+		// A: B never arrived, so the sources are the only complete copy of
+		// B's series.
+		A2 := ULID(50)
+		copied := output(A2, 0, 2, []ulid.ULID{A, B}, A2)
+		view, dups, hidden := run(t, nil, meta(ULID(1)), meta(ULID(2)), output(A, 0, 2, []ulid.ULID{A, B}, ULID(1), ULID(2)), copied)
+		testutil.Equals(t, []ulid.ULID{}, dups, "nothing may retire the sources")
+		testutil.Equals(t, []ulid.ULID{A}, hidden)
+		testutil.Equals(t, []ulid.ULID{ULID(1), ULID(2), A2}, view)
+	})
+	t.Run("a repaired copy takes its original's place in the set", func(t *testing.T) {
+		// Repair keeps the sources and renames the copy into the set: while
+		// B is missing the copy is as unpublished as A was, and once B is
+		// there the set is complete again, with A gone.
+		A2 := ULID(50)
+		repaired := output(A2, 0, 2, []ulid.ULID{A, B}, ULID(1), ULID(2))
+		repaired.Thanos.RenameInOutput(A, A2)
+		testutil.Equals(t, []ulid.ULID{A2, B}, repaired.Thanos.Output.Blocks)
+		view, dups, hidden := run(t, nil, meta(ULID(1)), meta(ULID(2)), repaired)
+		testutil.Equals(t, ULIDs(1, 2), view)
+		testutil.Equals(t, []ulid.ULID{}, dups)
+		testutil.Equals(t, []ulid.ULID{A2}, hidden)
+
+		// Shards are groups of their own.
+		repaired.Thanos.Labels = map[string]string{"tenant": "a", "part": "a"}
+		b := output(B, 1, 2, []ulid.ULID{A, B}, ULID(1), ULID(2))
+		b.Thanos.Labels = map[string]string{"tenant": "a", "part": "b"}
+		view, _, hidden = run(t, nil, repaired, b)
+		testutil.Equals(t, []ulid.ULID{B, A2}, view)
+		testutil.Equals(t, []ulid.ULID{}, hidden)
 	})
 	t.Run("without hiding, the same view keeps the unpublished block, as a store gateway does", func(t *testing.T) {
 		metas := map[ulid.ULID]*metadata.Meta{ULID(1): meta(ULID(1)), ULID(2): meta(ULID(2)), A: output(A, 0, 2, []ulid.ULID{A, B}, ULID(1), ULID(2))}
