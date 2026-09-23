@@ -1353,6 +1353,13 @@ func (cg *Group) planLocked(ctx context.Context, planner Planner, exclude map[ul
 		}
 		plan.Outputs = outputs
 	}
+	if sp, ok := planner.(SiblingPlanner); ok {
+		siblings, err := sp.PlanSiblings(ctx, cg, toCompact)
+		if err != nil {
+			return Plan{}, errors.Wrap(err, "plan compaction siblings")
+		}
+		plan.Siblings = siblings
+	}
 	return plan, nil
 }
 
