@@ -100,21 +100,22 @@ func assertDeduplicated(t *testing.T, plain, got *compacttest.BucketDump) {
 func seriesDedupScenarios() []compacttest.Scenario {
 	return []compacttest.Scenario{
 		{
-			// Replicas in lockstep: every tie between them is at the same
-			// timestamp and goes to the replica offered first, and the
-			// compaction serves what a querier reading the whole range
-			// serves, downsampled aggregates included.
+			// Replicas in lockstep without gaps: every tie between them is
+			// at the same timestamp and goes to the replica offered first,
+			// and the compaction serves what a querier reading the whole
+			// range serves, downsampled aggregates included.
 			Name: "series_dedup_serves_what_query_time_dedup_served",
 			Run:  servesWhatQueryTimeDedupServed(0),
 		},
 		{
 			// Replicas scraping 20s apart, as real HA pairs do: penalty
 			// deduplication keeps one replica's timestamps and drops the
-			// other's. The compactor deduplicates each block window's
-			// overlapping chunks on its own and serves, window by window,
-			// what a querier reading that window alone serves - including
-			// the later replica's first sample of the window, which a
-			// querier reading across windows drops.
+			// other's. The compactor deduplicates each group of
+			// overlapping chunks on its own - in this corpus one chunk per
+			// series and block window - and serves, group by group, what a
+			// querier reading that group alone serves, including the later
+			// replica's first sample of the group, which a querier reading
+			// across groups drops.
 			Name:    "series_dedup_with_offset_scrapes_serves_per_window_what_query_time_dedup_served",
 			Tenants: offsetScrapeCorpus(),
 			Run:     servesWhatQueryTimeDedupServed(compacttest.Window),

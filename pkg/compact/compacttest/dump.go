@@ -369,7 +369,12 @@ func (d *BucketDump) replicaGroups(replicaLabels []string) map[string][]map[down
 // order is legitimate. The algorithm decides by timestamps alone, so each
 // sample is fed to it as its index and mapped back, which lets histogram and
 // aggregate samples through unchanged.
-func penaltySequences(t *testing.T, replicas [][]Sample) map[string][]Sample {
+//
+// A counter aggregate chunk ends with the raw series' last sample, which may
+// not move forward in time; with counter set, what does not move forward is
+// dropped on both paths alike. Any other sequence is compared as it is, so a
+// duplicated or backwards sample in a lone series is a difference.
+func penaltySequences(t *testing.T, replicas [][]Sample, counter bool) map[string][]Sample {
 	t.Helper()
 	testutil.Assert(t, len(replicas) <= 6, "%d replicas of one series; the permutations would be too many", len(replicas))
 	out := map[string][]Sample{}
@@ -399,10 +404,10 @@ func penaltySequences(t *testing.T, replicas [][]Sample) map[string][]Sample {
 			}
 			testutil.Ok(t, set.Err())
 			// A lone series passes through the querier untouched, while the
-			// algorithm only moves forward in time; a counter aggregate
-			// chunk ends with the raw series' last sample, which may not.
-			// Drop what does not move forward on both paths alike.
-			seq = forwardOnly(seq)
+			// algorithm only moves forward in time.
+			if counter {
+				seq = forwardOnly(seq)
+			}
 			out[fmt.Sprintf("%v", seq)] = seq
 			return
 		}
@@ -459,13 +464,14 @@ func (s *seriesList) Warnings() annotations.Annotations { return nil }
 // algorithm would stay with one does not pass.
 //
 // With window zero the whole time range is read at once. Compaction-time
-// penalty deduplication satisfies that only where the replicas' chunks line
-// up, as for replicas scraping in lockstep: the compactor deduplicates each
-// group of overlapping chunks on its own - for HA replicas written through
-// the same receivers, one block window - starting afresh, where a querier
-// reading across groups carries its state on. With a window, raw samples are
-// compared window by window, each read alone, which is what compaction
-// matches for replicas scraping at different moments; aggregates of
+// penalty deduplication satisfies that only for replicas scraping in
+// lockstep without gaps: the compactor deduplicates each group of
+// overlapping chunks on its own, starting afresh, where a querier reading
+// across groups carries its state on. With a window, raw samples are
+// compared window by window, each read alone, which compaction matches for
+// replicas scraping at different moments when a window holds one group of
+// overlapping chunks - true of the scenario corpus, whose blocks hold one
+// chunk per series, not of real data at a 15s scrape; aggregates of
 // downsampled blocks, which span many windows, are then not compared.
 func AssertSameDeduplicated(t *testing.T, want, got *BucketDump, replicaLabels []string, window time.Duration, what string) {
 	t.Helper()
@@ -518,7 +524,8 @@ func deduplicatedDifferences(t *testing.T, want, got *BucketDump, replicaLabels 
 				continue
 			}
 			for _, part := range windows(append(append([][]Sample{}, wr...), gr...), window) {
-				wseq, gseq := penaltySequences(t, within(wr, part)), penaltySequences(t, within(gr, part))
+				counter := at == downsample.AggrCounter
+				wseq, gseq := penaltySequences(t, within(wr, part), counter), penaltySequences(t, within(gr, part), counter)
 				matched := false
 				for s := range gseq {
 					if _, ok := wseq[s]; ok {

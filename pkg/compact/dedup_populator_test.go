@@ -4,6 +4,7 @@
 package compact
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"log/slog"
@@ -24,6 +25,7 @@ import (
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
+	"github.com/prometheus/prometheus/tsdb/index"
 	"github.com/prometheus/prometheus/util/annotations"
 	"github.com/thanos-io/objstore"
 
@@ -74,8 +76,9 @@ func samplesOf(v float64, from, to int64) []string {
 // series carry their replica label inside the series and checks that
 // replicas merge into one series without the label, in the right order,
 // that the tie between replicas with samples at the same timestamps goes to
-// the first source's first replica, that a series lacking the label merges
-// with its replicas, and that the label leaves the symbol table.
+// the first source's first replica - sources ordered by MinTime, then ULID -
+// that a series lacking the label merges with its replicas, and that the
+// label leaves the symbol table.
 func TestDeduplicatingBlockPopulator(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -124,11 +127,13 @@ func TestDeduplicatingBlockPopulator(t *testing.T) {
 	againContent, _, _ := blockContent(t, againDir, again[0])
 	testutil.Equals(t, content, againContent)
 
-	// Swapping the sources swaps which replica wins the tie.
+	// Sources with the same MinTime come in no fixed order - the copies of
+	// one range that different receivers uploaded - so the order they are
+	// handed over in does not decide the tie: MinTime, then ULID does.
 	swapped, err := comp.CompactWithBlockPopulator(out, []string{y, x}, nil, DeduplicatingBlockPopulator{ReplicaLabels: []string{"replica"}})
 	testutil.Ok(t, err)
 	swappedContent, _, _ := blockContent(t, out, swapped[0])
-	testutil.Equals(t, samplesOf(8, 0, 10), swappedContent[`{__name__="m", a="1"}`])
+	testutil.Equals(t, content, swappedContent)
 }
 
 // TestDeduplicatingBlockPopulatorMatchesQueryTimeDeduplication: on replicas
@@ -330,13 +335,14 @@ func queryTimePenalty(t *testing.T, lset labels.Labels, replicas ...[]chunks.Sam
 }
 
 // TestDeduplicatingBlockPopulatorAfterAGap pins down what compaction-time
-// penalty deduplication does after a gap, which differs from a querier
-// reading across a chunk group boundary. The merger deduplicates each group
-// of overlapping chunks on its own, starting afresh. After A's gap the first
-// window continues with B, as a querier does; the second window starts
-// again from A, where a querier reading both windows at once stays with B.
-// Each window is exactly what a querier returns for that window alone, and
-// every sample is a real one.
+// penalty deduplication does after a gap that spans two blocks, which
+// differs from a querier reading across them. The merger deduplicates each
+// group of overlapping chunks on its own, starting afresh; the blocks here
+// hold one chunk per series. After A's gap the first block continues with B,
+// as a querier does; the second starts again from A, where a querier reading
+// both at once stays with B. Each block is exactly what a querier returns
+// for that block alone, and every sample is a real one. Groups within one
+// block are TestDeduplicatingBlockPopulatorPerChunkGroup's.
 func TestDeduplicatingBlockPopulatorAfterAGap(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -369,4 +375,111 @@ func TestDeduplicatingBlockPopulatorAfterAGap(t *testing.T) {
 
 	across := queryTimePenalty(t, stripped, append(slices.Clone(a1), a2...), append(slices.Clone(b1), b2...))
 	testutil.Assert(t, !slices.Equal(across, perWindow), "a querier reading across the windows stays with B; if it no longer does, the documentation is wrong")
+}
+
+// chunkGroups returns the time ranges of the groups of overlapping chunks the
+// block's series form together: the chunks the merger deduplicates at once.
+func chunkGroups(t *testing.T, blockDir string) [][2]int64 {
+	t.Helper()
+	b, err := tsdb.OpenBlock(slog.Default(), blockDir, chunkenc.NewPool(), nil)
+	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, b.Close()) }()
+	ir, err := b.Index()
+	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, ir.Close()) }()
+	k, v := index.AllPostingsKey()
+	all, err := ir.Postings(context.Background(), k, v)
+	testutil.Ok(t, err)
+	var ranges [][2]int64
+	for all.Next() {
+		var builder labels.ScratchBuilder
+		var chks []chunks.Meta
+		testutil.Ok(t, ir.Series(all.At(), &builder, &chks))
+		for _, c := range chks {
+			ranges = append(ranges, [2]int64{c.MinTime, c.MaxTime})
+		}
+	}
+	testutil.Ok(t, all.Err())
+	slices.SortFunc(ranges, func(a, b [2]int64) int { return cmp.Compare(a[0], b[0]) })
+	var groups [][2]int64
+	for _, r := range ranges {
+		if n := len(groups); n > 0 && r[0] <= groups[n-1][1] {
+			groups[n-1][1] = max(groups[n-1][1], r[1])
+			continue
+		}
+		groups = append(groups, r)
+	}
+	return groups
+}
+
+func within(samples []chunks.Sample, from, to int64) []chunks.Sample {
+	var out []chunks.Sample
+	for _, s := range samples {
+		if s.T() >= from && s.T() <= to {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// TestDeduplicatingBlockPopulatorPerChunkGroup pins down what compaction-time
+// penalty deduplication guarantees against a querier at normal scrape
+// density: the merger deduplicates each group of overlapping chunks on its
+// own, starting afresh, and a block holds several such groups - a chunk holds
+// 120 samples, half an hour at a 15s scrape. The result is, group by group,
+// exactly what a querier returns for that group alone, every sample a real
+// one; a querier reading across groups carries its state on and can differ at
+// the group boundaries. Replicas scraped at an offset differ that way at
+// every boundary, and replicas in lockstep once one of them has a gap;
+// replicas in lockstep without gaps do not differ at all.
+func TestDeduplicatingBlockPopulatorPerChunkGroup(t *testing.T) {
+	ctx := context.Background()
+	lset := func(r string) labels.Labels { return labels.FromStrings("__name__", "up", "replica", r) }
+	stripped := labels.FromStrings("__name__", "up")
+	for _, tc := range []struct {
+		name    string
+		offset  int64 // B's scrape offset against A, in seconds.
+		gap     [2]int64
+		differs bool
+	}{
+		{name: "offset scrapes", offset: 6, differs: true},
+		{name: "lockstep scrapes with a gap in one replica", gap: [2]int64{1000, 1300}, differs: true},
+		{name: "lockstep scrapes without gaps"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var a, b []chunks.Sample
+			for ts := int64(0); ts < 7200; ts += 15 {
+				if ts < tc.gap[0] || ts >= tc.gap[1] {
+					a = append(a, floatSample{t: ts * 1000, f: 1})
+				}
+				b = append(b, floatSample{t: (ts + tc.offset) * 1000, f: 2})
+			}
+			src := writeBlock(t, t.TempDir(), storage.NewListSeries(lset("A"), a), storage.NewListSeries(lset("B"), b))
+			groups := chunkGroups(t, src)
+			testutil.Assert(t, len(groups) > 1, "the test needs several chunk groups in one block, got %v", groups)
+
+			comp, err := tsdb.NewLeveledCompactor(ctx, nil, slog.Default(), []int64{2 * time.Hour.Milliseconds()}, chunkenc.NewPool(), dedup.NewChunkSeriesMerger())
+			testutil.Ok(t, err)
+			out := t.TempDir()
+			ids, err := comp.CompactWithBlockPopulator(out, []string{src}, nil, DeduplicatingBlockPopulator{ReplicaLabels: []string{"replica"}})
+			testutil.Ok(t, err)
+			content, _, _ := blockContent(t, out, ids[0])
+
+			var perGroup []string
+			for _, g := range groups {
+				perGroup = append(perGroup, queryTimePenalty(t, stripped, within(a, g[0], g[1]), within(b, g[0], g[1]))...)
+			}
+			slices.Sort(perGroup)
+			testutil.Equals(t, map[string][]string{stripped.String(): perGroup}, content)
+
+			// A querier reading the whole block, in either replica order,
+			// returns something else, with the difference at the group
+			// boundaries - except for lockstep replicas without gaps. If
+			// that changes, the documentation is wrong.
+			testutil.Equals(t, tc.differs, !slices.Equal(queryTimePenalty(t, stripped, a, b), perGroup), "A first")
+			if tc.differs {
+				testutil.Assert(t, !slices.Equal(queryTimePenalty(t, stripped, b, a), perGroup), "B first")
+			}
+		})
+	}
 }

@@ -163,6 +163,7 @@ func BuildCorpus(t *testing.T, name string, tenants []TenantSpec) *Corpus {
 				var id ulid.ULID
 				var err error
 				if tn.ReplicaScrapeOffset > 0 {
+					testutil.Assert(t, len(tn.SampleTypes) == 0, "tenant %s: scrape offsets are only supported for float samples", tn.Name)
 					id, err = e2eutil.CreateBlockWithSampleOffsets(ctx, dir, series, tn.Samples, mint, maxt, b.Labels(), func(lset labels.Labels) int64 {
 						return int64(slices.Index(promReplicas, lset.Get(tn.SeriesReplicaLabel))) * tn.ReplicaScrapeOffset.Milliseconds()
 					})

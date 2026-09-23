@@ -4,6 +4,7 @@
 package compact
 
 import (
+	"cmp"
 	"container/heap"
 	"context"
 	"fmt"
@@ -71,17 +72,19 @@ func NormalizeSeriesReplicaLabels(names []string) []string {
 // pairs - which external-label deduplication cannot see.
 //
 // Series are merged with the compactor's merge function, offered in a fixed
-// order: by source block in the plan's order and, within a source, by their
-// replica labels compared as a label set, a series lacking them first. The
-// penalty merger keeps the samples of the chunk it merges the others into,
-// and gives ties between chunks with the same time range to the series
+// order: by source block - MinTime, then ULID - and, within a source, by
+// their replica labels compared as a label set, a series lacking them first.
+// The penalty merger keeps the samples of the chunk it merges the others
+// into, and gives ties between chunks with the same time range to the series
 // offered first, so a fixed order is what makes the output depend on the
 // sources alone and not on how a heap happened to settle. The merger runs
-// the penalty algorithm on each group of overlapping chunks on its own - for
-// replicas written through the same receivers, one block window - so each
-// window holds what a querier reading that window alone returns; a querier
-// reading across windows carries its state on and may stay with another
-// replica. Every sample kept is one a replica really has.
+// the penalty algorithm on each group of overlapping chunks on its own,
+// starting afresh - a group spans about one chunk, 120 samples, half an hour
+// at a 15s scrape - so each group holds what a querier reading that group
+// alone returns. A querier reading across groups carries its state on and
+// can differ at the group boundaries: for replicas scraped at an offset, and
+// for replicas in lockstep once one of them has a gap. Every sample kept is
+// one a replica really has.
 //
 // Optionally the populator writes one partition of the series only, like
 // PartitionedBlockPopulator; the partition must then leave the replica labels
@@ -118,7 +121,7 @@ func (p DeduplicatingBlockPopulator) validate() error {
 	for _, name := range p.ReplicaLabels {
 		if !slices.Contains(p.Partition.Without, name) {
 			return errors.Errorf("series partition %d of %d hashes the series replica label %q, so replicas of one series would land in different partitions; "+
-				"leave the series replica labels out of the partition hash (--compact.block-split.ignore-labels)", p.Partition.Index, p.Partition.Count, name)
+				"leave the series replica labels out of the partition hash (with block splitting: --compact.block-split.ignore-labels)", p.Partition.Index, p.Partition.Count, name)
 		}
 	}
 	return nil
@@ -132,6 +135,14 @@ func (p DeduplicatingBlockPopulator) PopulateBlock(ctx context.Context, metrics 
 	if err := p.validate(); err != nil {
 		return err
 	}
+	// Ties between replicas go to the source that comes first. Planning sorts
+	// sources by MinTime only, and sources with the same MinTime - the copies
+	// of one range that different receivers uploaded - come in no fixed
+	// order, so the order is made total here: by MinTime, then by ULID.
+	blocks = slices.Clone(blocks)
+	slices.SortStableFunc(blocks, func(a, b tsdb.BlockReader) int {
+		return cmp.Or(cmp.Compare(a.Meta().MinTime, b.Meta().MinTime), a.Meta().ULID.Compare(b.Meta().ULID))
+	})
 
 	var (
 		sets        []storage.ChunkSeriesSet

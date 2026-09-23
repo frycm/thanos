@@ -860,7 +860,7 @@ func (cc *compactConfig) registerFlag(cmd extkingpin.FlagClause) {
 	cmd.Flag("deduplication.series-replica-label", "Experimental. Series label to treat as a replica indicator of series that can be deduplicated (repeated flag): "+
 		"every compaction merges series that differ only in these labels, with the algorithm --deduplication.func selects, and drops the labels from the result. "+
 		"For HA replicas whose replica label is inside the series rather than an external label of the block, such as Prometheus pairs writing through Receive, agents or collectors. "+
-		"Keep the labels in the querier's --query.replica-label. With block splitting, list the same labels in --compact.block-split.ignore-labels from the start. This process is irreversible. "+
+		"Keep the labels in the querier's --query.replica-label. With block splitting, leave at least these labels out of the shard hash from the start. This process is irreversible. "+
 		"Flag may be specified multiple times as well as a comma separated list of labels.").
 		StringsVar(&cc.seriesReplicaLabels)
 

@@ -19,10 +19,11 @@ It is recommend to upgrade the storage components first (Receive, Store, etc.) a
 ### Added
 
 - [#4](https://github.com/frycm/thanos/issues/4) Compactor: blocks record the set of blocks their compaction produced in `thanos.output` of `meta.json`, and replace their sources only once the whole set is in the bucket. The compactor and `tools bucket downsample` withhold blocks whose set is incomplete, counted as `state="unpublished"` in `thanos_blocks_meta_synced`; retention still applies to them. Block repair and `tools bucket rewrite` keep the set with the new block in the original's place.
-- [#12](https://github.com/frycm/thanos/issues/12) Compactor: experimental `--deduplication.series-replica-label` merges series that differ only in the given series labels at compaction and drops the labels, for HA replicas whose replica label is inside the series (Prometheus pairs behind Receive, agents, collector pairs). Compacted blocks record the labels as `thanos.series_replica_labels`.
+- [#12](https://github.com/frycm/thanos/issues/12) Compactor: experimental `--deduplication.series-replica-label` merges series that differ only in the given series labels at compaction and drops the labels, for HA replicas whose replica label is inside the series (Prometheus pairs behind Receive, agents, collector pairs). `--deduplication.func=penalty` accepts it without an external replica label. Compacted blocks record the labels as `thanos.series_replica_labels`; `thanos_compact_series_dedup_input_series_total` and `thanos_compact_series_dedup_output_series_total` count the series merged.
 
 ### Changed
-- [#12](https://github.com/frycm/thanos/issues/12) Compactor: penalty deduplication gives ties between replica chunks with the same time range to the replica that comes first in the plan, instead of whichever its heap popped first, so vertical compaction output no longer depends on heap order.
+
+- [#12](https://github.com/frycm/thanos/issues/12) Compactor: penalty deduplication gives ties between replica chunks with the same time range to the series offered to it first, instead of whichever its heap popped first. With series replica labels that is the source order, by time and ID, then the replica labels; for external replicas the order comes from the storage merge and is still not fixed.
 
 ### Removed
 

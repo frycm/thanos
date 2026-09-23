@@ -66,6 +66,8 @@ func TestDeduplicatedDifferences(t *testing.T) {
 	union := append(append([]Sample{}, a...), b...)
 	testutil.Assert(t, len(deduplicatedDifferences(t, want, dump(map[string][]Sample{"": union}), replicaLabels, 0)) > 0, "the union of offset scrapes must be rejected")
 	testutil.Assert(t, len(deduplicatedDifferences(t, want, dump(map[string][]Sample{"": a[:19]}), replicaLabels, 0)) > 0, "a lost sample must be rejected")
+	duplicated := append(append([]Sample{}, a[:10]...), a[9:]...)
+	testutil.Assert(t, len(deduplicatedDifferences(t, want, dump(map[string][]Sample{"": duplicated}), replicaLabels, 0)) > 0, "a duplicated sample must be rejected")
 
 	// Offset by 20s at a 60s step, more than the algorithm's initial
 	// penalty: read from the start of a window, the querier takes A's first
