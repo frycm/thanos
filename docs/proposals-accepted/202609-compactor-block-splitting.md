@@ -337,7 +337,7 @@ A shard block records the full source set of its plan while holding a fraction o
 * the store resolution filter's coverage check ([PR #3](https://github.com/frycm/thanos/pull/3)), which judges coverage per stream and shard in the same way, in that PR;
 * the stuck-block downsampling fences ([PR #2](https://github.com/frycm/thanos/pull/2)), which hold per shard.
 
-Each of these has a regression test with shard blocks, so a future change that compares sources across shards fails loudly: `TestDeduplicateFilterWithShards` and `TestDeduplicateFilterShardsSupersedeOnlyAsASet` for the deduplication filter, `TestPlanScopesCoverageByExternalLabels` and `TestPlanCoverageAcrossShards` for the downsampling planner, `TestResolutionMetaFilter_ShardsCoverTheirStream` in PR #3, and `TestPlanStuckBlocksPerShard` in PR #2.
+Each of these has a regression test with shard blocks, so a future change that compares sources across shards fails loudly: `TestDeduplicateFilterWithShards` and `TestDeduplicateFilterShardsSupersedeOnlyAsASet` for the deduplication filter, `TestPlanScopesCoverageByExternalLabels` and `TestCoverageAcrossShards` for the downsampling planner, `TestResolutionMetaFilter_ShardsCoverTheirStream` in PR #3, and `TestPlanStuckBlocksPerShard` in PR #2.
 
 ### Failure handling
 
