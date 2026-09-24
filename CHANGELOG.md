@@ -19,7 +19,7 @@ It is recommend to upgrade the storage components first (Receive, Store, etc.) a
 ### Added
 
 - [#5](https://github.com/frycm/thanos/issues/5) Compact: add experimental block splitting by series (hidden `--compact.block-split.*` flags): a compaction that would exceed the index size limit writes shard blocks labelled `__compactor_shard__` instead of marking its biggest source no-compact; store gateway strips the label from what it serves.
-- [#4](https://github.com/frycm/thanos/issues/4) Compactor: blocks record the set of blocks their compaction produced in `thanos.output` of `meta.json`, and replace their sources only once the whole set is in the bucket. The compactor and `tools bucket downsample` withhold blocks whose set is incomplete, counted as `state="unpublished"` in `thanos_blocks_meta_synced`; retention still applies to them. Block repair and `tools bucket rewrite` keep the set with the new block in the original's place.
+- [#4](https://github.com/frycm/thanos/issues/4) Compact: blocks record the set of blocks their compaction produced (`thanos.output` in `meta.json`) and replace their sources only once the whole set is uploaded; blocks of an incomplete set are withheld from compaction and downsampling and counted as `state="unpublished"` in `thanos_blocks_meta_synced`.
 
 ### Changed
 
