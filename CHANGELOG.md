@@ -15,8 +15,11 @@ It is recommend to upgrade the storage components first (Receive, Store, etc.) a
 ### Fixed
 
 - [#8667](https://github.com/thanos-io/thanos/pull/8667): Query: fix data race in GetStoreClients by making endpointRef mutex a pointer
+- [#8](https://github.com/frycm/thanos/issues/8) Tools: the resolution hints of `tools bucket replicate --resolution` and the store's resolution flags list `0s`, `5m` and `1h` instead of `0s`, `300µs` and `3.6ms`.
 
 ### Added
+
+- [#8](https://github.com/frycm/thanos/issues/8) Store: add `--min-block-resolution` and `--max-block-resolution` to serve blocks by downsampling resolution; a finer block is hidden only while blocks at the minimum resolution cover all of its data.
 
 ### Changed
 
