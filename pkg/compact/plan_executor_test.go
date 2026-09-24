@@ -100,7 +100,7 @@ func meta(id ulid.ULID, mint, maxt int64) *metadata.Meta {
 // produces is handed to the injected executor unchanged, and that the executor's
 // result is propagated back out of compact.
 func TestGroupPlanSeparatesPlanningFromExecution(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	m1 := meta(ulid.MustNew(1, nil), 0, 100)
 	m2 := meta(ulid.MustNew(2, nil), 100, 200)
@@ -133,7 +133,7 @@ func TestGroupPlanSeparatesPlanningFromExecution(t *testing.T) {
 // plan produces sees the plan's sources and that its outputs travel with the
 // plan to the executor, so an executor never has to invent them.
 func TestGroupPlanCarriesPlannerOutputs(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	m1 := meta(ulid.MustNew(1, nil), 0, 100)
 	m2 := meta(ulid.MustNew(2, nil), 100, 200)
@@ -181,7 +181,7 @@ func (s *siblingPlanner) PlanSiblings(_ context.Context, _ *Group, sources []*me
 // names reach the plan the executor gets. Tests of the executor build their
 // plans by hand, so they cannot catch a planning path that drops them.
 func TestGroupPlanCarriesPlannerSiblings(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	m1 := meta(ulid.MustNew(1, nil), 0, 100)
 	m2 := meta(ulid.MustNew(2, nil), 100, 200)
@@ -218,7 +218,7 @@ func TestGroupPlanCarriesPlannerSiblings(t *testing.T) {
 // TestGroupCompactTreatsDeferredPlanAsNoWork asserts that an executor that
 // declines a plan neither fails the group nor asks for a rerun.
 func TestGroupCompactTreatsDeferredPlanAsNoWork(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	m1 := meta(ulid.MustNew(1, nil), 0, 100)
 	m2 := meta(ulid.MustNew(2, nil), 100, 200)
@@ -249,7 +249,7 @@ func TestPlansSingleBlockGroups(t *testing.T) {
 // invoked at all when the planner has no work, matching the previous behavior
 // of returning early.
 func TestGroupCompactSkipsExecutorWhenNothingPlanned(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	cg := testGroup(t, meta(ulid.MustNew(1, nil), 0, 100))
 	exec := &recordingExecutor{}
@@ -264,7 +264,7 @@ func TestGroupCompactSkipsExecutorWhenNothingPlanned(t *testing.T) {
 // TestGroupPlanHaltsOnOverlap asserts the pre-compaction overlap check still
 // produces a halt error, now from Plan rather than from compact.
 func TestGroupPlanHaltsOnOverlap(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Two blocks covering the same time range overlap.
 	cg := testGroup(t,
@@ -366,7 +366,7 @@ func TestGroupPlanNamesSiblingsFromItsView(t *testing.T) {
 	testutil.Assert(t, shardA != nil, "no group for shard a")
 
 	planner := stubPlanner{plan: []*metadata.Meta{view[ulid.MustNew(1, nil)], view[ulid.MustNew(3, nil)]}}
-	plan, err := shardA.Plan(context.Background(), planner, make(chan error, 1))
+	plan, err := shardA.Plan(t.Context(), planner, make(chan error, 1))
 	testutil.Ok(t, err)
 	testutil.Equals(t, []ulid.ULID{ulid.MustNew(2, nil)}, plan.Siblings)
 }

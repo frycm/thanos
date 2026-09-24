@@ -4,7 +4,6 @@
 package compacttest
 
 import (
-	"context"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -76,7 +75,7 @@ func Scenarios() []Scenario {
 						break
 					}
 				}
-				testutil.Ok(t, r.Shared.Upload(context.Background(), filepath.Join(damaged.ID.String(), block.IndexFilename), strings.NewReader("this is not an index")))
+				testutil.Ok(t, r.Shared.Upload(t.Context(), filepath.Join(damaged.ID.String(), block.IndexFilename), strings.NewReader("this is not an index")))
 
 				// The plain group fails on every pass, as it would in the
 				// binary; a few passes are enough to give it every chance.
@@ -95,7 +94,7 @@ func Scenarios() []Scenario {
 					if _, ok := corpusIDs[id]; ok {
 						continue
 					}
-					m, err := block.DownloadMeta(context.Background(), log.NewNopLogger(), r.Shared, id)
+					m, err := block.DownloadMeta(t.Context(), log.NewNopLogger(), r.Shared, id)
 					testutil.Ok(t, err)
 					testutil.Assert(t, m.Thanos.Labels["tenant"] != "plain", "block %s was produced for the damaged group", id)
 				}

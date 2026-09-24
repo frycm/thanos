@@ -4,7 +4,6 @@
 package compact
 
 import (
-	"context"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -43,7 +42,7 @@ func blockContent(t *testing.T, dir string, id ulid.ULID) (series map[string][]s
 	series = map[string][]string{}
 	lsets = map[string]labels.Labels{}
 	k, v := index.AllPostingsKey()
-	all, err := ir.Postings(context.Background(), k, v)
+	all, err := ir.Postings(t.Context(), k, v)
 	testutil.Ok(t, err)
 	for all.Next() {
 		var builder labels.ScratchBuilder
@@ -83,7 +82,7 @@ func blockContent(t *testing.T, dir string, id ulid.ULID) (series map[string][]s
 // exactly the partition its hash says, and that a partition's symbol table
 // only holds what its series use.
 func TestPartitionedBlockPopulator(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	dir := t.TempDir()
 	var series []labels.Labels
 	for i := range 40 {
@@ -177,7 +176,7 @@ func TestSeriesPartitionWithout(t *testing.T) {
 // partition leaves that label out of its hash, and the populators' tallies
 // show the partitions covering every series.
 func TestPartitionedBlockPopulatorKeepsReplicasTogether(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	dir := t.TempDir()
 	var series []labels.Labels
 	for i := range 40 {
