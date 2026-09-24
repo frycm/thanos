@@ -114,6 +114,13 @@ type Thanos struct {
 	// neither outputs nor siblings.
 	Output *ThanosOutput `json:"output,omitempty"`
 
+	// SeriesReplicaLabels, when present, are the series labels the block was
+	// deduplicated by: series that differed only in them were merged and the
+	// labels dropped. A compaction records it when it deduplicated; a
+	// downsampled block inherits it from its source. Nothing on the read path
+	// consults it; it tells operators and tools which blocks were processed.
+	SeriesReplicaLabels []string `json:"series_replica_labels,omitempty"`
+
 	// UploadTime is used to track when the meta.json file was uploaded to the object storage
 	// without an extra Attributes call. Used for consistency filter.
 	UploadTime time.Time `json:"upload_time,omitempty"`

@@ -1327,6 +1327,16 @@ type LocalPlanExecutor struct {
 	// deletion in the bucket once the compacted result has been uploaded. It is
 	// true for the in-process compactor.
 	MarkSourcesForDeletion bool
+
+	// SeriesReplicaLabels, if set, are series labels to deduplicate by: every
+	// compaction merges series that differ only in them, with the
+	// compactor's merge function, and drops them from what it writes. See
+	// DeduplicatingBlockPopulator. It is a policy of the whole stream, like
+	// the external replica labels, so it is configured here rather than
+	// decided per plan.
+	SeriesReplicaLabels []string
+	// SeriesDedupMetrics, if set, counts what series deduplication does.
+	SeriesDedupMetrics *SeriesDedupMetrics
 }
 
 // Execute implements PlanExecutor.
@@ -1417,6 +1427,7 @@ func (ex LocalPlanExecutor) Execute(ctx context.Context, dir string, cg *Group, 
 
 	begin = time.Now()
 	var compIDs []ulid.ULID
+	replicaLabels := NormalizeSeriesReplicaLabels(ex.SeriesReplicaLabels)
 	if err := tracing.DoInSpanWithErr(ctx, "compaction", func(ctx context.Context) (e error) {
 		populateBlockFunc, e := ex.Callback.GetBlockPopulator(ctx, cg.logger, cg)
 		if e != nil {
@@ -1426,10 +1437,22 @@ func (ex LocalPlanExecutor) Execute(ctx context.Context, dir string, cg *Group, 
 			level.Info(cg.logger).Log("msg", "compacting into several blocks", "outputs", len(outputs), "plan", sourceBlockStr)
 		}
 		stats := make([]PartitionStats, len(outputs))
+		dedupStats := make([]SeriesDedupStats, len(outputs))
 		for i, out := range outputs {
 			populator := populateBlockFunc
-			if out.Series != nil {
-				if _, isDefault := populateBlockFunc.(tsdb.DefaultBlockPopulator); !isDefault {
+			_, isDefault := populateBlockFunc.(tsdb.DefaultBlockPopulator)
+			switch {
+			case len(replicaLabels) > 0:
+				if !isDefault {
+					return errors.Errorf("cannot deduplicate series replicas in a compaction whose lifecycle callback provides its own block populator (%T)", populateBlockFunc)
+				}
+				dp := DeduplicatingBlockPopulator{ReplicaLabels: replicaLabels, Stats: &dedupStats[i]}
+				if out.Series != nil {
+					dp.Partition, dp.PartitionStats = out.Series, &stats[i]
+				}
+				populator = dp
+			case out.Series != nil:
+				if !isDefault {
 					return errors.Errorf("cannot partition a compaction whose lifecycle callback provides its own block populator (%T)", populateBlockFunc)
 				}
 				populator = PartitionedBlockPopulator{Partition: *out.Series, Stats: &stats[i]}
@@ -1445,6 +1468,17 @@ func (ex LocalPlanExecutor) Execute(ctx context.Context, dir string, cg *Group, 
 				outputOf[id] = producedBy{output: out, index: i}
 			}
 			compIDs = append(compIDs, ids...)
+		}
+		if len(replicaLabels) > 0 {
+			var in, out uint64
+			for _, st := range dedupStats {
+				in, out = in+st.Input, out+st.Output
+			}
+			if ex.SeriesDedupMetrics != nil {
+				ex.SeriesDedupMetrics.Input.Add(float64(in))
+				ex.SeriesDedupMetrics.Output.Add(float64(out))
+			}
+			level.Info(cg.logger).Log("msg", "deduplicated series replicas", "labels", strings.Join(replicaLabels, ","), "inputSeries", in, "outputSeries", out, "plan", sourceBlockStr)
 		}
 		return partitionsCover(outputs, stats)
 	}); err != nil {
@@ -1511,6 +1545,9 @@ func (ex LocalPlanExecutor) Execute(ctx context.Context, dir string, cg *Group, 
 			Source:       metadata.CompactorSource,
 			SegmentFiles: block.GetSegmentFiles(bdir),
 			Extensions:   cg.Extensions(),
+		}
+		if len(replicaLabels) > 0 {
+			thanosMeta.SeriesReplicaLabels = slices.Clone(replicaLabels)
 		}
 		if len(plan.Outputs) > 0 || len(plan.Siblings) > 0 {
 			// The outputs of a plan replace the sources as a set, and only a

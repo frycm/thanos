@@ -433,7 +433,24 @@ func CreateBlock(
 	hashFunc metadata.HashFunc,
 	sampleTypes []chunkenc.ValueType,
 ) (id ulid.ULID, err error) {
-	return createBlock(ctx, dir, series, numSamples, mint, maxt, extLset, resolution, false, hashFunc, sampleTypes)
+	return createBlock(ctx, dir, series, numSamples, mint, maxt, extLset, resolution, false, hashFunc, sampleTypes, nil)
+}
+
+// CreateBlockWithSampleOffsets is CreateBlock with every sample of a series
+// shifted by offset(series) milliseconds, as replicas scraping the same
+// targets at different moments write them. Offsets must stay below the step
+// between samples, (maxt-mint)/(numSamples+1), for the samples to stay in
+// the block's range.
+func CreateBlockWithSampleOffsets(
+	ctx context.Context,
+	dir string,
+	series []labels.Labels,
+	numSamples int,
+	mint, maxt int64,
+	extLset labels.Labels,
+	offset func(labels.Labels) int64,
+) (id ulid.ULID, err error) {
+	return createBlock(ctx, dir, series, numSamples, mint, maxt, extLset, 0, false, metadata.NoneFunc, nil, offset)
 }
 
 // CreateBlockWithTombstone is same as CreateBlock but leaves tombstones which mimics the Prometheus local block.
@@ -448,7 +465,7 @@ func CreateBlockWithTombstone(
 	hashFunc metadata.HashFunc,
 	sampleTypes []chunkenc.ValueType,
 ) (id ulid.ULID, err error) {
-	return createBlock(ctx, dir, series, numSamples, mint, maxt, extLset, resolution, true, hashFunc, sampleTypes)
+	return createBlock(ctx, dir, series, numSamples, mint, maxt, extLset, resolution, true, hashFunc, sampleTypes, nil)
 }
 
 // CreateBlockWithBlockDelay writes a block with the given series and numSamples samples each.
@@ -502,7 +519,7 @@ func CreateFloatHistogramBlockWithDelay(
 }
 
 func createBlockWithDelay(ctx context.Context, dir string, series []labels.Labels, numSamples int, mint int64, maxt int64, blockDelay time.Duration, extLset labels.Labels, resolution int64, hashFunc metadata.HashFunc, sampleTypes []chunkenc.ValueType) (ulid.ULID, error) {
-	blockID, err := createBlock(ctx, dir, series, numSamples, mint, maxt, extLset, resolution, false, hashFunc, sampleTypes)
+	blockID, err := createBlock(ctx, dir, series, numSamples, mint, maxt, extLset, resolution, false, hashFunc, sampleTypes, nil)
 	if err != nil {
 		return ulid.ULID{}, errors.Wrap(err, "block creation")
 	}
@@ -542,6 +559,7 @@ func createBlock(
 	tombstones bool,
 	hashFunc metadata.HashFunc,
 	sampleTypes []chunkenc.ValueType,
+	offset func(labels.Labels) int64,
 ) (id ulid.ULID, err error) {
 	headOpts := tsdb.DefaultHeadOptions()
 	headOpts.ChunkDirRoot = filepath.Join(dir, "chunks")
@@ -585,16 +603,20 @@ func createBlock(
 					var err error
 
 					var sampleType = sampleTypes[si.Add(1)%int64(len(sampleTypes))]
+					ts := t
+					if offset != nil {
+						ts += offset(lset)
+					}
 
 					switch sampleType {
 					case chunkenc.ValFloat:
 						randMutex.Lock()
-						_, err = app.Append(0, lset, t, r.Float64())
+						_, err = app.Append(0, lset, ts, r.Float64())
 						randMutex.Unlock()
 					case chunkenc.ValHistogram:
-						_, err = app.AppendHistogram(0, lset, t, &histogramSample, nil)
+						_, err = app.AppendHistogram(0, lset, ts, &histogramSample, nil)
 					case chunkenc.ValFloatHistogram:
-						_, err = app.AppendHistogram(0, lset, t, nil, &floatHistogramSample)
+						_, err = app.AppendHistogram(0, lset, ts, nil, &floatHistogramSample)
 					}
 
 					if err != nil {
