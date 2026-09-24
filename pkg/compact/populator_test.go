@@ -84,7 +84,7 @@ func blockContent(t *testing.T, dir string, id ulid.ULID) (series map[string][]s
 func TestPartitionedBlockPopulator(t *testing.T) {
 	ctx := t.Context()
 	dir := t.TempDir()
-	var series []labels.Labels
+	series := make([]labels.Labels, 0, 40)
 	for i := range 40 {
 		series = append(series, labels.FromStrings("__name__", fmt.Sprintf("metric_%d", i%5), "instance", fmt.Sprintf("host-%d", i), "job", "api"))
 	}
@@ -94,8 +94,14 @@ func TestPartitionedBlockPopulator(t *testing.T) {
 		testutil.Ok(t, err)
 		dirs = append(dirs, filepath.Join(dir, id.String()))
 	}
-	comp, err := tsdb.NewLeveledCompactor(ctx, nil, slog.Default(), []int64{time.Hour.Milliseconds(), 2 * time.Hour.Milliseconds()}, chunkenc.NewPool(),
-		storage.NewCompactingChunkSeriesMerger(storage.ChainedSeriesMerge))
+	comp, err := tsdb.NewLeveledCompactor(
+		ctx,
+		nil,
+		slog.Default(),
+		[]int64{time.Hour.Milliseconds(), 2 * time.Hour.Milliseconds()},
+		chunkenc.NewPool(),
+		storage.NewCompactingChunkSeriesMerger(storage.ChainedSeriesMerge),
+	)
 	testutil.Ok(t, err)
 
 	out := t.TempDir()
@@ -110,7 +116,7 @@ func TestPartitionedBlockPopulator(t *testing.T) {
 	seen := map[string]int{}
 	for i := range uint64(count) {
 		part := SeriesPartition{Index: i, Count: count}
-		ids, err := comp.CompactWithBlockPopulator(out, dirs, nil, PartitionedBlockPopulator{Partition: part})
+		ids, err = comp.CompactWithBlockPopulator(out, dirs, nil, PartitionedBlockPopulator{Partition: part})
 		testutil.Ok(t, err)
 		if len(ids) == 0 {
 			continue // An empty partition produces no block.
@@ -137,10 +143,25 @@ func TestPartitionedBlockPopulator(t *testing.T) {
 }
 
 func TestSeriesPartitionValidate(t *testing.T) {
-	testutil.Ok(t, SeriesPartition{Index: 0, Count: 1}.Validate())
-	testutil.Ok(t, SeriesPartition{Index: 3, Count: 4}.Validate())
-	testutil.NotOk(t, SeriesPartition{}.Validate())
-	testutil.NotOk(t, SeriesPartition{Index: 4, Count: 4}.Validate())
+	for _, tcase := range []struct {
+		name      string
+		partition SeriesPartition
+		valid     bool
+	}{
+		{name: "single partition", partition: SeriesPartition{Index: 0, Count: 1}, valid: true},
+		{name: "last of four", partition: SeriesPartition{Index: 3, Count: 4}, valid: true},
+		{name: "zero count", partition: SeriesPartition{}},
+		{name: "index out of range", partition: SeriesPartition{Index: 4, Count: 4}},
+	} {
+		t.Run(tcase.name, func(t *testing.T) {
+			err := tcase.partition.Validate()
+			if tcase.valid {
+				testutil.Ok(t, err)
+				return
+			}
+			testutil.NotOk(t, err)
+		})
+	}
 }
 
 // TestSeriesPartitionWithout: a partition that leaves labels out of its hash
@@ -178,17 +199,24 @@ func TestSeriesPartitionWithout(t *testing.T) {
 func TestPartitionedBlockPopulatorKeepsReplicasTogether(t *testing.T) {
 	ctx := t.Context()
 	dir := t.TempDir()
-	var series []labels.Labels
+	replicas := []string{"a", "b"}
+	series := make([]labels.Labels, 0, 40*len(replicas))
 	for i := range 40 {
-		for _, replica := range []string{"a", "b"} {
+		for _, replica := range replicas {
 			series = append(series, labels.FromStrings("__name__", fmt.Sprintf("metric_%d", i%5), "instance", fmt.Sprintf("host-%d", i), "job", "api", "replica", replica))
 		}
 	}
 	id, err := e2eutil.CreateBlock(ctx, dir, series, 30, 0, time.Hour.Milliseconds(), labels.FromStrings("ext", "1"), 0, metadata.NoneFunc, nil)
 	testutil.Ok(t, err)
 	dirs := []string{filepath.Join(dir, id.String())}
-	comp, err := tsdb.NewLeveledCompactor(ctx, nil, slog.Default(), []int64{time.Hour.Milliseconds(), 2 * time.Hour.Milliseconds()}, chunkenc.NewPool(),
-		storage.NewCompactingChunkSeriesMerger(storage.ChainedSeriesMerge))
+	comp, err := tsdb.NewLeveledCompactor(
+		ctx,
+		nil,
+		slog.Default(),
+		[]int64{time.Hour.Milliseconds(), 2 * time.Hour.Milliseconds()},
+		chunkenc.NewPool(),
+		storage.NewCompactingChunkSeriesMerger(storage.ChainedSeriesMerge),
+	)
 	testutil.Ok(t, err)
 	out := t.TempDir()
 

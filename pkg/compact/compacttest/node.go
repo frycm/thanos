@@ -64,7 +64,7 @@ func (c NodeConfig) WithDefaults() NodeConfig {
 func (c NodeConfig) Vertical() bool { return len(c.DedupReplicaLabels) > 0 }
 
 // HANodeConfig is the configuration of the deployment the suites exist for:
-// penalty deduplication over the Prometheus and receive replica labels.
+// penalty deduplication over the Prometheus and receiver replica labels.
 func HANodeConfig() NodeConfig {
 	return NodeConfig{DedupReplicaLabels: []string{"prometheus_replica", "receiver_replica", "otelcol_replica", "ruler_replica"}, DedupFunc: compact.DedupAlgorithmPenalty}
 }
@@ -185,8 +185,18 @@ func NewNode(t *testing.T, shared objstore.Bucket, conf NodeConfig, hooks Hooks)
 		n.downsample = downsampleInProcess
 	}
 
-	n.Compactor, err = compact.NewBucketCompactorWithExecutor(n.Logger, n.Syncer, grouper, planner, executor,
-		filepath.Join(n.Dir, "compact"), insBkt, conf.Concurrency, false, cleaner)
+	n.Compactor, err = compact.NewBucketCompactorWithExecutor(
+		n.Logger,
+		n.Syncer,
+		grouper,
+		planner,
+		executor,
+		filepath.Join(n.Dir, "compact"),
+		insBkt,
+		conf.Concurrency,
+		false,
+		cleaner,
+	)
 	testutil.Ok(t, err)
 	return n
 }

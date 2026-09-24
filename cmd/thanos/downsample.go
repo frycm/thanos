@@ -255,13 +255,11 @@ func downsampleBucket(
 	// Workers scheduled, distribute blocks.
 metaSendLoop:
 	for _, c := range candidates {
-		m := c.Meta
-
 		select {
 		case <-workerCtx.Done():
 			downsampleErrs.Add(workerCtx.Err())
 			break metaSendLoop
-		case metaCh <- m:
+		case metaCh <- c.Meta:
 		case downsampleErr := <-errCh:
 			downsampleErrs.Add(downsampleErr)
 			break metaSendLoop

@@ -38,8 +38,11 @@ import (
 	"github.com/thanos-io/thanos/pkg/testutil/e2eutil"
 )
 
-var runScenarios = flag.Bool("compact.scenarios", false,
-	"Run the in-process fault scenario suites of the compactor. Slow; off by default.")
+var runScenarios = flag.Bool(
+	"compact.scenarios",
+	false,
+	"Run the in-process fault scenario suites of the compactor. Slow; off by default.",
+)
 
 // SkipUnlessScenarios skips the test unless the scenario suites were asked for
 // with -compact.scenarios or THANOS_COMPACT_SCENARIOS in the environment.
@@ -50,7 +53,7 @@ func SkipUnlessScenarios(t *testing.T) {
 	}
 }
 
-// Window is the raw block length, as Prometheus and receive cut them.
+// Window is the raw block length, as Prometheus and receivers cut them.
 const Window = 2 * time.Hour
 
 // Levels are the compaction ranges every node plans with. A raw block is
@@ -68,7 +71,7 @@ type TenantSpec struct {
 	// ExternalReplicaLabel defaults to receiver_replica; rulers use ruler_replica.
 	ExternalReplicaLabel string
 	// Receivers are the receiver_replica values written as an external label,
-	// one block per receiver per window; empty means no receive replication.
+	// one block per receiver per window; empty means no receiver replication.
 	Receivers []string
 	Series    int
 	Windows   int
@@ -129,7 +132,7 @@ func BuildCorpus(t *testing.T, name string, tenants []TenantSpec) *Corpus {
 		if len(promReplicas) == 0 {
 			promReplicas = []string{""}
 		}
-		var series []labels.Labels
+		series := make([]labels.Labels, 0, len(promReplicas)*tn.Series)
 		for _, pr := range promReplicas {
 			for i := range tn.Series {
 				b := labels.NewBuilder(labels.EmptyLabels())
@@ -174,8 +177,15 @@ func (c *Corpus) Upload(t *testing.T, bkt objstore.Bucket) {
 	for _, b := range c.Blocks {
 		testutil.Ok(t, block.Upload(ctx, logger, bkt, b.Dir, metadata.NoneFunc))
 		if b.Mark != "" {
-			testutil.Ok(t, block.MarkForNoCompact(ctx, logger, bkt, b.ID, b.Mark, "scenario corpus",
-				promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "scenario_marks_total", Help: "Blocks the corpus marked no-compact."})))
+			testutil.Ok(t, block.MarkForNoCompact(
+				ctx,
+				logger,
+				bkt,
+				b.ID,
+				b.Mark,
+				"scenario corpus",
+				promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "scenario_marks_total", Help: "Blocks the corpus marked no-compact."}),
+			))
 		}
 	}
 }

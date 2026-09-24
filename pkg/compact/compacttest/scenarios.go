@@ -37,8 +37,9 @@ func Scenarios() []Scenario {
 				before := r.Fingerprint()
 				r.Inject(func() {
 					r.WaitFor("work to be under way", func() bool { return r.Fingerprint() != before })
-					var lifts []func()
-					for _, v := range r.Views() {
+					views := r.Views()
+					lifts := make([]func(), 0, len(views))
+					for _, v := range views {
 						lifts = append(lifts, v.Outage())
 					}
 					time.Sleep(750 * time.Millisecond)
