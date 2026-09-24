@@ -88,6 +88,17 @@ tools bucket retention [<flags>]
 tools bucket upload-blocks [<flags>]
     Upload blocks push blocks from the provided path to the object storage.
 
+tools bucket rollback-distributed-compaction [<flags>]
+    Experimental. Undo what the distributed compactor
+    (--compact.mode=manager/worker) did to the bucket: restore the recorded
+    sources, including garbage-collection marks, then delete the blocks its
+    workers produced, returning the bucket to the state the standalone compactor
+    left behind. Stop the manager and every worker first and wait for in-flight
+    tasks to end; the command refuses to apply while a journal in scope looks
+    alive. Run it before the compactor's --delete-delay has passed for the
+    oldest marks, since a block that was physically deleted cannot be restored.
+    Nothing is changed unless --no-dry-run is given.
+
 tools rules-check --rules=RULES
     Check if the rule files are valid or not.
 
@@ -226,6 +237,17 @@ tools bucket retention [<flags>]
 
 tools bucket upload-blocks [<flags>]
     Upload blocks push blocks from the provided path to the object storage.
+
+tools bucket rollback-distributed-compaction [<flags>]
+    Experimental. Undo what the distributed compactor
+    (--compact.mode=manager/worker) did to the bucket: restore the recorded
+    sources, including garbage-collection marks, then delete the blocks its
+    workers produced, returning the bucket to the state the standalone compactor
+    left behind. Stop the manager and every worker first and wait for in-flight
+    tasks to end; the command refuses to apply while a journal in scope looks
+    alive. Run it before the compactor's --delete-delay has passed for the
+    oldest marks, since a block that was physically deleted cannot be restored.
+    Nothing is changed unless --no-dry-run is given.
 
 
 ```
