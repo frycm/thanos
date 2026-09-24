@@ -31,7 +31,7 @@ func TestPlanPicksBlocksThatNeedDownsampling(t *testing.T) {
 		raw: planMeta(raw, ResLevel0, ResLevel1DownsampleRange),
 	}
 
-	got, err := Plan(metas)
+	got, err := Plan(metas, PlanOptions{})
 	testutil.Ok(t, err)
 	testutil.Equals(t, 1, len(got))
 	testutil.Equals(t, raw, got[0].Meta.ULID)
@@ -45,9 +45,35 @@ func TestPlanSkipsBlocksThatAreTooShort(t *testing.T) {
 		raw: planMeta(raw, ResLevel0, ResLevel1DownsampleRange-1),
 	}
 
-	got, err := Plan(metas)
+	got, err := Plan(metas, PlanOptions{})
 	testutil.Ok(t, err)
 	testutil.Equals(t, 0, len(got))
+}
+
+// TestPlanLeavesNoDownsampleMarkedBlocksOut: a marked block is never a
+// candidate, and a marked downsampled block covers nothing, as if neither
+// were in view.
+func TestPlanLeavesNoDownsampleMarkedBlocksOut(t *testing.T) {
+	raw, marked, markedDown := ulid.MustNew(1, nil), ulid.MustNew(2, nil), ulid.MustNew(3, nil)
+	metas := map[ulid.ULID]*metadata.Meta{
+		raw:        planMeta(raw, ResLevel0, ResLevel1DownsampleRange),
+		marked:     planMeta(marked, ResLevel0, ResLevel1DownsampleRange),
+		markedDown: planMeta(markedDown, ResLevel1, ResLevel1DownsampleRange, raw),
+	}
+
+	got, err := Plan(metas, PlanOptions{})
+	testutil.Ok(t, err)
+	testutil.Equals(t, 1, len(got), "unmarked, the 5m block covers raw and only the other raw block is left")
+	testutil.Equals(t, marked, got[0].Meta.ULID)
+
+	got, err = Plan(metas, PlanOptions{NoDownsampleMarked: map[ulid.ULID]*metadata.NoDownsampleMark{
+		marked:     {ID: marked},
+		markedDown: {ID: markedDown},
+	}})
+	testutil.Ok(t, err)
+	testutil.Equals(t, 1, len(got), "the marked block is no candidate, and the marked 5m block no coverage")
+	testutil.Equals(t, raw, got[0].Meta.ULID)
+	testutil.Equals(t, ResLevel1, got[0].TargetResolution)
 }
 
 func TestPlanSkipsBlocksAlreadyCovered(t *testing.T) {
@@ -60,7 +86,7 @@ func TestPlanSkipsBlocksAlreadyCovered(t *testing.T) {
 		already: planMeta(already, ResLevel1, ResLevel1DownsampleRange, raw),
 	}
 
-	got, err := Plan(metas)
+	got, err := Plan(metas, PlanOptions{})
 	testutil.Ok(t, err)
 	testutil.Equals(t, 0, len(got))
 }
@@ -71,7 +97,7 @@ func TestPlanAdvancesFiveMinuteBlocksToOneHour(t *testing.T) {
 		fiveMin: planMeta(fiveMin, ResLevel1, ResLevel2DownsampleRange),
 	}
 
-	got, err := Plan(metas)
+	got, err := Plan(metas, PlanOptions{})
 	testutil.Ok(t, err)
 	testutil.Equals(t, 1, len(got))
 	testutil.Equals(t, ResLevel2, got[0].TargetResolution)
@@ -83,7 +109,7 @@ func TestPlanIgnoresFullyDownsampledBlocks(t *testing.T) {
 		oneHour: planMeta(oneHour, ResLevel2, ResLevel2DownsampleRange),
 	}
 
-	got, err := Plan(metas)
+	got, err := Plan(metas, PlanOptions{})
 	testutil.Ok(t, err)
 	testutil.Equals(t, 0, len(got))
 }
@@ -94,7 +120,7 @@ func TestPlanRejectsUnknownResolution(t *testing.T) {
 		odd: planMeta(odd, 1234, 100),
 	}
 
-	_, err := Plan(metas)
+	_, err := Plan(metas, PlanOptions{})
 	testutil.NotOk(t, err)
 }
 
@@ -107,10 +133,10 @@ func TestPlanIsDeterministic(t *testing.T) {
 		metas[id] = planMeta(id, ResLevel0, ResLevel1DownsampleRange)
 	}
 
-	first, err := Plan(metas)
+	first, err := Plan(metas, PlanOptions{})
 	testutil.Ok(t, err)
 	for i := 0; i < 5; i++ {
-		got, err := Plan(metas)
+		got, err := Plan(metas, PlanOptions{})
 		testutil.Ok(t, err)
 		testutil.Equals(t, len(first), len(got))
 		for j := range first {
@@ -137,7 +163,7 @@ func TestPlanScopesCoverageByExternalLabels(t *testing.T) {
 		down1: shard(planMeta(down1, ResLevel1, ResLevel1DownsampleRange, source), "1_of_2"),
 	}
 
-	got, err := Plan(metas)
+	got, err := Plan(metas, PlanOptions{})
 	testutil.Ok(t, err)
 	testutil.Equals(t, 1, len(got), "shard 2 has never been downsampled")
 	testutil.Equals(t, raw2, got[0].Meta.ULID)

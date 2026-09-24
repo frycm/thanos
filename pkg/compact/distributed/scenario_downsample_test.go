@@ -5,21 +5,16 @@ package distributed
 
 import (
 	"context"
-	"maps"
 
 	"github.com/oklog/ulid/v2"
 
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/compact/compacttest"
+	"github.com/thanos-io/thanos/pkg/compact/downsample"
 )
 
-// downsample is the manager's half of the binary's runDownsampling: the
-// candidates go to workers. Blocks marked no-downsample are taken out of the
-// view first, as the binary does.
-func (n *node) downsample(ctx context.Context, cn *compacttest.Node, metas map[ulid.ULID]*metadata.Meta, _ map[ulid.ULID]*metadata.NoCompactMark, noDownsample map[ulid.ULID]*metadata.NoDownsampleMark) error {
-	metas = maps.Clone(metas)
-	for id := range noDownsample {
-		delete(metas, id)
-	}
-	return DispatchDownsampling(ctx, cn.Logger, cn.Bkt, n.sched, metas, 2, metadata.NoneFunc, 1, false, n.downsamples, n.downsampleFailures)
+// downsample is the manager's half of the binary's downsampling pass: the
+// candidates go to workers, planned as the binary plans them.
+func (n *node) downsample(ctx context.Context, cn *compacttest.Node, metas map[ulid.ULID]*metadata.Meta, opts downsample.PlanOptions) error {
+	return DispatchDownsampling(ctx, cn.Logger, cn.Bkt, n.sched, metas, opts, 2, metadata.NoneFunc, 1, false, n.downsamples, n.downsampleFailures)
 }

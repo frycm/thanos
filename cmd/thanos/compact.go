@@ -346,7 +346,7 @@ func runCompact(
 		}
 	}()
 
-	mergeFunc, err := dedupFuncFor(conf, dedupReplicaLabels)
+	mergeFunc, err := dedupFuncFor(conf)
 	if err != nil {
 		return err
 	}
@@ -400,17 +400,36 @@ func runCompact(
 	}
 	blocksCleaner := compact.NewBlocksCleaner(logger, insBkt, ignoreDeletionMarkFilter, deleteDelay, compactMetrics.blocksCleaned, compactMetrics.blockCleanupFailures)
 
+	// How a plan is executed and how blocks are downsampled are chosen here,
+	// once: the compaction and downsampling loops below only call them.
+	localExecutor := compact.LocalPlanExecutor{
+		Comp:                   comp,
+		BlockDeletableChecker:  compact.DefaultBlockDeletableChecker{},
+		Callback:               compact.DefaultCompactionLifecycleCallback{},
+		MarkSourcesForDeletion: true,
+	}
+
+	var planExecutor compact.PlanExecutor = localExecutor
+	downsampleBlocks := func(ctx context.Context, metas map[ulid.ULID]*metadata.Meta, opts downsample.PlanOptions) error {
+		return downsampleBucket(
+			ctx,
+			logger,
+			downsampleMetrics,
+			insBkt,
+			metas,
+			opts,
+			downsamplingDir,
+			conf.downsampleConcurrency,
+			conf.blockFilesConcurrency,
+			metadata.HashFunc(conf.hashFunc),
+			conf.acceptMalformedIndex,
+		)
+	}
+
 	// In manager mode planning stays here but execution moves to workers, so the
-	// compactor is given a remote executor instead of compacting in process.
-	var (
-		scheduler    *distributed.Scheduler
-		planExecutor compact.PlanExecutor = compact.LocalPlanExecutor{
-			Comp:                   comp,
-			BlockDeletableChecker:  compact.DefaultBlockDeletableChecker{},
-			Callback:               compact.DefaultCompactionLifecycleCallback{},
-			MarkSourcesForDeletion: true,
-		}
-	)
+	// compactor is given a remote executor instead of compacting in process, and
+	// downsampling is dispatched to workers as well.
+	var scheduler *distributed.Scheduler
 	if conf.mode == compactModeManager {
 		scheduler, err = distributed.NewScheduler(ctx, logger, insBkt, reg, distributed.ManagerConfig{
 			JournalID:          conf.managerJournalID,
@@ -427,6 +446,22 @@ func runCompact(
 			return errors.Wrap(err, "create compaction scheduler")
 		}
 		planExecutor = distributed.NewRemotePlanExecutor(logger, insBkt, scheduler, planner, conf.managerMaxInflightPerGroup, nil)
+		downsampleBlocks = func(ctx context.Context, metas map[ulid.ULID]*metadata.Meta, opts downsample.PlanOptions) error {
+			return distributed.DispatchDownsampling(
+				ctx,
+				logger,
+				insBkt,
+				scheduler,
+				metas,
+				opts,
+				conf.downsampleConcurrency,
+				metadata.HashFunc(conf.hashFunc),
+				conf.blockFilesConcurrency,
+				conf.acceptMalformedIndex,
+				downsampleMetrics.downsamples,
+				downsampleMetrics.downsampleFailures,
+			)
+		}
 		// A worker's output supersedes the blocks it was made from only once
 		// this manager has verified it; a result it rejected never does.
 		duplicateBlocksFilter.SetPublishedFunc(scheduler.PublishedFunc())
@@ -521,10 +556,6 @@ func runCompact(
 			}
 
 			filteredMetas := sy.Metas()
-			noDownsampleBlocks := noDownsampleMarkerFilter.NoDownsampleMarkedBlocks()
-			for ul := range noDownsampleBlocks {
-				delete(filteredMetas, ul)
-			}
 
 			for _, meta := range filteredMetas {
 				resolutionLabel := meta.Thanos.ResolutionString()
@@ -532,7 +563,9 @@ func runCompact(
 				downsampleMetrics.downsampleFailures.WithLabelValues(resolutionLabel)
 			}
 
-			if err := runDownsampling(ctx, logger, scheduler, downsampleMetrics, insBkt, filteredMetas, downsamplingDir, conf); err != nil {
+			if err := downsampleBlocks(ctx, filteredMetas, downsample.PlanOptions{
+				NoDownsampleMarked: noDownsampleMarkerFilter.NoDownsampleMarkedBlocks(),
+			}); err != nil {
 				return errors.Wrap(err, "first pass of downsampling failed")
 			}
 
@@ -544,12 +577,10 @@ func runCompact(
 			// Regenerate the filtered list of blocks after the sync,
 			// to include the blocks created by the first pass.
 			filteredMetas = sy.Metas()
-			noDownsampleBlocks = noDownsampleMarkerFilter.NoDownsampleMarkedBlocks()
-			for ul := range noDownsampleBlocks {
-				delete(filteredMetas, ul)
-			}
 
-			if err := runDownsampling(ctx, logger, scheduler, downsampleMetrics, insBkt, filteredMetas, downsamplingDir, conf); err != nil {
+			if err := downsampleBlocks(ctx, filteredMetas, downsample.PlanOptions{
+				NoDownsampleMarked: noDownsampleMarkerFilter.NoDownsampleMarkedBlocks(),
+			}); err != nil {
 				return errors.Wrap(err, "second pass of downsampling failed")
 			}
 
@@ -976,6 +1007,22 @@ func (cc *compactConfig) registerFlag(cmd extkingpin.FlagClause) {
 	cmd.Flag("disable-admin-operations", "Disable UI/API admin operations like marking blocks for deletion and no compaction.").Default("false").BoolVar(&cc.disableAdminOperations)
 }
 
+// dedupFuncFor returns the vertical merge function --deduplication.func
+// selects, after checking the flags it depends on.
+func dedupFuncFor(conf compactConfig) (storage.VerticalChunkSeriesMergeFunc, error) {
+	switch conf.dedupFunc {
+	case compact.DedupAlgorithmPenalty:
+		if len(strutil.ParseFlagLabels(conf.dedupReplicaLabels)) == 0 {
+			return nil, errors.New("penalty based deduplication needs at least one replica label specified")
+		}
+		return dedup.NewChunkSeriesMerger(), nil
+	case "":
+		return storage.NewCompactingChunkSeriesMerger(storage.ChainedSeriesMerge), nil
+	default:
+		return nil, errors.Errorf("unsupported deduplication func, got %s", conf.dedupFunc)
+	}
+}
+
 // schedulerMaintenanceError decides what a failed maintenance tick means for
 // the manager. A halt - another manager took the journal over, or the journal
 // has been unwritable for too long - ends the manager: it must not stay alive
@@ -992,60 +1039,4 @@ func schedulerMaintenanceError(logger log.Logger, err error) error {
 	}
 	level.Warn(logger).Log("msg", "scheduler maintenance failed; retrying on the next tick", "err", err)
 	return nil
-}
-
-// dedupFuncFor returns the vertical merge function configured by --deduplication.func.
-func dedupFuncFor(conf compactConfig, dedupReplicaLabels []string) (storage.VerticalChunkSeriesMergeFunc, error) {
-	switch conf.dedupFunc {
-	case compact.DedupAlgorithmPenalty:
-		if len(dedupReplicaLabels) == 0 {
-			return nil, errors.New("penalty based deduplication needs at least one replica label specified")
-		}
-		return dedup.NewChunkSeriesMerger(), nil
-	case "":
-		return storage.NewCompactingChunkSeriesMerger(storage.ChainedSeriesMerge), nil
-	default:
-		return nil, errors.Errorf("unsupported deduplication func, got %s", conf.dedupFunc)
-	}
-}
-
-// runDownsampling downsamples the given blocks. In manager mode the work is
-// handed to workers; otherwise it happens in this process as it always has.
-func runDownsampling(
-	ctx context.Context,
-	logger log.Logger,
-	scheduler *distributed.Scheduler,
-	downsampleMetrics *DownsampleMetrics,
-	insBkt objstore.InstrumentedBucket,
-	metas map[ulid.ULID]*metadata.Meta,
-	downsamplingDir string,
-	conf compactConfig,
-) error {
-	if scheduler != nil {
-		return distributed.DispatchDownsampling(
-			ctx,
-			logger,
-			insBkt,
-			scheduler,
-			metas,
-			conf.downsampleConcurrency,
-			metadata.HashFunc(conf.hashFunc),
-			conf.blockFilesConcurrency,
-			conf.acceptMalformedIndex,
-			downsampleMetrics.downsamples,
-			downsampleMetrics.downsampleFailures,
-		)
-	}
-	return downsampleBucket(
-		ctx,
-		logger,
-		downsampleMetrics,
-		insBkt,
-		metas,
-		downsamplingDir,
-		conf.downsampleConcurrency,
-		conf.blockFilesConcurrency,
-		metadata.HashFunc(conf.hashFunc),
-		conf.acceptMalformedIndex,
-	)
 }

@@ -1838,6 +1838,7 @@ func DispatchDownsampling(
 	bkt objstore.Bucket,
 	sched *Scheduler,
 	metas map[ulid.ULID]*metadata.Meta,
+	opts downsample.PlanOptions,
 	concurrency int,
 	hashFunc metadata.HashFunc,
 	blockFilesConcurrency int,
@@ -1845,7 +1846,7 @@ func DispatchDownsampling(
 	downsamples *prometheus.CounterVec,
 	downsampleFailures *prometheus.CounterVec,
 ) error {
-	candidates, err := downsample.Plan(metas)
+	candidates, err := downsample.Plan(metas, opts)
 	if err != nil {
 		return err
 	}

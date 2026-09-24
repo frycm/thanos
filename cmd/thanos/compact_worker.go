@@ -90,7 +90,7 @@ func runCompactWorker(
 		return errors.Wrap(err, "get compaction levels")
 	}
 
-	mergeFunc, err := dedupFuncFor(conf, conf.dedupReplicaLabels)
+	mergeFunc, err := dedupFuncFor(conf)
 	if err != nil {
 		cancel()
 		return err
