@@ -17,8 +17,8 @@ It is recommend to upgrade the storage components first (Receive, Store, etc.) a
 - [#8667](https://github.com/thanos-io/thanos/pull/8667): Query: fix data race in GetStoreClients by making endpointRef mutex a pointer
 
 ### Added
-- [#5](https://github.com/frycm/thanos/issues/5) Compactor: experimental block splitting by series behind the hidden `--compact.block-split.max-shards` flag. A compaction estimated to exceed the index size limit is written as a power-of-two number of shard blocks carrying the external label `__compactor_shard__` instead of freezing its biggest source block; Store Gateway strips the label from what it serves. `--compact.block-split.ignore-labels` leaves series labels, such as in-series replica labels, out of the shard hash. Shards of an incomplete set are withheld from the compactor's view, and every plan over shards names the blocks that share a set with its sources so that they stay published.
 
+- [#5](https://github.com/frycm/thanos/issues/5) Compact: add experimental block splitting by series (hidden `--compact.block-split.*` flags): a compaction that would exceed the index size limit writes shard blocks labelled `__compactor_shard__` instead of marking its biggest source no-compact; store gateway strips the label from what it serves.
 - [#4](https://github.com/frycm/thanos/issues/4) Compactor: blocks record the set of blocks their compaction produced in `thanos.output` of `meta.json`, and replace their sources only once the whole set is in the bucket. The compactor and `tools bucket downsample` withhold blocks whose set is incomplete, counted as `state="unpublished"` in `thanos_blocks_meta_synced`; retention still applies to them. Block repair and `tools bucket rewrite` keep the set with the new block in the original's place.
 
 ### Changed
