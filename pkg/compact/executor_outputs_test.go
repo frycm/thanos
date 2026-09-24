@@ -38,7 +38,7 @@ func TestLocalPlanExecutorPublishesOutputsAsSet(t *testing.T) {
 	logger := log.NewNopLogger()
 	dir := t.TempDir()
 
-	var series []labels.Labels
+	series := make([]labels.Labels, 0, 20)
 	for i := range 20 {
 		series = append(series, labels.FromStrings("__name__", "metric", "instance", fmt.Sprintf("host-%d", i)))
 	}
@@ -59,8 +59,14 @@ func TestLocalPlanExecutorPublishesOutputsAsSet(t *testing.T) {
 	for _, m := range sources {
 		testutil.Ok(t, cg.AppendMeta(m))
 	}
-	comp, err := tsdb.NewLeveledCompactor(ctx, nil, slog.Default(), []int64{time.Hour.Milliseconds(), 2 * time.Hour.Milliseconds()}, chunkenc.NewPool(),
-		storage.NewCompactingChunkSeriesMerger(storage.ChainedSeriesMerge))
+	comp, err := tsdb.NewLeveledCompactor(
+		ctx,
+		nil,
+		slog.Default(),
+		[]int64{time.Hour.Milliseconds(), 2 * time.Hour.Milliseconds()},
+		chunkenc.NewPool(),
+		storage.NewCompactingChunkSeriesMerger(storage.ChainedSeriesMerge),
+	)
 	testutil.Ok(t, err)
 
 	plan := Plan{Sources: sources, Outputs: []PlanOutput{
@@ -76,8 +82,8 @@ func TestLocalPlanExecutorPublishesOutputsAsSet(t *testing.T) {
 	slices.SortFunc(want, func(a, b ulid.ULID) int { return a.Compare(b) })
 	seen := map[int]bool{}
 	for _, id := range compIDs {
-		m, err := block.DownloadMeta(ctx, logger, bkt, id)
-		testutil.Ok(t, err)
+		m, metaErr := block.DownloadMeta(ctx, logger, bkt, id)
+		testutil.Ok(t, metaErr)
 		testutil.Assert(t, m.Thanos.Output != nil, "result block %s records no output set", id)
 		testutil.Equals(t, 2, m.Thanos.Output.Count)
 		got := slices.Clone(m.Thanos.Output.Blocks)
@@ -93,8 +99,8 @@ func TestLocalPlanExecutorPublishesOutputsAsSet(t *testing.T) {
 
 	// The sources were retired only after the whole set was uploaded.
 	for _, s := range sources {
-		ok, err := bkt.Exists(ctx, filepath.Join(s.ULID.String(), metadata.DeletionMarkFilename))
-		testutil.Ok(t, err)
+		ok, existsErr := bkt.Exists(ctx, filepath.Join(s.ULID.String(), metadata.DeletionMarkFilename))
+		testutil.Ok(t, existsErr)
 		testutil.Equals(t, true, ok)
 	}
 }
@@ -110,7 +116,7 @@ func TestLocalPlanExecutorRefusesPartitionsThatLoseSeries(t *testing.T) {
 	logger := log.NewNopLogger()
 	dir := t.TempDir()
 
-	var series []labels.Labels
+	series := make([]labels.Labels, 0, 20)
 	for i := range 20 {
 		series = append(series, labels.FromStrings("__name__", "metric", "instance", fmt.Sprintf("host-%d", i)))
 	}
@@ -130,8 +136,14 @@ func TestLocalPlanExecutorRefusesPartitionsThatLoseSeries(t *testing.T) {
 	for _, m := range sources {
 		testutil.Ok(t, cg.AppendMeta(m))
 	}
-	comp, err := tsdb.NewLeveledCompactor(ctx, nil, slog.Default(), []int64{time.Hour.Milliseconds(), 2 * time.Hour.Milliseconds()}, chunkenc.NewPool(),
-		storage.NewCompactingChunkSeriesMerger(storage.ChainedSeriesMerge))
+	comp, err := tsdb.NewLeveledCompactor(
+		ctx,
+		nil,
+		slog.Default(),
+		[]int64{time.Hour.Milliseconds(), 2 * time.Hour.Milliseconds()},
+		chunkenc.NewPool(),
+		storage.NewCompactingChunkSeriesMerger(storage.ChainedSeriesMerge),
+	)
 	testutil.Ok(t, err)
 	ex := LocalPlanExecutor{Comp: comp, BlockDeletableChecker: DefaultBlockDeletableChecker{}, Callback: DefaultCompactionLifecycleCallback{}, MarkSourcesForDeletion: true}
 
@@ -147,8 +159,8 @@ func TestLocalPlanExecutorRefusesPartitionsThatLoseSeries(t *testing.T) {
 	testutil.Ok(t, bkt.Iter(ctx, "", func(name string) error { uploaded = append(uploaded, name); return nil }))
 	testutil.Equals(t, 2, len(uploaded), "nothing but the sources is in the bucket: %v", uploaded)
 	for _, s := range sources {
-		ok, err := bkt.Exists(ctx, filepath.Join(s.ULID.String(), metadata.DeletionMarkFilename))
-		testutil.Ok(t, err)
+		ok, existsErr := bkt.Exists(ctx, filepath.Join(s.ULID.String(), metadata.DeletionMarkFilename))
+		testutil.Ok(t, existsErr)
 		testutil.Equals(t, false, ok, "the sources must not be retired")
 	}
 
@@ -167,7 +179,7 @@ func TestLocalPlanExecutorPublishesSiblingsInTheSet(t *testing.T) {
 	logger := log.NewNopLogger()
 	dir := t.TempDir()
 
-	var series []labels.Labels
+	series := make([]labels.Labels, 0, 8)
 	for i := range 8 {
 		series = append(series, labels.FromStrings("__name__", "metric", "instance", fmt.Sprintf("host-%d", i)))
 	}
@@ -187,8 +199,14 @@ func TestLocalPlanExecutorPublishesSiblingsInTheSet(t *testing.T) {
 	for _, m := range sources {
 		testutil.Ok(t, cg.AppendMeta(m))
 	}
-	comp, err := tsdb.NewLeveledCompactor(ctx, nil, slog.Default(), []int64{time.Hour.Milliseconds(), 2 * time.Hour.Milliseconds()}, chunkenc.NewPool(),
-		storage.NewCompactingChunkSeriesMerger(storage.ChainedSeriesMerge))
+	comp, err := tsdb.NewLeveledCompactor(
+		ctx,
+		nil,
+		slog.Default(),
+		[]int64{time.Hour.Milliseconds(), 2 * time.Hour.Milliseconds()},
+		chunkenc.NewPool(),
+		storage.NewCompactingChunkSeriesMerger(storage.ChainedSeriesMerge),
+	)
 	testutil.Ok(t, err)
 	ex := LocalPlanExecutor{Comp: comp, BlockDeletableChecker: DefaultBlockDeletableChecker{}, Callback: DefaultCompactionLifecycleCallback{}, MarkSourcesForDeletion: true}
 
