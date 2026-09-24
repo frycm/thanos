@@ -4,6 +4,7 @@
 package distributed
 
 import (
+	"cmp"
 	"os"
 	"syscall"
 
@@ -86,11 +87,7 @@ func outOfOrderBlock(err error) string {
 // away without a data failure, so there is nothing for the compactor to
 // react to beyond running the task again.
 func ReconstructError(res Result) error {
-	msg := res.ErrorMessage
-	if msg == "" {
-		msg = string(res.Outcome)
-	}
-	err := errors.New(msg)
+	err := errors.New(cmp.Or(res.ErrorMessage, string(res.Outcome)))
 
 	switch res.Outcome {
 	case OutcomeCompleted:

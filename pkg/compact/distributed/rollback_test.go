@@ -79,14 +79,14 @@ func (f *rollbackFixture) upload(t *testing.T) ulid.ULID {
 	m.Compaction.Sources = []ulid.ULID{id}
 	f.writeMeta(t, m)
 	// A block needs something besides meta.json for Delete to have work to do.
-	testutil.Ok(t, f.bkt.Upload(context.Background(), path.Join(id.String(), block.IndexFilename), strings.NewReader("index")))
+	testutil.Ok(t, f.bkt.Upload(t.Context(), path.Join(id.String(), block.IndexFilename), strings.NewReader("index")))
 	return id
 }
 
 // stamp records on a block that a worker made it from the given sources.
 func (f *rollbackFixture) stamp(t *testing.T, id ulid.ULID, prov Provenance, sources ...ulid.ULID) {
 	t.Helper()
-	m, err := block.DownloadMeta(context.Background(), log.NewNopLogger(), f.bkt, id)
+	m, err := block.DownloadMeta(t.Context(), log.NewNopLogger(), f.bkt, id)
 	testutil.Ok(t, err)
 	srcs := make([]string, 0, len(sources))
 	for _, s := range sources {
@@ -101,23 +101,23 @@ func (f *rollbackFixture) writeMeta(t *testing.T, m metadata.Meta) {
 	t.Helper()
 	raw, err := json.Marshal(m)
 	testutil.Ok(t, err)
-	testutil.Ok(t, f.bkt.Upload(context.Background(), path.Join(m.ULID.String(), block.MetaFilename), strings.NewReader(string(raw))))
+	testutil.Ok(t, f.bkt.Upload(t.Context(), path.Join(m.ULID.String(), block.MetaFilename), strings.NewReader(string(raw))))
 }
 
 func (f *rollbackFixture) mark(t *testing.T, id ulid.ULID, details string) {
 	t.Helper()
-	testutil.Ok(t, block.MarkForDeletion(context.Background(), log.NewNopLogger(), f.bkt, id, details,
+	testutil.Ok(t, block.MarkForDeletion(t.Context(), log.NewNopLogger(), f.bkt, id, details,
 		promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"})))
 }
 
 func (f *rollbackFixture) remove(t *testing.T, id ulid.ULID) {
 	t.Helper()
-	testutil.Ok(t, block.Delete(context.Background(), log.NewNopLogger(), f.bkt, id))
+	testutil.Ok(t, block.Delete(t.Context(), log.NewNopLogger(), f.bkt, id))
 }
 
 func exists(t *testing.T, bkt objstore.Bucket, name string) bool {
 	t.Helper()
-	ok, err := bkt.Exists(context.Background(), name)
+	ok, err := bkt.Exists(t.Context(), name)
 	testutil.Ok(t, err)
 	return ok
 }
@@ -128,7 +128,7 @@ func exists(t *testing.T, bkt objstore.Bucket, name string) bool {
 func TestRollbackPlanScopedToJournal(t *testing.T) {
 	f := newRollbackFixture(t)
 
-	r, err := PlanRollback(context.Background(), log.NewNopLogger(), f.bkt, RollbackOptions{JournalID: "A"})
+	r, err := PlanRollback(t.Context(), log.NewNopLogger(), f.bkt, RollbackOptions{JournalID: "A"})
 	testutil.Ok(t, err)
 
 	// consumedA was produced by A and is gone with the rest, not restored;
@@ -142,7 +142,7 @@ func TestRollbackPlanScopedToJournal(t *testing.T) {
 func TestRollbackPlanForEveryJournal(t *testing.T) {
 	f := newRollbackFixture(t)
 
-	r, err := PlanRollback(context.Background(), log.NewNopLogger(), f.bkt, RollbackOptions{AllJournals: true})
+	r, err := PlanRollback(t.Context(), log.NewNopLogger(), f.bkt, RollbackOptions{AllJournals: true})
 	testutil.Ok(t, err)
 
 	testutil.Equals(t, []ulid.ULID{f.producedA, f.producedB, f.consumedA}, r.Produced)
@@ -154,7 +154,7 @@ func TestRollbackPlanForEveryJournal(t *testing.T) {
 // without marks, everything else untouched.
 func TestRollbackApply(t *testing.T) {
 	f := newRollbackFixture(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	r, err := PlanRollback(ctx, log.NewNopLogger(), f.bkt, RollbackOptions{JournalID: "A"})
 	testutil.Ok(t, err)
@@ -188,10 +188,10 @@ func TestRollbackApply(t *testing.T) {
 func TestRollbackRequiresAScope(t *testing.T) {
 	f := newRollbackFixture(t)
 
-	_, err := PlanRollback(context.Background(), log.NewNopLogger(), f.bkt, RollbackOptions{})
+	_, err := PlanRollback(t.Context(), log.NewNopLogger(), f.bkt, RollbackOptions{})
 	testutil.NotOk(t, err)
 
-	_, err = PlanRollback(context.Background(), log.NewNopLogger(), f.bkt, RollbackOptions{JournalID: "A", AllJournals: true})
+	_, err = PlanRollback(t.Context(), log.NewNopLogger(), f.bkt, RollbackOptions{JournalID: "A", AllJournals: true})
 	testutil.NotOk(t, err)
 }
 
@@ -201,7 +201,7 @@ func TestRollbackRequiresAScope(t *testing.T) {
 // marked. With the explicit allowance the block is left out and named.
 func TestRollbackRefusesUnreadableBlocks(t *testing.T) {
 	f := newRollbackFixture(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// A block directory with no meta.json - what an aborted upload leaves.
 	broken := ulid.MustNew(500, nil)
@@ -223,7 +223,7 @@ func TestRollbackRefusesUnreadableBlocks(t *testing.T) {
 // manager has to be stopped.
 func TestRollbackSeesEveryJournalInScope(t *testing.T) {
 	f := newRollbackFixture(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Two managers wrote journals; B's is fresh, A's is old.
 	old := NewJournal("A", "")
@@ -251,7 +251,7 @@ func TestRollbackSeesEveryJournalInScope(t *testing.T) {
 // still shows up as alive: its maintenance loop keeps the journal fresh.
 func TestRollbackDetectsRunningManager(t *testing.T) {
 	f := newRollbackFixture(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	s, err := NewScheduler(ctx, log.NewNopLogger(), f.bkt, prometheus.NewRegistry(), ManagerConfig{JournalID: "A", LeaseTTL: 10 * time.Millisecond})
 	testutil.Ok(t, err)
@@ -271,7 +271,7 @@ func TestRollbackDetectsRunningManager(t *testing.T) {
 // data: the mark names nobody, and nothing else would ever remove it.
 func TestRollbackRestoresSourcesGarbageCollectionMarked(t *testing.T) {
 	f := newRollbackFixture(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	testutil.Ok(t, block.RemoveMark(ctx, log.NewNopLogger(), f.bkt, f.sourceA,
 		promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"}), metadata.DeletionMarkFilename))
@@ -290,7 +290,7 @@ func TestRollbackRestoresSourcesGarbageCollectionMarked(t *testing.T) {
 // must prevent that descendant from being selected for rollback.
 func TestRollbackIgnoresInheritedProvenance(t *testing.T) {
 	f := newRollbackFixture(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// A 5m downsample of producedA made by the standalone downsampler: the
 	// meta is a copy of producedA's, stamp included, under a new ULID.

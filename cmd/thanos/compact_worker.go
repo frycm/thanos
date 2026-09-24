@@ -4,6 +4,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"os"
 	"path"
@@ -105,10 +106,7 @@ func runCompactWorker(
 	// Every worker gets its own directory: the startup cleanup removes stale
 	// task directories in it, which must never reach another worker's
 	// in-flight downloads or a co-located manager's compact/ directory.
-	workerID := conf.workerID
-	if workerID == "" {
-		workerID = distributed.DefaultWorkerID()
-	}
+	workerID := cmp.Or(conf.workerID, distributed.DefaultWorkerID())
 	workerDir := path.Join(conf.dataDir, "compact-worker", workerID)
 	if err := os.MkdirAll(workerDir, os.ModePerm); err != nil {
 		cancel()

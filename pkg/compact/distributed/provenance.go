@@ -6,6 +6,7 @@ package distributed
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 
@@ -67,9 +68,7 @@ func (p Provenance) Stamp(extensions any) (any, error) {
 			// dropping the provenance would undermine what it exists for.
 			return nil, errors.Errorf("cannot stamp provenance onto extensions of type %T", extensions)
 		}
-		for k, v := range existing {
-			ext[k] = v
-		}
+		maps.Copy(ext, existing)
 	}
 	ext[ProvenanceExtension] = p
 	return ext, nil

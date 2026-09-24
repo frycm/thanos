@@ -15,7 +15,7 @@ import (
 )
 
 func TestJournalRoundTrip(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	bkt := objstore.NewInMemBucket()
 
 	// A shard with no journal yet is not an error.
@@ -63,7 +63,7 @@ func TestJournalPrunesOnlyOldTerminalTasks(t *testing.T) {
 // the journal really still records its lease, and that an unreadable journal is
 // reported distinctly from a lost lease.
 func TestCheckOwnershipFailsClosed(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	bkt := objstore.NewInMemBucket()
 
 	j := NewJournal("shard-a", "")

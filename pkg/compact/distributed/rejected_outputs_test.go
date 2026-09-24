@@ -39,7 +39,7 @@ func (b stubbornBucket) Delete(ctx context.Context, name string) error {
 // which of the given blocks ended up marked for deletion.
 func syncAndCollect(t *testing.T, bkt objstore.Bucket, published func(*metadata.Meta) bool, ids ...ulid.ULID) map[ulid.ULID]bool {
 	t.Helper()
-	ctx := context.Background()
+	ctx := t.Context()
 	logger := log.NewNopLogger()
 	dedup := block.NewDeduplicateFilter(1)
 	if published != nil {
@@ -69,7 +69,7 @@ func syncAndCollect(t *testing.T, bkt objstore.Bucket, published func(*metadata.
 // is recorded as rejected, and the manager's deduplication filter treats it
 // as unpublished, through sync and garbage collection.
 func TestRejectedOutputsNeverRetireTheSources(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	versioned := func(m metadata.Meta) metadata.Meta {
 		m.Version = metadata.TSDBVersion1
 		m.Thanos.Version = metadata.ThanosVersion1
@@ -200,7 +200,7 @@ func TestOutputPublished(t *testing.T) {
 // metadata says they were made for the task are deleted: the list of outputs
 // is the worker's word, and a block ID it named could be a source of the plan.
 func TestMaintenanceRejectsUnverifiedOutputs(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	bkt := objstore.NewInMemBucket()
 	sched := testScheduler(t, bkt, ManagerConfig{})
 	id, source := ulid.MustNew(5, nil), ulid.MustNew(6, nil)

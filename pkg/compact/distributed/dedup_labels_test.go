@@ -4,7 +4,6 @@
 package distributed
 
 import (
-	"context"
 	"encoding/json"
 	"path"
 	"strings"
@@ -28,7 +27,7 @@ import (
 // strip fetched metadata the same way, placeholder included, or every block of
 // such a deployment fails the group's label validation.
 func TestRebuildGroupStripsDedupReplicaLabels(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	uploadMeta := func(t *testing.T, bkt objstore.Bucket, id ulid.ULID, lbls map[string]string) *metadata.Meta {
 		m := &metadata.Meta{}

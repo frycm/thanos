@@ -126,7 +126,7 @@ func TestWorkerChecksumReadBackFailureAbortsNotCompletes(t *testing.T) {
 // restart voids every in-flight lease.
 func TestSubmitJournalBlipIsRetryable(t *testing.T) {
 	bkt := compacttest.NewHookBucket(objstore.NewInMemBucket())
-	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
+	sched, err := NewScheduler(t.Context(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
 		JournalID: "shard-blip",
 	})
 	testutil.Ok(t, err)
@@ -138,7 +138,7 @@ func TestSubmitJournalBlipIsRetryable(t *testing.T) {
 		return nil
 	})
 
-	_, err = sched.Submit(context.Background(), Task{ID: "t-blip", Type: TaskCompaction})
+	_, err = sched.Submit(t.Context(), Task{ID: "t-blip", Type: TaskCompaction})
 	testutil.NotOk(t, err)
 	testutil.Assert(t, compact.IsRetryError(err), "a journal blip in Submit must be retryable, got: %v", err)
 	testutil.Assert(t, !compact.IsHaltError(err), "a journal blip in Submit must not halt")
@@ -146,7 +146,7 @@ func TestSubmitJournalBlipIsRetryable(t *testing.T) {
 	// The submission was rolled back: once the journal recovers the same task
 	// can be submitted again.
 	bkt.SetOnUpload(nil)
-	_, err = sched.Submit(context.Background(), Task{ID: "t-blip", Type: TaskCompaction})
+	_, err = sched.Submit(t.Context(), Task{ID: "t-blip", Type: TaskCompaction})
 	testutil.Ok(t, err)
 }
 
@@ -222,7 +222,7 @@ func TestAbandonedSourcesAreNotReplanned(t *testing.T) {
 
 	// And the control loop turns the deferral into "do not rerun the group".
 	stub := stubPlanner{plan: toCompact}
-	rerun, ids, err := cg.CompactWithExecutor(context.Background(), t.TempDir(),
+	rerun, ids, err := cg.CompactWithExecutor(t.Context(), t.TempDir(),
 		stub, NewRemotePlanExecutor(c.logger, c.manager, c.sched, nil, 1, nil))
 	testutil.Ok(t, err)
 	testutil.Equals(t, false, rerun)
@@ -243,15 +243,15 @@ func (p stubPlanner) Plan(_ context.Context, _ []*metadata.Meta, _ chan error, _
 // somebody else already holds.
 func TestLeaseRevocationsPersistImmediately(t *testing.T) {
 	bkt := objstore.NewInMemBucket()
-	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
+	sched, err := NewScheduler(t.Context(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
 		JournalID: "shard-revoke",
 		LeaseTTL:  time.Hour, // So nothing expires or persists on its own schedule.
 	})
 	testutil.Ok(t, err)
 
-	_, err = sched.Submit(context.Background(), Task{ID: "t-revoke", Type: TaskCompaction})
+	_, err = sched.Submit(t.Context(), Task{ID: "t-revoke", Type: TaskCompaction})
 	testutil.Ok(t, err)
-	leased, err := sched.Lease(context.Background(), LeaseRequest{WorkerID: "w1", Accepts: []TaskType{TaskCompaction}})
+	leased, err := sched.Lease(t.Context(), LeaseRequest{WorkerID: "w1", Accepts: []TaskType{TaskCompaction}})
 	testutil.Ok(t, err)
 	testutil.Assert(t, leased != nil, "the task must lease")
 
@@ -263,7 +263,7 @@ func TestLeaseRevocationsPersistImmediately(t *testing.T) {
 	sched.mtx.Unlock()
 	testutil.Ok(t, sched.Maintain())
 
-	j, err := ReadJournal(context.Background(), bkt, "shard-revoke")
+	j, err := ReadJournal(t.Context(), bkt, "shard-revoke")
 	testutil.Ok(t, err)
 	testutil.Equals(t, StatePending, j.Tasks["t-revoke"].State)
 }
@@ -273,7 +273,7 @@ func TestLeaseRevocationsPersistImmediately(t *testing.T) {
 // than the grace allows. Without it, a worker partitioned from the manager but
 // not from the bucket sailed through the gate on a stale journal.
 func TestOwnershipCheckRejectsLongExpiredLease(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	bkt := objstore.NewInMemBucket()
 
 	writeLease := func(expiresAt time.Time) {
@@ -310,20 +310,20 @@ func TestOwnershipCheckRejectsLongExpiredLease(t *testing.T) {
 // no timeout - and each requeue was leaseable immediately.
 func TestAbortStreakIsCappedAndBackedOff(t *testing.T) {
 	bkt := objstore.NewInMemBucket()
-	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
+	sched, err := NewScheduler(t.Context(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
 		JournalID:   "shard-abort",
 		LeaseTTL:    time.Millisecond, // Caps the requeue backoff for the test.
 		MaxAttempts: 3,
 	})
 	testutil.Ok(t, err)
 
-	resultCh, err := sched.Submit(context.Background(), Task{ID: "t-abort", Type: TaskCompaction})
+	resultCh, err := sched.Submit(t.Context(), Task{ID: "t-abort", Type: TaskCompaction})
 	testutil.Ok(t, err)
 
 	lease := func() *Task {
 		deadline := time.Now().Add(5 * time.Second)
 		for time.Now().Before(deadline) {
-			task, err := sched.Lease(context.Background(), LeaseRequest{WorkerID: "w1", Accepts: []TaskType{TaskCompaction}})
+			task, err := sched.Lease(t.Context(), LeaseRequest{WorkerID: "w1", Accepts: []TaskType{TaskCompaction}})
 			testutil.Ok(t, err)
 			if task != nil {
 				return task
@@ -337,7 +337,7 @@ func TestAbortStreakIsCappedAndBackedOff(t *testing.T) {
 	cap := abortCapFor(3)
 	for range cap {
 		task := lease()
-		testutil.Ok(t, sched.Report(context.Background(), Result{
+		testutil.Ok(t, sched.Report(t.Context(), Result{
 			TaskID:       task.ID,
 			LeaseToken:   task.LeaseToken,
 			Generation:   task.Generation,
@@ -356,7 +356,7 @@ func TestAbortStreakIsCappedAndBackedOff(t *testing.T) {
 		t.Fatal("the capped abort streak never reached the submitter")
 	}
 
-	j, err := ReadJournal(context.Background(), bkt, "shard-abort")
+	j, err := ReadJournal(t.Context(), bkt, "shard-abort")
 	testutil.Ok(t, err)
 	testutil.Equals(t, StateAbandoned, j.Tasks["t-abort"].State)
 	testutil.Equals(t, cap, j.Tasks["t-abort"].Aborts)
@@ -366,29 +366,29 @@ func TestAbortStreakIsCappedAndBackedOff(t *testing.T) {
 // again immediately.
 func TestAbortedRequeueBacksOff(t *testing.T) {
 	bkt := objstore.NewInMemBucket()
-	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
+	sched, err := NewScheduler(t.Context(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
 		JournalID: "shard-backoff",
 		LeaseTTL:  200 * time.Millisecond,
 	})
 	testutil.Ok(t, err)
 
-	_, err = sched.Submit(context.Background(), Task{ID: "t-backoff", Type: TaskCompaction})
+	_, err = sched.Submit(t.Context(), Task{ID: "t-backoff", Type: TaskCompaction})
 	testutil.Ok(t, err)
-	task, err := sched.Lease(context.Background(), LeaseRequest{WorkerID: "w1"})
+	task, err := sched.Lease(t.Context(), LeaseRequest{WorkerID: "w1"})
 	testutil.Ok(t, err)
-	testutil.Ok(t, sched.Report(context.Background(), Result{
+	testutil.Ok(t, sched.Report(t.Context(), Result{
 		TaskID: task.ID, LeaseToken: task.LeaseToken, Generation: task.Generation,
 		Outcome: OutcomeAbortedOwnershipLost,
 	}))
 
 	// Immediately after the abort the task is parked.
-	again, err := sched.Lease(context.Background(), LeaseRequest{WorkerID: "w1"})
+	again, err := sched.Lease(t.Context(), LeaseRequest{WorkerID: "w1"})
 	testutil.Ok(t, err)
 	testutil.Assert(t, again == nil, "an aborted task must back off before it is leaseable again")
 
 	// After the backoff (capped at the lease TTL) it comes back.
 	time.Sleep(250 * time.Millisecond)
-	again, err = sched.Lease(context.Background(), LeaseRequest{WorkerID: "w1"})
+	again, err = sched.Lease(t.Context(), LeaseRequest{WorkerID: "w1"})
 	testutil.Ok(t, err)
 	testutil.Assert(t, again != nil, "the task must be leaseable after the backoff")
 }
@@ -397,16 +397,16 @@ func TestAbortedRequeueBacksOff(t *testing.T) {
 // different journal is refused loudly instead of being handed tasks it would
 // abort forever against the wrong journal.
 func TestLeaseRefusesMismatchedJournalID(t *testing.T) {
-	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), objstore.NewInMemBucket(), prometheus.NewRegistry(), ManagerConfig{
+	sched, err := NewScheduler(t.Context(), log.NewNopLogger(), objstore.NewInMemBucket(), prometheus.NewRegistry(), ManagerConfig{
 		JournalID: "shard-a",
 	})
 	testutil.Ok(t, err)
 
-	_, err = sched.Lease(context.Background(), LeaseRequest{WorkerID: "w1", JournalID: "shard-b"})
+	_, err = sched.Lease(t.Context(), LeaseRequest{WorkerID: "w1", JournalID: "shard-b"})
 	testutil.NotOk(t, err)
 	testutil.Assert(t, strings.Contains(err.Error(), "shard-b"), "the refusal must name both journals: %v", err)
 
-	_, err = sched.Lease(context.Background(), LeaseRequest{WorkerID: "w1", JournalID: "shard-a"})
+	_, err = sched.Lease(t.Context(), LeaseRequest{WorkerID: "w1", JournalID: "shard-a"})
 	testutil.Ok(t, err)
 }
 
@@ -458,18 +458,18 @@ func TestPlanGroupKeepsConcurrentPlansTimeDisjoint(t *testing.T) {
 	bracket := []*metadata.Meta{meta(0, 8000), meta(16000, 18000)}
 	sched := &Scheduler{journal: NewJournal("t", "")}
 	e := NewRemotePlanExecutor(logger, bkt, sched, &listPlanner{plans: [][]*metadata.Meta{bracket}}, 4, nil)
-	plans := e.planGroup(context.Background(), newGroup(false, append(append([]*metadata.Meta{}, first...), bracket...)...), first)
+	plans := e.planGroup(t.Context(), newGroup(false, append(append([]*metadata.Meta{}, first...), bracket...)...), first)
 	testutil.Equals(t, 1, len(plans))
 
 	// A genuinely disjoint second plan still runs concurrently.
 	disjoint := []*metadata.Meta{meta(16000, 18000), meta(18000, 20000)}
 	e = NewRemotePlanExecutor(logger, bkt, sched, &listPlanner{plans: [][]*metadata.Meta{disjoint}}, 4, nil)
-	plans = e.planGroup(context.Background(), newGroup(false, append(append([]*metadata.Meta{}, first...), disjoint...)...), first)
+	plans = e.planGroup(t.Context(), newGroup(false, append(append([]*metadata.Meta{}, first...), disjoint...)...), first)
 	testutil.Equals(t, 2, len(plans))
 
 	// Vertical compaction also permits independent plans when their full time envelopes are disjoint.
 	e = NewRemotePlanExecutor(logger, bkt, sched, &listPlanner{plans: [][]*metadata.Meta{disjoint}}, 4, nil)
-	plans = e.planGroup(context.Background(), newGroup(true, append(append([]*metadata.Meta{}, first...), disjoint...)...), first)
+	plans = e.planGroup(t.Context(), newGroup(true, append(append([]*metadata.Meta{}, first...), disjoint...)...), first)
 	testutil.Equals(t, 2, len(plans))
 }
 
@@ -501,14 +501,14 @@ func TestRemoteFinalizeRespectsDeletableCheckerAndRecordsMetrics(t *testing.T) {
 		}
 
 		e := NewRemotePlanExecutor(c.logger, c.manager, c.sched, nil, 1, checker)
-		ids, err := e.Execute(context.Background(), "", mcg, compact.Plan{Sources: toCompact})
+		ids, err := e.Execute(t.Context(), "", mcg, compact.Plan{Sources: toCompact})
 		testutil.Ok(t, err)
 		testutil.Equals(t, 1, len(ids))
 		return toCompact, compactions, gcBlocks
 	}
 
 	hasDeletionMark := func(id ulid.ULID) bool {
-		ok, err := c.shared.Exists(context.Background(), path.Join(id.String(), metadata.DeletionMarkFilename))
+		ok, err := c.shared.Exists(t.Context(), path.Join(id.String(), metadata.DeletionMarkFilename))
 		testutil.Ok(t, err)
 		return ok
 	}
@@ -536,15 +536,14 @@ func TestRemoteFinalizeRespectsDeletableCheckerAndRecordsMetrics(t *testing.T) {
 // frozen at zero, so failure alerts could never fire.
 func TestDispatchDownsamplingRecordsFailures(t *testing.T) {
 	bkt := objstore.NewInMemBucket()
-	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
+	sched, err := NewScheduler(t.Context(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
 		JournalID:   "shard-ds",
 		MaxAttempts: 1,
 	})
 	testutil.Ok(t, err)
 
 	// A stand-in worker that fails everything it leases.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go func() {
 		for ctx.Err() == nil {
 			task, err := sched.Lease(ctx, LeaseRequest{WorkerID: "w1"})
@@ -566,7 +565,7 @@ func TestDispatchDownsamplingRecordsFailures(t *testing.T) {
 	m.Thanos.Labels = map[string]string{"ext": "1"}
 
 	failures := promauto.With(nil).NewCounterVec(prometheus.CounterOpts{Name: "test_ds_failures"}, []string{"resolution"})
-	err = DispatchDownsampling(context.Background(), log.NewNopLogger(), bkt, sched,
+	err = DispatchDownsampling(t.Context(), log.NewNopLogger(), bkt, sched,
 		map[ulid.ULID]*metadata.Meta{m.ULID: m}, downsample.PlanOptions{}, 1, metadata.NoneFunc, 1, false, nil, failures)
 	testutil.NotOk(t, err)
 	testutil.Equals(t, 1.0, promtestutil.ToFloat64(failures.WithLabelValues(m.Thanos.ResolutionString())))
@@ -578,15 +577,15 @@ func TestDispatchDownsamplingRecordsFailures(t *testing.T) {
 // - and frozen heartbeats are expired leases and discarded work.
 func TestHeartbeatsAreNotStalledByJournalIO(t *testing.T) {
 	bkt := compacttest.NewHookBucket(objstore.NewInMemBucket())
-	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
+	sched, err := NewScheduler(t.Context(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
 		JournalID: "shard-slow",
 	})
 	testutil.Ok(t, err)
 
 	// Lease a task whose heartbeats we can measure.
-	_, err = sched.Submit(context.Background(), Task{ID: "t-slow", Type: TaskCompaction})
+	_, err = sched.Submit(t.Context(), Task{ID: "t-slow", Type: TaskCompaction})
 	testutil.Ok(t, err)
-	task, err := sched.Lease(context.Background(), LeaseRequest{WorkerID: "w1"})
+	task, err := sched.Lease(t.Context(), LeaseRequest{WorkerID: "w1"})
 	testutil.Ok(t, err)
 
 	// Make every journal write take its time, and start a Submit that has to
@@ -606,7 +605,7 @@ func TestHeartbeatsAreNotStalledByJournalIO(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_, _ = sched.Submit(context.Background(), Task{ID: "t-slow-2", Type: TaskCompaction})
+		_, _ = sched.Submit(t.Context(), Task{ID: "t-slow-2", Type: TaskCompaction})
 	}()
 	<-uploadStarted
 
@@ -622,7 +621,7 @@ func TestHeartbeatsAreNotStalledByJournalIO(t *testing.T) {
 // TestWorkerSeenIsPruned pins down that the worker liveness map forgets workers
 // gone for many lease TTLs, instead of growing forever under pod churn.
 func TestWorkerSeenIsPruned(t *testing.T) {
-	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), objstore.NewInMemBucket(), prometheus.NewRegistry(), ManagerConfig{
+	sched, err := NewScheduler(t.Context(), log.NewNopLogger(), objstore.NewInMemBucket(), prometheus.NewRegistry(), ManagerConfig{
 		JournalID: "shard-seen",
 		LeaseTTL:  10 * time.Millisecond,
 	})
@@ -680,12 +679,10 @@ func TestGroupCompactRunsAreSerialized(t *testing.T) {
 	e := &countingExecutor{}
 	var wg sync.WaitGroup
 	for range 4 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			_, _, err := cg.CompactWithExecutor(context.Background(), t.TempDir(), stubPlanner{plan: []*metadata.Meta{m}}, e)
+		wg.Go(func() {
+			_, _, err := cg.CompactWithExecutor(t.Context(), t.TempDir(), stubPlanner{plan: []*metadata.Meta{m}}, e)
 			testutil.Ok(t, err)
-		}()
+		})
 	}
 	wg.Wait()
 	testutil.Equals(t, 1, e.maxSeen)
@@ -713,7 +710,7 @@ func TestOversizedTasksAreRefusedNotDispatched(t *testing.T) {
 	c.sched.conf.MaxTaskSeries = wantSeries - 1
 
 	e := NewRemotePlanExecutor(c.logger, c.manager, c.sched, nil, 1, nil)
-	_, err := e.Execute(context.Background(), "", cg, compact.Plan{Sources: toCompact})
+	_, err := e.Execute(t.Context(), "", cg, compact.Plan{Sources: toCompact})
 	testutil.Assert(t, errors.Is(err, compact.ErrPlanDeferred), "an oversized plan must be deferred, got: %v", err)
 
 	entry := c.journalTask(StateOversized)
@@ -723,7 +720,7 @@ func TestOversizedTasksAreRefusedNotDispatched(t *testing.T) {
 	testutil.Equals(t, wantSeries, entry.Task.ExpectedSeries)
 
 	// A second pass parks on the existing entry instead of minting another.
-	_, err = e.Execute(context.Background(), "", cg, compact.Plan{Sources: toCompact})
+	_, err = e.Execute(t.Context(), "", cg, compact.Plan{Sources: toCompact})
 	testutil.Assert(t, errors.Is(err, compact.ErrPlanDeferred), "the parked plan must stay deferred, got: %v", err)
 	oversized := 0
 	for _, e := range c.journal().Tasks {
@@ -746,7 +743,7 @@ func TestOversizedTasksAreRefusedNotDispatched(t *testing.T) {
 		}
 	}
 	c.sched.mtx.Unlock()
-	ids, err := e.Execute(context.Background(), "", cg, compact.Plan{Sources: toCompact})
+	ids, err := e.Execute(t.Context(), "", cg, compact.Plan{Sources: toCompact})
 	testutil.Ok(t, err)
 	testutil.Equals(t, 1, len(ids))
 }
@@ -765,7 +762,7 @@ func TestOversizedLimitsIgnoreUnknownSizes(t *testing.T) {
 // the bucket - so assuming any worker can hold them is exactly wrong.
 func TestDispatchDownsamplingRefusesOversizedBlocks(t *testing.T) {
 	bkt := objstore.NewInMemBucket()
-	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
+	sched, err := NewScheduler(t.Context(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
 		JournalID:         "shard-ds-big",
 		MaxTaskIndexBytes: 1024,
 	})
@@ -780,10 +777,10 @@ func TestDispatchDownsamplingRefusesOversizedBlocks(t *testing.T) {
 
 	// No worker exists; if the gate failed, Dispatch would hang on Submit's
 	// result channel, so returning at all proves the refusal.
-	testutil.Ok(t, DispatchDownsampling(context.Background(), log.NewNopLogger(), bkt, sched,
+	testutil.Ok(t, DispatchDownsampling(t.Context(), log.NewNopLogger(), bkt, sched,
 		map[ulid.ULID]*metadata.Meta{m.ULID: m}, downsample.PlanOptions{}, 1, metadata.NoneFunc, 1, false, nil, nil))
 
-	j, err := ReadJournal(context.Background(), bkt, "shard-ds-big")
+	j, err := ReadJournal(t.Context(), bkt, "shard-ds-big")
 	testutil.Ok(t, err)
 	found := false
 	for _, e := range j.Tasks {

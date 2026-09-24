@@ -4,6 +4,7 @@
 package distributed
 
 import (
+	"cmp"
 	"context"
 	"io"
 	"testing"
@@ -19,24 +20,22 @@ import (
 
 func testScheduler(t *testing.T, bkt objstore.Bucket, conf ManagerConfig) *Scheduler {
 	t.Helper()
-	if conf.JournalID == "" {
-		conf.JournalID = "shard-a"
-	}
-	s, err := NewScheduler(context.Background(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), conf)
+	conf.JournalID = cmp.Or(conf.JournalID, "shard-a")
+	s, err := NewScheduler(t.Context(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), conf)
 	testutil.Ok(t, err)
 	return s
 }
 
 func submitTask(t *testing.T, s *Scheduler) <-chan Result {
 	t.Helper()
-	ch, err := s.Submit(context.Background(), Task{ID: "t1", Type: TaskCompaction, SourceBlocks: []string{"src-t1"}})
+	ch, err := s.Submit(t.Context(), Task{ID: "t1", Type: TaskCompaction, SourceBlocks: []string{"src-t1"}})
 	testutil.Ok(t, err)
 	return ch
 }
 
 // TestSchedulerLeaseLifecycle walks a task from queued through leased to done.
 func TestSchedulerLeaseLifecycle(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	bkt := objstore.NewInMemBucket()
 	s := testScheduler(t, bkt, ManagerConfig{})
 
@@ -77,7 +76,7 @@ func TestSchedulerLeaseLifecycle(t *testing.T) {
 // TestSchedulerExpiredLeaseIsRequeued asserts a task whose worker went silent
 // goes back to the queue rather than being stuck with that worker.
 func TestSchedulerExpiredLeaseIsRequeued(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := testScheduler(t, objstore.NewInMemBucket(), ManagerConfig{LeaseTTL: time.Millisecond})
 
 	submitTask(t, s)
@@ -103,7 +102,7 @@ func TestSchedulerExpiredLeaseIsRequeued(t *testing.T) {
 func TestSchedulerAbortedResultDoesNotCountAsAttempt(t *testing.T) {
 	for _, outcome := range []Outcome{OutcomeAbortedStoreUnreachable, OutcomeAbortedOwnershipLost, OutcomeAbortedWorkerShutdown} {
 		t.Run(string(outcome), func(t *testing.T) {
-			ctx := context.Background()
+			ctx := t.Context()
 			bkt := objstore.NewInMemBucket()
 			s := testScheduler(t, bkt, ManagerConfig{})
 
@@ -145,12 +144,12 @@ func TestSchedulerAbortedResultDoesNotCountAsAttempt(t *testing.T) {
 // TestSchedulerGivesUpAfterMaxAttempts asserts a task that keeps failing ends up
 // failed rather than retried forever.
 func TestSchedulerGivesUpAfterMaxAttempts(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := testScheduler(t, objstore.NewInMemBucket(), ManagerConfig{MaxAttempts: 2})
 
 	resultCh := submitTask(t, s)
 
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		task, err := s.Lease(ctx, LeaseRequest{WorkerID: "w1"})
 		testutil.Ok(t, err)
 		testutil.Assert(t, task != nil, "expected attempt %d to be leased", i)
@@ -175,7 +174,7 @@ func TestSchedulerGivesUpAfterMaxAttempts(t *testing.T) {
 // TestSchedulerTakeoverVoidsOldLeases asserts a restarted manager bumps the
 // journal generation, which invalidates leases handed out by its predecessor.
 func TestSchedulerTakeoverVoidsOldLeases(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	bkt := objstore.NewInMemBucket()
 
 	first := testScheduler(t, bkt, ManagerConfig{})
@@ -205,7 +204,7 @@ func TestSchedulerTakeoverVoidsOldLeases(t *testing.T) {
 // TestSchedulerHaltsWhenAnotherManagerTakesOver asserts the surviving manager
 // stops rather than writing over a journal a second manager now owns.
 func TestSchedulerHaltsWhenAnotherManagerTakesOver(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	bkt := objstore.NewInMemBucket()
 
 	first := testScheduler(t, bkt, ManagerConfig{})
@@ -260,7 +259,7 @@ func (b *countingBucket) Upload(ctx context.Context, name string, r io.Reader, o
 // the journal's timestamp a liveness signal the rollback tool can rely on: a
 // journal not written for a few TTLs belongs to no running manager.
 func TestSchedulerMaintainKeepsJournalFresh(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	bkt := &countingBucket{Bucket: objstore.NewInMemBucket()}
 	s := testScheduler(t, bkt, ManagerConfig{LeaseTTL: 30 * time.Millisecond})
 
@@ -286,7 +285,7 @@ func TestSchedulerMaintainKeepsJournalFresh(t *testing.T) {
 // is idle - and therefore never submits or records anything - still learns
 // that it has to stop.
 func TestSchedulerMaintainReportsTakeover(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	bkt := objstore.NewInMemBucket()
 	s := testScheduler(t, bkt, ManagerConfig{LeaseTTL: 10 * time.Millisecond})
 

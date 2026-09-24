@@ -316,8 +316,7 @@ func gateChunks(w *testWorker) (release func()) {
 			return ctx.Err()
 		}
 	})
-	var once sync.Once
-	return func() { once.Do(func() { close(gate) }) }
+	return sync.OnceFunc(func() { close(gate) })
 }
 
 // TestInteractionGoldenPath compacts two real blocks through the full stack:
@@ -340,7 +339,7 @@ func TestInteractionGoldenPath(t *testing.T) {
 	testutil.Equals(t, 1, len(got.compIDs))
 
 	// The compacted block is really in the bucket and really is the result.
-	outMeta, err := block.DownloadMeta(context.Background(), c.logger, c.shared, got.compIDs[0])
+	outMeta, err := block.DownloadMeta(t.Context(), c.logger, c.shared, got.compIDs[0])
 	testutil.Ok(t, err)
 	testutil.Equals(t, 2, outMeta.Compaction.Level)
 	testutil.Equals(t, []ulid.ULID{toCompact[0].ULID, toCompact[1].ULID}, outMeta.Compaction.Sources)
@@ -362,7 +361,7 @@ func TestInteractionGoldenPath(t *testing.T) {
 	// The sources were marked for deletion by the manager, and the marks say so.
 	for _, m := range toCompact {
 		var mark metadata.DeletionMark
-		testutil.Ok(t, metadata.ReadMarker(context.Background(), c.logger, objstore.WithNoopInstr(c.shared), m.ULID.String(), &mark))
+		testutil.Ok(t, metadata.ReadMarker(t.Context(), c.logger, objstore.WithNoopInstr(c.shared), m.ULID.String(), &mark))
 		markJournal, markTask, ok := ParseDeletionDetails(mark.Details)
 		testutil.Equals(t, true, ok)
 		testutil.Equals(t, journalID, markJournal)
@@ -499,7 +498,7 @@ func TestInteractionManagerTakeoverStopsOldWork(t *testing.T) {
 	// Nothing was uploaded: the bucket holds exactly the two source blocks and
 	// no deletion marks.
 	for _, m := range toCompact {
-		ok, err := c.shared.Exists(context.Background(), filepath.Join(m.ULID.String(), metadata.DeletionMarkFilename))
+		ok, err := c.shared.Exists(t.Context(), filepath.Join(m.ULID.String(), metadata.DeletionMarkFilename))
 		testutil.Ok(t, err)
 		testutil.Equals(t, false, ok)
 	}
@@ -612,7 +611,7 @@ func TestInteractionPenaltyDedup(t *testing.T) {
 	testutil.Ok(t, got.err)
 	testutil.Equals(t, 1, len(got.compIDs))
 
-	outMeta, err := block.DownloadMeta(context.Background(), c.logger, c.shared, got.compIDs[0])
+	outMeta, err := block.DownloadMeta(t.Context(), c.logger, c.shared, got.compIDs[0])
 	testutil.Ok(t, err)
 
 	// The result carries the group's labels: the replica label is gone.
@@ -632,7 +631,7 @@ func TestInteractionPenaltyDedup(t *testing.T) {
 
 	// All four sources were marked for deletion by the manager.
 	for _, m := range toCompact {
-		ok, err := c.shared.Exists(context.Background(), filepath.Join(m.ULID.String(), metadata.DeletionMarkFilename))
+		ok, err := c.shared.Exists(t.Context(), filepath.Join(m.ULID.String(), metadata.DeletionMarkFilename))
 		testutil.Ok(t, err)
 		testutil.Equals(t, true, ok)
 	}
@@ -650,7 +649,7 @@ func TestInteractionCorruptedBlockFailsWithoutDamage(t *testing.T) {
 
 	// Corrupt one source's index after upload, as a partial or damaged upload
 	// would look.
-	testutil.Ok(t, c.shared.Upload(context.Background(),
+	testutil.Ok(t, c.shared.Upload(t.Context(),
 		filepath.Join(toCompact[0].ULID.String(), "index"), strings.NewReader("this is not an index")))
 
 	outcome := c.execute(cg, toCompact)
@@ -674,7 +673,7 @@ func TestInteractionCorruptedBlockFailsWithoutDamage(t *testing.T) {
 
 	// Nothing about the bucket changed: no deletion marks, no result blocks.
 	for _, m := range toCompact {
-		ok, err := c.shared.Exists(context.Background(), filepath.Join(m.ULID.String(), metadata.DeletionMarkFilename))
+		ok, err := c.shared.Exists(t.Context(), filepath.Join(m.ULID.String(), metadata.DeletionMarkFilename))
 		testutil.Ok(t, err)
 		testutil.Equals(t, false, ok)
 	}
@@ -692,7 +691,7 @@ func TestInteractionDownsampleDedup(t *testing.T) {
 
 	// A raw block long enough to be due for 5m downsampling, uploaded with the
 	// replica label, as receive would have written it.
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	prepareDir := t.TempDir()
 
@@ -719,7 +718,7 @@ func TestInteractionDownsampleDedup(t *testing.T) {
 
 	outID, err := ulid.Parse(entry.Outputs[0])
 	testutil.Ok(t, err)
-	outMeta, err := block.DownloadMeta(context.Background(), c.logger, c.shared, outID)
+	outMeta, err := block.DownloadMeta(t.Context(), c.logger, c.shared, outID)
 	testutil.Ok(t, err)
 
 	// The downsampled block carries the target resolution and the stripped

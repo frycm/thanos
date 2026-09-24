@@ -42,7 +42,7 @@ func (b *journalFaultBucket) Upload(ctx context.Context, name string, r io.Reade
 // would find the task unverified and delete the outputs, while the sources,
 // marked on the strength of that verdict, were on their way out.
 func TestVerificationCountsOnlyOnceRecorded(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	e, bkt, cg, toCompact := provenanceFixture(t)
 	jb := &journalFaultBucket{Bucket: bkt}
 	sched := testScheduler(t, jb, ManagerConfig{JournalID: "shard-test", JournalUnavailableTimeout: time.Hour})
@@ -96,7 +96,7 @@ func (b *blockingDeleteBucket) Delete(ctx context.Context, name string) error {
 // otherwise stall every heartbeat, lease and report, and workers would lose
 // their leases.
 func TestMaintenanceDeletesWithoutTheStateLock(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	inner := objstore.NewInMemBucket()
 	bkt := &blockingDeleteBucket{Bucket: inner, started: make(chan struct{}), release: make(chan struct{})}
 	sched := testScheduler(t, bkt, ManagerConfig{})
@@ -141,15 +141,15 @@ func TestMaintenanceDeletesWithoutTheStateLock(t *testing.T) {
 // expiry, oversized refusals and halts. A successor may own the journal by
 // then.
 func TestStoppedSchedulerWritesNothing(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	bkt := objstore.NewInMemBucket()
 	sched, err := NewScheduler(ctx, log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{JournalID: "shard-a", LeaseTTL: time.Millisecond})
 	testutil.Ok(t, err)
-	_, err = sched.Submit(context.Background(), Task{ID: "t1", Type: TaskCompaction})
+	_, err = sched.Submit(t.Context(), Task{ID: "t1", Type: TaskCompaction})
 	testutil.Ok(t, err)
-	_, err = sched.Lease(context.Background(), LeaseRequest{WorkerID: "w1"})
+	_, err = sched.Lease(t.Context(), LeaseRequest{WorkerID: "w1"})
 	testutil.Ok(t, err)
-	before, err := ReadJournal(context.Background(), bkt, "shard-a")
+	before, err := ReadJournal(t.Context(), bkt, "shard-a")
 	testutil.Ok(t, err)
 
 	cancel()
@@ -158,7 +158,7 @@ func TestStoppedSchedulerWritesNothing(t *testing.T) {
 	sched.MarkOversized(Task{ID: "t2", Type: TaskCompaction}, "too big")
 	sched.Halt(errors.New("stop"))
 
-	after, err := ReadJournal(context.Background(), bkt, "shard-a")
+	after, err := ReadJournal(t.Context(), bkt, "shard-a")
 	testutil.Ok(t, err)
 	testutil.Equals(t, before.UpdatedAt, after.UpdatedAt, "the journal must not be written after the stop")
 	testutil.Equals(t, len(before.Tasks), len(after.Tasks))

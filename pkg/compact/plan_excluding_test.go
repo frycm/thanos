@@ -4,7 +4,6 @@
 package compact
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -21,7 +20,7 @@ const twoHours = int64(2 * time.Hour / time.Millisecond)
 // rangeBlocks builds n consecutive 2h blocks starting at t=0.
 func rangeBlocks(n int) []*metadata.Meta {
 	metas := make([]*metadata.Meta, 0, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		m := meta(ulid.MustNew(uint64(i+1), nil), int64(i)*twoHours, int64(i+1)*twoHours)
 		m.Compaction.Level = 1
 		m.Compaction.Sources = []ulid.ULID{m.ULID}
@@ -35,7 +34,7 @@ func rangeBlocks(n int) []*metadata.Meta {
 // and do not overlap in time. That is what makes it safe to hand several plans
 // for one group to different workers at the same time.
 func TestPlanExcludingProducesDisjointPlans(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// 12 consecutive 2h blocks: enough for several independent 8h compactions.
 	cg := testGroup(t, rangeBlocks(12)...)
@@ -77,7 +76,7 @@ func TestPlanExcludingProducesDisjointPlans(t *testing.T) {
 // TestPlanExcludingEverythingPlansNothing asserts that once every block is in
 // flight there is no further work to hand out.
 func TestPlanExcludingEverythingPlansNothing(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	blocks := rangeBlocks(8)
 	cg := testGroup(t, blocks...)
@@ -96,7 +95,7 @@ func TestPlanExcludingEverythingPlansNothing(t *testing.T) {
 // TestPlanExcludingNothingMatchesPlan asserts the exclusion variant with an
 // empty set behaves exactly like plain planning.
 func TestPlanExcludingNothingMatchesPlan(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	cg := testGroup(t, rangeBlocks(8)...)
 	planner := NewTSDBBasedPlanner(log.NewNopLogger(), []int64{twoHours, 2 * twoHours, 4 * twoHours})

@@ -142,13 +142,13 @@ func TestWorkerResourceErrorsDoNotHaltManager(t *testing.T) {
 // removed and would inflate the queue metrics forever.
 func TestLeaseExpiredDuringPersistLeavesNoDuplicateQueueEntry(t *testing.T) {
 	bkt := compacttest.NewHookBucket(objstore.NewInMemBucket())
-	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
+	sched, err := NewScheduler(t.Context(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
 		JournalID:   "shard-dup",
 		LeaseTTL:    20 * time.Millisecond,
 		MaxAttempts: 3,
 	})
 	testutil.Ok(t, err)
-	_, err = sched.Submit(context.Background(), Task{ID: "t-dup", Type: TaskCompaction})
+	_, err = sched.Submit(t.Context(), Task{ID: "t-dup", Type: TaskCompaction})
 	testutil.Ok(t, err)
 
 	uploadStarted := make(chan struct{}, 1)
@@ -166,7 +166,7 @@ func TestLeaseExpiredDuringPersistLeavesNoDuplicateQueueEntry(t *testing.T) {
 
 	leased := make(chan error, 1)
 	go func() {
-		_, err := sched.Lease(context.Background(), LeaseRequest{WorkerID: "w1", Accepts: []TaskType{TaskCompaction}})
+		_, err := sched.Lease(t.Context(), LeaseRequest{WorkerID: "w1", Accepts: []TaskType{TaskCompaction}})
 		leased <- err
 	}()
 	<-uploadStarted
@@ -196,20 +196,20 @@ func TestLeaseExpiredDuringPersistLeavesNoDuplicateQueueEntry(t *testing.T) {
 // the operator restarted the worker, the task did nothing wrong, and a
 // long-running task must survive an arbitrary number of rolling restarts.
 func TestWorkerShutdownAbortsAreNotChargedOrBackedOff(t *testing.T) {
-	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), objstore.NewInMemBucket(), prometheus.NewRegistry(), ManagerConfig{
+	sched, err := NewScheduler(t.Context(), log.NewNopLogger(), objstore.NewInMemBucket(), prometheus.NewRegistry(), ManagerConfig{
 		JournalID:   "shard-restart",
 		LeaseTTL:    time.Hour, // Any backoff would be visible as an unleaseable task.
 		MaxAttempts: 3,
 	})
 	testutil.Ok(t, err)
-	resultCh, err := sched.Submit(context.Background(), Task{ID: "t-restart", Type: TaskCompaction})
+	resultCh, err := sched.Submit(t.Context(), Task{ID: "t-restart", Type: TaskCompaction})
 	testutil.Ok(t, err)
 
 	for range abortCapFor(3) + 1 {
-		task, err := sched.Lease(context.Background(), LeaseRequest{WorkerID: "w1", Accepts: []TaskType{TaskCompaction}})
+		task, err := sched.Lease(t.Context(), LeaseRequest{WorkerID: "w1", Accepts: []TaskType{TaskCompaction}})
 		testutil.Ok(t, err)
 		testutil.Assert(t, task != nil, "the task must be leaseable again immediately after a shutdown abort")
-		testutil.Ok(t, sched.Report(context.Background(), Result{
+		testutil.Ok(t, sched.Report(t.Context(), Result{
 			TaskID: task.ID, LeaseToken: task.LeaseToken, Generation: task.Generation,
 			Outcome: OutcomeAbortedWorkerShutdown, ErrorMessage: "rolling restart",
 		}))
@@ -227,13 +227,13 @@ func TestWorkerShutdownAbortsAreNotChargedOrBackedOff(t *testing.T) {
 	sched.mtx.Unlock()
 
 	// Every other abort kind still counts and backs off.
-	task, err := sched.Lease(context.Background(), LeaseRequest{WorkerID: "w1", Accepts: []TaskType{TaskCompaction}})
+	task, err := sched.Lease(t.Context(), LeaseRequest{WorkerID: "w1", Accepts: []TaskType{TaskCompaction}})
 	testutil.Ok(t, err)
-	testutil.Ok(t, sched.Report(context.Background(), Result{
+	testutil.Ok(t, sched.Report(t.Context(), Result{
 		TaskID: task.ID, LeaseToken: task.LeaseToken, Generation: task.Generation,
 		Outcome: OutcomeAbortedStoreUnreachable, ErrorMessage: "journal unreadable",
 	}))
-	task, err = sched.Lease(context.Background(), LeaseRequest{WorkerID: "w1", Accepts: []TaskType{TaskCompaction}})
+	task, err = sched.Lease(t.Context(), LeaseRequest{WorkerID: "w1", Accepts: []TaskType{TaskCompaction}})
 	testutil.Ok(t, err)
 	testutil.Assert(t, task == nil, "a store-unreachable abort must back the task off")
 	sched.mtx.Lock()
@@ -369,7 +369,7 @@ func TestMaintenanceWaitingForJournalDoesNotBlockHeartbeats(t *testing.T) {
 // and ownership checks fail, queued work is failed in the journal with the
 // halt as its reason, and nothing is leased or accepted afterwards.
 func TestHaltFreezesTheFleet(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	bkt := objstore.NewInMemBucket()
 	sched, err := NewScheduler(ctx, log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{JournalID: "shard-halt"})
 	testutil.Ok(t, err)

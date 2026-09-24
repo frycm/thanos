@@ -66,7 +66,7 @@ func unparkAll(t *testing.T, s *scenarioRun) int {
 		if !e.State.Parked() {
 			continue
 		}
-		testutil.Ok(t, s.Shared.Upload(context.Background(), UnparkPath(s.conf.journalID, e.Task.ID), strings.NewReader("")))
+		testutil.Ok(t, s.Shared.Upload(t.Context(), UnparkPath(s.conf.journalID, e.Task.ID), strings.NewReader("")))
 		n++
 	}
 	return n
@@ -291,7 +291,7 @@ func scenarios() []scenario {
 						break
 					}
 				}
-				testutil.Ok(t, s.Shared.Upload(context.Background(), filepath.Join(damaged.ID.String(), block.IndexFilename), strings.NewReader("this is not an index")))
+				testutil.Ok(t, s.Shared.Upload(t.Context(), filepath.Join(damaged.ID.String(), block.IndexFilename), strings.NewReader("this is not an index")))
 				s.startWorker("w1")
 				s.startWorker("w2")
 
@@ -318,7 +318,7 @@ func scenarios() []scenario {
 					if _, ok := corpusIDs[id]; ok {
 						continue
 					}
-					m, err := block.DownloadMeta(context.Background(), log.NewNopLogger(), s.Shared, id)
+					m, err := block.DownloadMeta(t.Context(), log.NewNopLogger(), s.Shared, id)
 					testutil.Ok(t, err)
 					testutil.Assert(t, m.Thanos.Labels["tenant"] != "plain", "block %s was produced for the damaged group", id)
 				}
@@ -333,10 +333,10 @@ func scenarios() []scenario {
 				s.stopWorkers()
 				s.currentManager().Stop()
 
-				plan, err := PlanRollback(context.Background(), log.NewNopLogger(), objstore.WithNoopInstr(s.Shared), RollbackOptions{JournalID: s.conf.journalID})
+				plan, err := PlanRollback(t.Context(), log.NewNopLogger(), objstore.WithNoopInstr(s.Shared), RollbackOptions{JournalID: s.conf.journalID})
 				testutil.Ok(t, err)
 				testutil.Assert(t, len(plan.Produced) > 0, "nothing to roll back")
-				testutil.Ok(t, plan.Apply(context.Background(), log.NewNopLogger(), s.Shared))
+				testutil.Ok(t, plan.Apply(t.Context(), log.NewNopLogger(), s.Shared))
 
 				// Exactly the input: the same block IDs, no marks, the same content.
 				testutil.Equals(t, s.Corpus.IDs(), compacttest.BlockIDs(t, s.Shared))
@@ -368,12 +368,12 @@ func scenarios() []scenario {
 				s.currentManager().Stop()
 				<-done
 
-				plan, err := PlanRollback(context.Background(), log.NewNopLogger(), objstore.WithNoopInstr(s.Shared), RollbackOptions{
+				plan, err := PlanRollback(t.Context(), log.NewNopLogger(), objstore.WithNoopInstr(s.Shared), RollbackOptions{
 					JournalID:             s.conf.journalID,
 					AllowUnreadableBlocks: true, // Uploads cut off mid way leave partial blocks.
 				})
 				testutil.Ok(t, err)
-				testutil.Ok(t, plan.Apply(context.Background(), log.NewNopLogger(), s.Shared))
+				testutil.Ok(t, plan.Apply(t.Context(), log.NewNopLogger(), s.Shared))
 
 				got := compacttest.DumpBucket(t, s.Shared)
 				testutil.Equals(t, s.Corpus.IDs(), got.ServedIDs())

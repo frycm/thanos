@@ -21,7 +21,7 @@ import (
 // TestHTTPTransportRoundTrip drives a worker's whole conversation with a manager
 // over the real HTTP handlers.
 func TestHTTPTransportRoundTrip(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	bkt := objstore.NewInMemBucket()
 	sched := testScheduler(t, bkt, ManagerConfig{})
 
@@ -69,6 +69,26 @@ func TestHTTPTransportRoundTrip(t *testing.T) {
 
 // TestHTTPTransportRejectsTaskTypeWorkerDoesNotAccept asserts a worker is never
 // handed a kind of task it did not ask for.
+// TestHTTPTransportAcceptsOnlyPost: the task API takes a POST on every
+// endpoint and answers any other method with 405 and an Allow header,
+// before a handler reads anything.
+func TestHTTPTransportAcceptsOnlyPost(t *testing.T) {
+	mux := http.NewServeMux()
+	RegisterServer(mux, log.NewNopLogger(), testScheduler(t, objstore.NewInMemBucket(), ManagerConfig{}))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	for _, path := range []string{LeasePath, HeartbeatPath, ResultPath} {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+path, nil)
+		testutil.Ok(t, err)
+		resp, err := srv.Client().Do(req)
+		testutil.Ok(t, err)
+		testutil.Ok(t, resp.Body.Close())
+		testutil.Equals(t, http.StatusMethodNotAllowed, resp.StatusCode, path)
+		testutil.Equals(t, http.MethodPost, resp.Header.Get("Allow"), path)
+	}
+}
+
 func TestHTTPTransportRejectsTaskTypeWorkerDoesNotAccept(t *testing.T) {
 	ctx := context.Background()
 	sched := testScheduler(t, objstore.NewInMemBucket(), ManagerConfig{})

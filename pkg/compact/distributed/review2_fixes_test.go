@@ -44,7 +44,7 @@ func failNextJournalWrite(bkt *compacttest.HookBucket, ready func() bool) {
 // other task - left in the scheduler's maps but never leased, forever.
 func TestSubmitFailureRemovesOnlyItsTask(t *testing.T) {
 	bkt := compacttest.NewHookBucket(objstore.NewInMemBucket())
-	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
+	sched, err := NewScheduler(t.Context(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
 		JournalID: "shard-submit", JournalUnavailableTimeout: time.Hour,
 	})
 	testutil.Ok(t, err)
@@ -64,17 +64,17 @@ func TestSubmitFailureRemovesOnlyItsTask(t *testing.T) {
 		for !queued("t-front") {
 			time.Sleep(time.Millisecond)
 		}
-		_, err := sched.Submit(context.Background(), Task{ID: "t-behind", Type: TaskCompaction})
+		_, err := sched.Submit(t.Context(), Task{ID: "t-behind", Type: TaskCompaction})
 		behind <- err
 	}()
 
-	_, err = sched.Submit(context.Background(), Task{ID: "t-front", Type: TaskCompaction})
+	_, err = sched.Submit(t.Context(), Task{ID: "t-front", Type: TaskCompaction})
 	testutil.NotOk(t, err)
 	testutil.Ok(t, <-behind)
 
 	// t-front is gone, t-behind is what a worker gets.
 	testutil.Equals(t, false, queued("t-front"))
-	task, err := sched.Lease(context.Background(), LeaseRequest{WorkerID: "w1"})
+	task, err := sched.Lease(t.Context(), LeaseRequest{WorkerID: "w1"})
 	testutil.Ok(t, err)
 	testutil.Assert(t, task != nil, "t-behind must be leasable")
 	testutil.Equals(t, "t-behind", task.ID)
@@ -87,7 +87,7 @@ func TestSubmitFailureRemovesOnlyItsTask(t *testing.T) {
 // entry the lease had moved on - a nil pointer panic in the manager.
 func TestSubmitSurvivesLeaseDuringJournalWrite(t *testing.T) {
 	bkt := compacttest.NewHookBucket(objstore.NewInMemBucket())
-	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
+	sched, err := NewScheduler(t.Context(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
 		JournalID: "shard-submit-lease", JournalUnavailableTimeout: time.Hour,
 	})
 	testutil.Ok(t, err)
@@ -107,7 +107,7 @@ func TestSubmitSurvivesLeaseDuringJournalWrite(t *testing.T) {
 		for state("t1") != StatePending {
 			time.Sleep(time.Millisecond)
 		}
-		task, err := sched.Lease(context.Background(), LeaseRequest{WorkerID: "w1"})
+		task, err := sched.Lease(t.Context(), LeaseRequest{WorkerID: "w1"})
 		if err != nil || task == nil {
 			leased <- nil
 			return
@@ -115,13 +115,13 @@ func TestSubmitSurvivesLeaseDuringJournalWrite(t *testing.T) {
 		leased <- task
 	}()
 
-	resultCh, err := sched.Submit(context.Background(), Task{ID: "t1", Type: TaskCompaction})
+	resultCh, err := sched.Submit(t.Context(), Task{ID: "t1", Type: TaskCompaction})
 	testutil.Ok(t, err)
 	task := <-leased
 	testutil.Assert(t, task != nil, "the worker must have leased the task")
 
 	// The worker's report reaches the submitter.
-	testutil.Ok(t, sched.Report(context.Background(), Result{
+	testutil.Ok(t, sched.Report(t.Context(), Result{
 		TaskID: task.ID, LeaseToken: task.LeaseToken, Generation: task.Generation,
 		Outcome: OutcomeFailedHalt, ErrorMessage: "as planned",
 	}))
@@ -139,7 +139,7 @@ func TestSubmitSurvivesLeaseDuringJournalWrite(t *testing.T) {
 // write of the manager would then go to the path the body names - the other
 // shard's journal, with two managers writing it.
 func TestReadJournalRejectsForeignBody(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	bkt := objstore.NewInMemBucket()
 
 	testutil.Ok(t, WriteJournal(ctx, bkt, NewJournal("shard-a", "")))
@@ -167,7 +167,7 @@ func TestReadJournalRejectsForeignBody(t *testing.T) {
 // leave no trace in the blocks, so nothing downstream would catch a worker
 // merging the sources differently than the manager planned for.
 func TestLeaseRefusesMismatchedDedupConfig(t *testing.T) {
-	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), objstore.NewInMemBucket(), prometheus.NewRegistry(), ManagerConfig{
+	sched, err := NewScheduler(t.Context(), log.NewNopLogger(), objstore.NewInMemBucket(), prometheus.NewRegistry(), ManagerConfig{
 		JournalID: "shard-a", DedupFunc: "penalty", DedupReplicaLabels: []string{"replica", "rule_replica"},
 	})
 	testutil.Ok(t, err)
@@ -183,7 +183,7 @@ func TestLeaseRefusesMismatchedDedupConfig(t *testing.T) {
 		{"fewer replica labels", LeaseRequest{WorkerID: "w1", DedupFunc: "penalty", DedupReplicaLabels: []string{"replica"}}, "--deduplication.replica-label"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := sched.Lease(context.Background(), tc.req)
+			_, err := sched.Lease(t.Context(), tc.req)
 			testutil.NotOk(t, err)
 			testutil.Assert(t, strings.Contains(err.Error(), tc.want), "the refusal must name the flag to fix: %v", err)
 			testutil.Assert(t, strings.Contains(err.Error(), "w1"), "the refusal must name the worker: %v", err)
@@ -191,16 +191,16 @@ func TestLeaseRefusesMismatchedDedupConfig(t *testing.T) {
 	}
 
 	// The same configuration in any order is accepted.
-	_, err = sched.Lease(context.Background(), LeaseRequest{WorkerID: "w1", DedupFunc: "penalty", DedupReplicaLabels: []string{"rule_replica", "replica"}})
+	_, err = sched.Lease(t.Context(), LeaseRequest{WorkerID: "w1", DedupFunc: "penalty", DedupReplicaLabels: []string{"rule_replica", "replica"}})
 	testutil.Ok(t, err)
 
 	// A manager on the defaults accepts a worker on the defaults, which is
 	// what every existing deployment sends.
-	plain, err := NewScheduler(context.Background(), log.NewNopLogger(), objstore.NewInMemBucket(), prometheus.NewRegistry(), ManagerConfig{JournalID: "shard-b"})
+	plain, err := NewScheduler(t.Context(), log.NewNopLogger(), objstore.NewInMemBucket(), prometheus.NewRegistry(), ManagerConfig{JournalID: "shard-b"})
 	testutil.Ok(t, err)
-	_, err = plain.Lease(context.Background(), LeaseRequest{WorkerID: "w1"})
+	_, err = plain.Lease(t.Context(), LeaseRequest{WorkerID: "w1"})
 	testutil.Ok(t, err)
-	_, err = plain.Lease(context.Background(), LeaseRequest{WorkerID: "w1", DedupFunc: "penalty", DedupReplicaLabels: []string{"replica"}})
+	_, err = plain.Lease(t.Context(), LeaseRequest{WorkerID: "w1", DedupFunc: "penalty", DedupReplicaLabels: []string{"replica"}})
 	testutil.NotOk(t, err)
 }
 
@@ -208,20 +208,20 @@ func TestLeaseRefusesMismatchedDedupConfig(t *testing.T) {
 // manager's merge function, so that a worker can refuse one it was not built
 // for even when the manager that planned it is gone.
 func TestTaskCarriesDedupFunc(t *testing.T) {
-	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), objstore.NewInMemBucket(), prometheus.NewRegistry(), ManagerConfig{
+	sched, err := NewScheduler(t.Context(), log.NewNopLogger(), objstore.NewInMemBucket(), prometheus.NewRegistry(), ManagerConfig{
 		JournalID: "shard-a", DedupFunc: "penalty", DedupReplicaLabels: []string{"replica"},
 	})
 	testutil.Ok(t, err)
-	_, err = sched.Submit(context.Background(), Task{ID: "t1", Type: TaskCompaction})
+	_, err = sched.Submit(t.Context(), Task{ID: "t1", Type: TaskCompaction})
 	testutil.Ok(t, err)
 
-	task, err := sched.Lease(context.Background(), LeaseRequest{WorkerID: "w1", DedupFunc: "penalty", DedupReplicaLabels: []string{"replica"}})
+	task, err := sched.Lease(t.Context(), LeaseRequest{WorkerID: "w1", DedupFunc: "penalty", DedupReplicaLabels: []string{"replica"}})
 	testutil.Ok(t, err)
 	testutil.Assert(t, task != nil, "the task must be leasable")
 	testutil.Equals(t, "penalty", task.Group.DedupFunc)
 
 	// The stamp survives the journal.
-	j, err := ReadJournal(context.Background(), sched.bkt, "shard-a")
+	j, err := ReadJournal(t.Context(), sched.bkt, "shard-a")
 	testutil.Ok(t, err)
 	testutil.Equals(t, "penalty", j.Tasks["t1"].Task.Group.DedupFunc)
 }
@@ -235,7 +235,7 @@ func TestWorkerRefusesTaskForOtherDedupFunc(t *testing.T) {
 	})
 	testutil.Ok(t, err)
 
-	res := w.execute(context.Background(), Task{ID: "01ARZ3NDEKTSV4RRFFQ69G5FAV", Type: TaskCompaction, Group: GroupSpec{DedupFunc: "penalty"}}, nil)
+	res := w.execute(t.Context(), Task{ID: "01ARZ3NDEKTSV4RRFFQ69G5FAV", Type: TaskCompaction, Group: GroupSpec{DedupFunc: "penalty"}}, nil)
 	testutil.Equals(t, OutcomeFailedRetryable, res.Outcome)
 	testutil.Assert(t, strings.Contains(res.ErrorMessage, "penalty"), "the failure must name the function the task was planned for: %s", res.ErrorMessage)
 }
@@ -248,7 +248,7 @@ func TestWorkerRefusesTaskForOtherDedupFunc(t *testing.T) {
 // the journal grew without bound in the meantime.
 func TestMaintainPrunesAndUnparks(t *testing.T) {
 	bkt := objstore.NewInMemBucket()
-	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
+	sched, err := NewScheduler(t.Context(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
 		JournalID: "shard-a", JournalRetention: time.Hour, LeaseTTL: time.Hour,
 	})
 	testutil.Ok(t, err)
@@ -265,22 +265,22 @@ func TestMaintainPrunesAndUnparks(t *testing.T) {
 	testutil.Ok(t, sched.Maintain())
 	testutil.Equals(t, false, sched.SourcesParked([]string{"01BX5ZZKBKACTAV9WEVGEMMVRZ"}))
 	testutil.Equals(t, true, sched.SourcesParked(sources))
-	j, err := ReadJournal(context.Background(), bkt, "shard-a")
+	j, err := ReadJournal(t.Context(), bkt, "shard-a")
 	testutil.Ok(t, err)
 	_, ok := j.Tasks["t-old"]
 	testutil.Equals(t, false, ok)
 
 	// The operator releases the other one; a marker for an unknown task and
 	// one for a task that is not parked are ignored.
-	testutil.Ok(t, bkt.Upload(context.Background(), UnparkPath("shard-a", "t-big"), strings.NewReader("")))
-	testutil.Ok(t, bkt.Upload(context.Background(), UnparkPath("shard-a", "t-unknown"), strings.NewReader("")))
-	_, err = sched.Submit(context.Background(), Task{ID: "t-live", Type: TaskCompaction})
+	testutil.Ok(t, bkt.Upload(t.Context(), UnparkPath("shard-a", "t-big"), strings.NewReader("")))
+	testutil.Ok(t, bkt.Upload(t.Context(), UnparkPath("shard-a", "t-unknown"), strings.NewReader("")))
+	_, err = sched.Submit(t.Context(), Task{ID: "t-live", Type: TaskCompaction})
 	testutil.Ok(t, err)
-	testutil.Ok(t, bkt.Upload(context.Background(), UnparkPath("shard-a", "t-live"), strings.NewReader("")))
+	testutil.Ok(t, bkt.Upload(t.Context(), UnparkPath("shard-a", "t-live"), strings.NewReader("")))
 
 	testutil.Ok(t, sched.Maintain())
 	testutil.Equals(t, false, sched.SourcesParked(sources))
-	j, err = ReadJournal(context.Background(), bkt, "shard-a")
+	j, err = ReadJournal(t.Context(), bkt, "shard-a")
 	testutil.Ok(t, err)
 	_, ok = j.Tasks["t-big"]
 	testutil.Equals(t, false, ok)
@@ -288,7 +288,7 @@ func TestMaintainPrunesAndUnparks(t *testing.T) {
 
 	// The markers are consumed once the journal is written.
 	for _, id := range []string{"t-big", "t-unknown", "t-live"} {
-		exists, err := bkt.Exists(context.Background(), UnparkPath("shard-a", id))
+		exists, err := bkt.Exists(t.Context(), UnparkPath("shard-a", id))
 		testutil.Ok(t, err)
 		testutil.Equals(t, false, exists, "marker for %s must be removed", id)
 	}
@@ -299,31 +299,31 @@ func TestMaintainPrunesAndUnparks(t *testing.T) {
 // so, otherwise a restart would read it back and park the set again.
 func TestMaintainKeepsUnparkMarkerUntilPersisted(t *testing.T) {
 	bkt := compacttest.NewHookBucket(objstore.NewInMemBucket())
-	sched, err := NewScheduler(context.Background(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
+	sched, err := NewScheduler(t.Context(), log.NewNopLogger(), bkt, prometheus.NewRegistry(), ManagerConfig{
 		JournalID: "shard-a", JournalRetention: time.Hour, LeaseTTL: time.Hour, JournalUnavailableTimeout: time.Hour,
 	})
 	testutil.Ok(t, err)
 
 	sources := []string{"01ARZ3NDEKTSV4RRFFQ69G5FAV"}
 	sched.MarkOversized(Task{ID: "t-big", Type: TaskCompaction, SourceBlocks: sources}, "too big")
-	testutil.Ok(t, bkt.Upload(context.Background(), UnparkPath("shard-a", "t-big"), strings.NewReader("")))
+	testutil.Ok(t, bkt.Upload(t.Context(), UnparkPath("shard-a", "t-big"), strings.NewReader("")))
 
 	failNextJournalWrite(bkt, func() bool { return true })
 	testutil.NotOk(t, sched.Maintain())
-	exists, err := bkt.Exists(context.Background(), UnparkPath("shard-a", "t-big"))
+	exists, err := bkt.Exists(t.Context(), UnparkPath("shard-a", "t-big"))
 	testutil.Ok(t, err)
 	testutil.Equals(t, true, exists, "the marker must stay until the journal without the entry is in the bucket")
 
 	// A manager restarted now still sees the entry, and the marker.
-	j, err := ReadJournal(context.Background(), bkt, "shard-a")
+	j, err := ReadJournal(t.Context(), bkt, "shard-a")
 	testutil.Ok(t, err)
 	testutil.Equals(t, StateOversized, j.Tasks["t-big"].State)
 
 	testutil.Ok(t, sched.Maintain())
-	exists, err = bkt.Exists(context.Background(), UnparkPath("shard-a", "t-big"))
+	exists, err = bkt.Exists(t.Context(), UnparkPath("shard-a", "t-big"))
 	testutil.Ok(t, err)
 	testutil.Equals(t, false, exists)
-	j, err = ReadJournal(context.Background(), bkt, "shard-a")
+	j, err = ReadJournal(t.Context(), bkt, "shard-a")
 	testutil.Ok(t, err)
 	_, ok := j.Tasks["t-big"]
 	testutil.Equals(t, false, ok)

@@ -4,6 +4,7 @@
 package distributed
 
 import (
+	"cmp"
 	"context"
 	"flag"
 	"net/http"
@@ -83,21 +84,11 @@ type nodeConfig struct {
 
 func (c nodeConfig) withDefaults() nodeConfig {
 	c.NodeConfig = c.WithDefaults()
-	if c.mode == "" {
-		c.mode = modeManager
-	}
-	if c.journalID == "" {
-		c.journalID = "scenario-shard"
-	}
-	if c.leaseTTL == 0 {
-		c.leaseTTL = 250 * time.Millisecond
-	}
-	if c.maxAttempts == 0 {
-		c.maxAttempts = 3
-	}
-	if c.maxInflight == 0 {
-		c.maxInflight = 4
-	}
+	c.mode = cmp.Or(c.mode, modeManager)
+	c.journalID = cmp.Or(c.journalID, "scenario-shard")
+	c.leaseTTL = cmp.Or(c.leaseTTL, 250*time.Millisecond)
+	c.maxAttempts = cmp.Or(c.maxAttempts, 3)
+	c.maxInflight = cmp.Or(c.maxInflight, 4)
 	return c
 }
 

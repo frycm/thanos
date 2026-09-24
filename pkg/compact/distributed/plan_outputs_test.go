@@ -4,7 +4,6 @@
 package distributed
 
 import (
-	"context"
 	"strings"
 	"testing"
 	"time"
@@ -59,7 +58,7 @@ func TestInteractionPlanOutputsAreProducedAsPlanned(t *testing.T) {
 
 	gotBlocks := map[string]struct{}{}
 	for _, id := range got.compIDs {
-		meta, err := block.DownloadMeta(context.Background(), c.logger, c.shared, id)
+		meta, err := block.DownloadMeta(t.Context(), c.logger, c.shared, id)
 		testutil.Ok(t, err)
 		key := labels.FromMap(meta.Thanos.Labels).String()
 		_, dup := gotBlocks[key]
@@ -72,7 +71,7 @@ func TestInteractionPlanOutputsAreProducedAsPlanned(t *testing.T) {
 	// The sources were retired on the strength of the verification.
 	for _, m := range toCompact {
 		var mark metadata.DeletionMark
-		testutil.Ok(t, metadata.ReadMarker(context.Background(), c.logger, objstore.WithNoopInstr(c.shared), m.ULID.String(), &mark))
+		testutil.Ok(t, metadata.ReadMarker(t.Context(), c.logger, objstore.WithNoopInstr(c.shared), m.ULID.String(), &mark))
 	}
 }
 

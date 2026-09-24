@@ -4,7 +4,6 @@
 package distributed
 
 import (
-	"context"
 	"testing"
 
 	"github.com/efficientgo/core/testutil"
@@ -57,7 +56,7 @@ func TestDuplicateResultsReduceToOneBlock(t *testing.T) {
 	f := block.NewDeduplicateFilter(1)
 	synced := extprom.NewTxGaugeVec(nil, prometheus.GaugeOpts{Name: "test_synced"}, []string{"state"})
 	synced.ResetTx()
-	testutil.Ok(t, f.Filter(context.Background(), metas, synced, nil))
+	testutil.Ok(t, f.Filter(t.Context(), metas, synced, nil))
 
 	// Exactly one of the two survives, and the other is reported as a duplicate
 	// for garbage collection to clean up.

@@ -31,7 +31,7 @@ import (
 // generation N and both write N+1. The owner ID is what tells them apart, so a
 // journal holding our generation but a foreign owner must halt us.
 func TestSchedulerDetectsPeerWithSameGeneration(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	bkt := objstore.NewInMemBucket()
 	s := testScheduler(t, bkt, ManagerConfig{})
 
@@ -66,7 +66,7 @@ func (b *failingUploadBucket) Upload(ctx context.Context, name string, r io.Read
 // produced, and a submitter blocked on a lost result can never be woken again:
 // a re-report finds the task no longer leased and is ignored.
 func TestSchedulerDeliversResultDespiteJournalWriteFailure(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	bkt := &failingUploadBucket{Bucket: objstore.NewInMemBucket()}
 	s := testScheduler(t, bkt, ManagerConfig{})
 
@@ -102,7 +102,7 @@ func TestSchedulerDeliversResultDespiteJournalWriteFailure(t *testing.T) {
 // reaction from the compactor's control loop, and repeating a potentially
 // hours-long compaction to reach the same conclusion delays that reaction.
 func TestSchedulerDeliversTerminalClassesImmediately(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	for _, outcome := range []Outcome{OutcomeFailedHalt, OutcomeFailedIssue347, OutcomeFailedOOOChunks} {
 		t.Run(string(outcome), func(t *testing.T) {
@@ -140,7 +140,7 @@ func TestSchedulerDeliversTerminalClassesImmediately(t *testing.T) {
 // instead of letting an unknown task vouch for it. Terminal entries stay as
 // they were until their retention expires.
 func TestSchedulerTakeoverEndsUnfinishedTasks(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	bkt := objstore.NewInMemBucket()
 
 	j := NewJournal("shard-a", "")
@@ -194,7 +194,7 @@ func TestSchedulerTakeoverEndsUnfinishedTasks(t *testing.T) {
 // however old it is, so that maintenance rejects its outputs instead of the
 // outputs counting as published once their task is forgotten.
 func TestTakeoverKeepsUnverifiedOutputsPastTheRetention(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	bkt := objstore.NewInMemBucket()
 
 	j := NewJournal("shard-a", "")
@@ -246,7 +246,7 @@ func uploadResultMeta(t *testing.T, bkt objstore.Bucket, m metadata.Meta) (strin
 	t.Helper()
 	raw, err := json.Marshal(m)
 	testutil.Ok(t, err)
-	testutil.Ok(t, bkt.Upload(context.Background(), path.Join(m.ULID.String(), "meta.json"), strings.NewReader(string(raw))))
+	testutil.Ok(t, bkt.Upload(t.Context(), path.Join(m.ULID.String(), "meta.json"), strings.NewReader(string(raw))))
 	return m.ULID.String(), checksumOf(raw)
 }
 
@@ -268,7 +268,7 @@ func resultMeta(id ulid.ULID, maxt int64, resolution int64, lbls map[string]stri
 
 func deletionMarked(t *testing.T, bkt objstore.Bucket, id ulid.ULID) bool {
 	t.Helper()
-	ok, err := bkt.Exists(context.Background(), path.Join(id.String(), metadata.DeletionMarkFilename))
+	ok, err := bkt.Exists(t.Context(), path.Join(id.String(), metadata.DeletionMarkFilename))
 	testutil.Ok(t, err)
 	return ok
 }
@@ -283,7 +283,7 @@ func TestVerifyAndFinalizeAcceptsTheRealResult(t *testing.T) {
 		toCompact[0].ULID, toCompact[1].ULID)
 	id, sum := uploadResultMeta(t, bkt, out)
 
-	compIDs, err := e.verifyAndFinalize(context.Background(), cg, compact.Plan{Sources: toCompact}, Result{
+	compIDs, err := e.verifyAndFinalize(t.Context(), cg, compact.Plan{Sources: toCompact}, Result{
 		TaskID: "t1", Outcome: OutcomeCompleted,
 		OutputBlocks: []string{id}, OutputChecksums: map[string]string{id: sum},
 	})
@@ -329,7 +329,7 @@ func TestVerifyAndFinalizeRefusesForeignBlocks(t *testing.T) {
 			e, bkt, cg, toCompact := provenanceFixture(t)
 			id, sum := uploadResultMeta(t, bkt, tc.out(toCompact))
 
-			_, err := e.verifyAndFinalize(context.Background(), cg, compact.Plan{Sources: toCompact}, Result{
+			_, err := e.verifyAndFinalize(t.Context(), cg, compact.Plan{Sources: toCompact}, Result{
 				TaskID: "t1", Outcome: OutcomeCompleted,
 				OutputBlocks: []string{id}, OutputChecksums: map[string]string{id: sum},
 			})
@@ -350,7 +350,7 @@ func TestVerifyAndFinalizeRefusesChecksumMismatch(t *testing.T) {
 		toCompact[0].ULID, toCompact[1].ULID)
 	id, _ := uploadResultMeta(t, bkt, out)
 
-	_, err := e.verifyAndFinalize(context.Background(), cg, compact.Plan{Sources: toCompact}, Result{
+	_, err := e.verifyAndFinalize(t.Context(), cg, compact.Plan{Sources: toCompact}, Result{
 		TaskID: "t1", Outcome: OutcomeCompleted,
 		OutputBlocks: []string{id}, OutputChecksums: map[string]string{id: "sha256:not-what-was-uploaded"},
 	})
@@ -370,7 +370,7 @@ func TestVerifyAndFinalizeEmptyResult(t *testing.T) {
 			m.Stats.NumSamples = 0
 		}
 
-		compIDs, err := e.verifyAndFinalize(context.Background(), cg, compact.Plan{Sources: toCompact}, Result{TaskID: "t1", Outcome: OutcomeCompleted})
+		compIDs, err := e.verifyAndFinalize(t.Context(), cg, compact.Plan{Sources: toCompact}, Result{TaskID: "t1", Outcome: OutcomeCompleted})
 		testutil.Ok(t, err)
 		testutil.Equals(t, 0, len(compIDs))
 		testutil.Equals(t, true, deletionMarked(t, bkt, toCompact[0].ULID))
@@ -381,7 +381,7 @@ func TestVerifyAndFinalizeEmptyResult(t *testing.T) {
 		e, bkt, cg, toCompact := provenanceFixture(t)
 		toCompact[0].Stats.NumSamples = 0
 
-		_, err := e.verifyAndFinalize(context.Background(), cg, compact.Plan{Sources: toCompact}, Result{TaskID: "t1", Outcome: OutcomeCompleted})
+		_, err := e.verifyAndFinalize(t.Context(), cg, compact.Plan{Sources: toCompact}, Result{TaskID: "t1", Outcome: OutcomeCompleted})
 		testutil.NotOk(t, err)
 		testutil.Equals(t, true, compact.IsRetryError(err))
 		testutil.Equals(t, false, deletionMarked(t, bkt, toCompact[0].ULID))
@@ -413,14 +413,14 @@ func (c *flakyClient) Report(_ context.Context, res Result) error {
 // hours of work is far more expensive than a few retries.
 func TestReportWithRetrySurvivesBlips(t *testing.T) {
 	c := &flakyClient{failures: 2}
-	testutil.Ok(t, reportWithBackoff(context.Background(), log.NewNopLogger(), c, Result{TaskID: "t1"}, time.Millisecond))
+	testutil.Ok(t, reportWithBackoff(t.Context(), log.NewNopLogger(), c, Result{TaskID: "t1"}, time.Millisecond))
 	testutil.Equals(t, 1, len(c.reported))
 }
 
 // TestReportWithRetryGivesUpOnContext asserts the retry loop respects its
 // deadline, since the manager's lease expiry is the fallback anyway.
 func TestReportWithRetryGivesUpOnContext(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
 	defer cancel()
 
 	c := &flakyClient{failures: 1 << 30}
@@ -439,7 +439,7 @@ func TestVerifyAndFinalizeRefusesMissingChecksum(t *testing.T) {
 		toCompact[0].ULID, toCompact[1].ULID)
 	id, _ := uploadResultMeta(t, bkt, out)
 
-	_, err := e.verifyAndFinalize(context.Background(), cg, compact.Plan{Sources: toCompact}, Result{
+	_, err := e.verifyAndFinalize(t.Context(), cg, compact.Plan{Sources: toCompact}, Result{
 		TaskID: "t1", Outcome: OutcomeCompleted,
 		OutputBlocks: []string{id},
 	})
@@ -455,7 +455,7 @@ func TestVerifyAndFinalizeRefusesMissingChecksum(t *testing.T) {
 // loop would verify the result and keep compacting a shard somebody else now
 // manages, with only the worker ever seeing the error.
 func TestSchedulerTakeoverHaltReachesSubmitter(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	bkt := objstore.NewInMemBucket()
 	s := testScheduler(t, bkt, ManagerConfig{})
 
@@ -512,7 +512,7 @@ func TestVerifyAndFinalizeRequiresProvenance(t *testing.T) {
 			}
 			id, sum := uploadResultMeta(t, bkt, out)
 
-			_, err := e.verifyAndFinalize(context.Background(), cg, compact.Plan{Sources: toCompact}, Result{
+			_, err := e.verifyAndFinalize(t.Context(), cg, compact.Plan{Sources: toCompact}, Result{
 				TaskID: "t1", Outcome: OutcomeCompleted,
 				OutputBlocks: []string{id}, OutputChecksums: map[string]string{id: sum},
 			})
@@ -559,7 +559,7 @@ func TestVerifyTimeCoverage(t *testing.T) {
 // task at its ownership check; a worker with another merge configuration would
 // produce blocks that carry no trace of the difference.
 func TestSchedulerRefusesMismatchedWorkers(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := testScheduler(t, objstore.NewInMemBucket(), ManagerConfig{
 		DedupFunc:          "penalty",
 		DedupReplicaLabels: []string{"replica"},
@@ -595,7 +595,7 @@ func TestSchedulerRefusesMismatchedWorkers(t *testing.T) {
 // capacity is refused before any worker touches it, recorded in the journal,
 // and its source blocks withheld from planning until an operator unparks them.
 func TestSchedulerParksOversizedTasks(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	bkt := objstore.NewInMemBucket()
 	s := testScheduler(t, bkt, ManagerConfig{MaxTaskSeries: 100, LeaseTTL: 10 * time.Millisecond})
 
@@ -639,7 +639,7 @@ func TestSchedulerParksOversizedTasks(t *testing.T) {
 // actually protects: once a task burned its attempts without a report, its
 // exact source set is parked, and the executor defers rather than re-dispatch.
 func TestSchedulerAbandonedTaskParksItsSources(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := testScheduler(t, objstore.NewInMemBucket(), ManagerConfig{LeaseTTL: time.Millisecond, MaxAttempts: 2})
 
 	resultCh, err := s.Submit(ctx, Task{ID: "t1", Type: TaskCompaction, SourceBlocks: []string{"a", "b"}})

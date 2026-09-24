@@ -4,6 +4,7 @@
 package distributed
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -60,9 +61,7 @@ func DefaultWorkerID() string {
 }
 
 func (c *WorkerConfig) applyDefaults() {
-	if c.WorkerID == "" {
-		c.WorkerID = DefaultWorkerID()
-	}
+	c.WorkerID = cmp.Or(c.WorkerID, DefaultWorkerID())
 	if c.PollInterval <= 0 {
 		c.PollInterval = 5 * time.Second
 	}

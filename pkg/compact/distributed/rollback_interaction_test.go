@@ -4,7 +4,6 @@
 package distributed
 
 import (
-	"context"
 	"path/filepath"
 	"testing"
 	"time"
@@ -32,7 +31,7 @@ func TestInteractionRollbackRestoresBucket(t *testing.T) {
 	// write, must survive the rollback untouched.
 	bystander, bystanderMetas := c.makeGroup(labels.FromStrings("ext", "bystander"))
 	_ = bystander
-	testutil.Ok(t, block.MarkForDeletion(context.Background(), c.logger, c.shared, bystanderMetas[0].ULID, "retention",
+	testutil.Ok(t, block.MarkForDeletion(t.Context(), c.logger, c.shared, bystanderMetas[0].ULID, "retention",
 		promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"})))
 
 	cg, toCompact := c.makeGroup(labels.FromStrings("ext", "1"))
@@ -48,7 +47,7 @@ func TestInteractionRollbackRestoresBucket(t *testing.T) {
 	// The state a trial leaves behind: result present, sources marked, and
 	// the result recording what it was made from.
 	testutil.Equals(t, true, exists(t, c.shared, filepath.Join(produced.String(), block.MetaFilename)))
-	producedMeta, err := block.DownloadMeta(context.Background(), c.logger, c.shared, produced)
+	producedMeta, err := block.DownloadMeta(t.Context(), c.logger, c.shared, produced)
 	testutil.Ok(t, err)
 	prov, ok := ProvenanceOf(&producedMeta)
 	testutil.Equals(t, true, ok)
@@ -58,7 +57,7 @@ func TestInteractionRollbackRestoresBucket(t *testing.T) {
 		testutil.Equals(t, true, exists(t, c.shared, filepath.Join(m.ULID.String(), metadata.DeletionMarkFilename)))
 	}
 
-	plan, err := PlanRollback(context.Background(), c.logger, objstore.WithNoopInstr(c.shared), RollbackOptions{JournalID: journalID})
+	plan, err := PlanRollback(t.Context(), c.logger, objstore.WithNoopInstr(c.shared), RollbackOptions{JournalID: journalID})
 	testutil.Ok(t, err)
 	testutil.Equals(t, []ulid.ULID{produced}, plan.Produced)
 	testutil.Equals(t, 2, len(plan.Restore))
@@ -68,7 +67,7 @@ func TestInteractionRollbackRestoresBucket(t *testing.T) {
 	// the manager and knows it is idle, so it may proceed.
 	testutil.Equals(t, []string{journalID}, plan.RecentlyActive(15*time.Minute, time.Now()))
 
-	testutil.Ok(t, plan.Apply(context.Background(), c.logger, c.shared))
+	testutil.Ok(t, plan.Apply(t.Context(), c.logger, c.shared))
 
 	// Back to where the standalone compactor left things.
 	testutil.Equals(t, false, exists(t, c.shared, filepath.Join(produced.String(), block.MetaFilename)))

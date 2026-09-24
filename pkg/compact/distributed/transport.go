@@ -31,9 +31,11 @@ const (
 	ResultPath    = APIPrefix + "/result"
 )
 
-// RegisterServer mounts the manager's task API on a router.
+// RegisterServer mounts the manager's task API on a router. Every endpoint
+// takes a POST; the router answers any other method with 405 and an Allow
+// header.
 func RegisterServer(mux *http.ServeMux, logger log.Logger, sched *Scheduler) {
-	mux.HandleFunc(LeasePath, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(http.MethodPost+" "+LeasePath, func(w http.ResponseWriter, r *http.Request) {
 		var req LeaseRequest
 		if !decode(w, r, &req) {
 			return
@@ -47,7 +49,7 @@ func RegisterServer(mux *http.ServeMux, logger log.Logger, sched *Scheduler) {
 		encode(w, LeaseResponse{Task: task})
 	})
 
-	mux.HandleFunc(HeartbeatPath, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(http.MethodPost+" "+HeartbeatPath, func(w http.ResponseWriter, r *http.Request) {
 		var req HeartbeatRequest
 		if !decode(w, r, &req) {
 			return
@@ -55,7 +57,7 @@ func RegisterServer(mux *http.ServeMux, logger log.Logger, sched *Scheduler) {
 		encode(w, sched.Heartbeat(req))
 	})
 
-	mux.HandleFunc(ResultPath, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(http.MethodPost+" "+ResultPath, func(w http.ResponseWriter, r *http.Request) {
 		var res Result
 		if !decode(w, r, &res) {
 			return
@@ -70,10 +72,6 @@ func RegisterServer(mux *http.ServeMux, logger log.Logger, sched *Scheduler) {
 }
 
 func decode(w http.ResponseWriter, r *http.Request, into any) bool {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return false
-	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 8<<20)).Decode(into); err != nil {
 		http.Error(w, errors.Wrap(err, "decode request").Error(), http.StatusBadRequest)
 		return false
