@@ -233,7 +233,7 @@ func TestCleanupDownsampleCacheFolder(t *testing.T) {
 // marker-read failure is logged and skipped, never propagated into the fetch.
 func TestBestEffortMetaFilterSwallowsErrors(t *testing.T) {
 	f := bestEffortMetaFilter{logger: log.NewNopLogger(), inner: failingMetaFilter{}}
-	testutil.Ok(t, f.Filter(context.Background(), nil, nil, nil))
+	testutil.Ok(t, f.Filter(t.Context(), nil, nil, nil))
 }
 
 type failingMetaFilter struct{}
