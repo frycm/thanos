@@ -156,7 +156,7 @@ func (r *Run) WaitFor(msg string, cond func() bool) {
 }
 
 // Fingerprint summarizes the shared bucket.
-func (r *Run) Fingerprint() string { return Fingerprint(r.Shared) }
+func (r *Run) Fingerprint() string { return Fingerprint(r.T, r.Shared) }
 
 // Passes runs up to n single passes of the current node, for a control loop
 // that is not expected to settle, such as one whose group fails on every
@@ -236,9 +236,8 @@ func (r *Run) Converge(timeout time.Duration) ConvergeResult {
 		}
 		quiet := r.Quiet == nil || r.Quiet()
 		fp := r.Fingerprint()
-		if err == nil && quiet && fp == last {
-			stable++
-		} else {
+		stable++
+		if err != nil || !quiet || fp != last {
 			stable = 0
 		}
 		last = fp

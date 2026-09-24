@@ -35,7 +35,7 @@ func CleanScenario(t testing.TB, e *e2e.DockerEnvironment) func() {
 // fail because the container name is still taken.
 func Restart(e e2e.Environment, r e2e.Runnable) error {
 	if err := r.Stop(); err != nil {
-		return err
+		return errors.Wrapf(err, "stop %s", r.Name())
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -48,7 +48,10 @@ func Restart(e e2e.Environment, r e2e.Runnable) error {
 	}); err != nil {
 		return errors.Wrapf(err, "wait for the removal of container %s", container)
 	}
-	return e2e.StartAndWaitReady(r)
+	if err := e2e.StartAndWaitReady(r); err != nil {
+		return errors.Wrapf(err, "start %s", r.Name())
+	}
+	return nil
 }
 
 func singleJoiningSlash(a, b string) string {

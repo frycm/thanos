@@ -89,9 +89,9 @@ func (p SeriesPartition) contains(lset labels.Labels, h *xxhash.Digest) bool {
 	return p.hash(lset, h)%p.Count == p.Index
 }
 
-// seps separates names and values in the byte layout labels.StableHash
+// sep separates names and values in the byte layout labels.StableHash
 // hashes, which hash mirrors.
-var seps = []byte{'\xff'}
+const sep = "\xff"
 
 // hash is labels.StableHash of lset without the labels in Without: the same
 // byte layout, name and value each followed by a separator, fed to xxhash for
@@ -103,17 +103,16 @@ func (p SeriesPartition) hash(lset labels.Labels, h *xxhash.Digest) uint64 {
 	}
 	if h == nil {
 		h = xxhash.New()
-	} else {
-		h.Reset()
 	}
+	h.Reset()
 	lset.Range(func(l labels.Label) {
 		if slices.Contains(p.Without, l.Name) {
 			return
 		}
 		_, _ = h.WriteString(l.Name)
-		_, _ = h.Write(seps)
+		_, _ = h.WriteString(sep)
 		_, _ = h.WriteString(l.Value)
-		_, _ = h.Write(seps)
+		_, _ = h.WriteString(sep)
 	})
 	return h.Sum64()
 }

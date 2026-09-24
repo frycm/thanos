@@ -893,18 +893,19 @@ func (f *DefaultDeduplicateFilter) Filter(_ context.Context, metas map[ulid.ULID
 		dups := make([]ulid.ULID, 0)
 		unpublished := make([]*metadata.Meta, 0)
 		for out := range dupsChan {
+			m := metas[out.id]
+			delete(metas, out.id)
 			if out.unpublished {
-				if m := metas[out.id]; m != nil {
+				if m != nil {
 					unpublished = append(unpublished, m)
 				}
 				synced.WithLabelValues(unpublishedMeta).Inc()
-			} else {
-				if metas[out.id] != nil {
-					dups = append(dups, out.id)
-				}
-				synced.WithLabelValues(duplicateMeta).Inc()
+				continue
 			}
-			delete(metas, out.id)
+			if m != nil {
+				dups = append(dups, out.id)
+			}
+			synced.WithLabelValues(duplicateMeta).Inc()
 		}
 		f.mu.Lock()
 		f.duplicateIDs = dups

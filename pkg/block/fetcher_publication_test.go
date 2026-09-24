@@ -52,57 +52,89 @@ func TestDeduplicateFilterRequiresPublication(t *testing.T) {
 	}
 
 	set := []ulid.ULID{ULID(10), ULID(11)}
-	t.Run("an incomplete set supersedes nothing", func(t *testing.T) {
-		got := run(t, nil,
-			meta(ULID(1)), meta(ULID(2)),
-			output(ULID(10), 0, 2, set, ULID(1), ULID(2)),
-		)
-		testutil.Equals(t, ULIDs(1, 2, 10), got, "the sources stay while a sibling is missing")
-	})
-	t.Run("a complete set supersedes its sources", func(t *testing.T) {
-		got := run(t, nil,
-			meta(ULID(1)), meta(ULID(2)),
-			output(ULID(10), 0, 2, set, ULID(1), ULID(2)),
-			output(ULID(11), 1, 2, set, ULID(1), ULID(2)),
-		)
-		testutil.Equals(t, ULIDs(10, 11), got)
-	})
-	t.Run("a published result supersedes the unpublished leftover of an earlier attempt", func(t *testing.T) {
-		later := []ulid.ULID{ULID(20), ULID(21)}
-		got := run(t, nil,
-			meta(ULID(1)), meta(ULID(2)),
-			// The earlier attempt published one of two blocks and failed.
-			output(ULID(10), 0, 2, set, ULID(1), ULID(2)),
-			output(ULID(20), 0, 2, later, ULID(1), ULID(2)),
-			output(ULID(21), 1, 2, later, ULID(1), ULID(2)),
-		)
-		testutil.Equals(t, ULIDs(20, 21), got, "the older, unpublished block must not win the tie")
-	})
-	t.Run("a block without a set is its own set", func(t *testing.T) {
-		got := run(t, nil, meta(ULID(1)), meta(ULID(2)), meta(ULID(10), ULID(1), ULID(2)))
-		testutil.Equals(t, ULIDs(10), got)
-	})
-	t.Run("a set copied from a source does not bind the block", func(t *testing.T) {
-		// A tool kept the source's metadata: the set names other blocks, none
-		// of them present. The block is judged as its own set.
-		got := run(t, nil, meta(ULID(1)), meta(ULID(2)), output(ULID(10), 0, 2, []ulid.ULID{ULID(90), ULID(91)}, ULID(1), ULID(2)))
-		testutil.Equals(t, ULIDs(10), got)
-	})
-	t.Run("the caller can declare a block unpublished", func(t *testing.T) {
-		rejected := ULID(10)
-		got := run(t, func(m *metadata.Meta) bool { return m.ULID != rejected },
-			meta(ULID(1)), meta(ULID(2)),
-			meta(ULID(10), ULID(1), ULID(2)),
-		)
-		testutil.Equals(t, ULIDs(1, 2, 10), got)
+	later := []ulid.ULID{ULID(20), ULID(21)}
+	rejected := ULID(10)
+	notRejected := func(m *metadata.Meta) bool { return m.ULID != rejected }
+	for _, tcase := range []struct {
+		name      string
+		published func(*metadata.Meta) bool
+		input     []*metadata.Meta
 
-		got = run(t, func(m *metadata.Meta) bool { return m.ULID != rejected },
-			meta(ULID(1)), meta(ULID(2)),
-			meta(ULID(10), ULID(1), ULID(2)),
-			meta(ULID(20), ULID(1), ULID(2)),
-		)
-		testutil.Equals(t, ULIDs(20), got, "the accepted result supersedes the rejected one and the sources")
-	})
+		expected []ulid.ULID
+		msg      string
+	}{
+		{
+			name: "an incomplete set supersedes nothing",
+			input: []*metadata.Meta{
+				meta(ULID(1)),
+				meta(ULID(2)),
+				output(ULID(10), 0, 2, set, ULID(1), ULID(2)),
+			},
+			expected: ULIDs(1, 2, 10),
+			msg:      "the sources stay while a sibling is missing",
+		},
+		{
+			name: "a complete set supersedes its sources",
+			input: []*metadata.Meta{
+				meta(ULID(1)),
+				meta(ULID(2)),
+				output(ULID(10), 0, 2, set, ULID(1), ULID(2)),
+				output(ULID(11), 1, 2, set, ULID(1), ULID(2)),
+			},
+			expected: ULIDs(10, 11),
+		},
+		{
+			name: "a published result supersedes the unpublished leftover of an earlier attempt",
+			input: []*metadata.Meta{
+				meta(ULID(1)),
+				meta(ULID(2)),
+				// The earlier attempt published one of two blocks and failed.
+				output(ULID(10), 0, 2, set, ULID(1), ULID(2)),
+				output(ULID(20), 0, 2, later, ULID(1), ULID(2)),
+				output(ULID(21), 1, 2, later, ULID(1), ULID(2)),
+			},
+			expected: ULIDs(20, 21),
+			msg:      "the older, unpublished block must not win the tie",
+		},
+		{
+			name:     "a block without a set is its own set",
+			input:    []*metadata.Meta{meta(ULID(1)), meta(ULID(2)), meta(ULID(10), ULID(1), ULID(2))},
+			expected: ULIDs(10),
+		},
+		{
+			// A tool kept the source's metadata: the set names other blocks, none
+			// of them present. The block is judged as its own set.
+			name:     "a set copied from a source does not bind the block",
+			input:    []*metadata.Meta{meta(ULID(1)), meta(ULID(2)), output(ULID(10), 0, 2, []ulid.ULID{ULID(90), ULID(91)}, ULID(1), ULID(2))},
+			expected: ULIDs(10),
+		},
+		{
+			name:      "the caller can declare a block unpublished",
+			published: notRejected,
+			input: []*metadata.Meta{
+				meta(ULID(1)),
+				meta(ULID(2)),
+				meta(ULID(10), ULID(1), ULID(2)),
+			},
+			expected: ULIDs(1, 2, 10),
+		},
+		{
+			name:      "the result the caller accepts supersedes the one it declared unpublished",
+			published: notRejected,
+			input: []*metadata.Meta{
+				meta(ULID(1)),
+				meta(ULID(2)),
+				meta(ULID(10), ULID(1), ULID(2)),
+				meta(ULID(20), ULID(1), ULID(2)),
+			},
+			expected: ULIDs(20),
+			msg:      "the accepted result supersedes the rejected one and the sources",
+		},
+	} {
+		t.Run(tcase.name, func(t *testing.T) {
+			testutil.Equals(t, tcase.expected, run(t, tcase.published, tcase.input...), tcase.msg)
+		})
+	}
 }
 
 // TestDeduplicateFilterHidesUnpublished: a compactor's filter withholds
@@ -169,8 +201,15 @@ func TestDeduplicateFilterHidesUnpublished(t *testing.T) {
 	})
 	t.Run("a leftover of an earlier attempt is a duplicate of the published rerun, not withheld", func(t *testing.T) {
 		A2, B2 := ULID(12), ULID(13)
-		view, dups, hidden := run(t, nil, meta(ULID(1)), meta(ULID(2)), output(A, 0, 2, []ulid.ULID{A, B}, ULID(1), ULID(2)),
-			output(A2, 0, 2, []ulid.ULID{A2, B2}, ULID(1), ULID(2)), output(B2, 1, 2, []ulid.ULID{A2, B2}, ULID(1), ULID(2)))
+		view, dups, hidden := run(
+			t,
+			nil,
+			meta(ULID(1)),
+			meta(ULID(2)),
+			output(A, 0, 2, []ulid.ULID{A, B}, ULID(1), ULID(2)),
+			output(A2, 0, 2, []ulid.ULID{A2, B2}, ULID(1), ULID(2)),
+			output(B2, 1, 2, []ulid.ULID{A2, B2}, ULID(1), ULID(2)),
+		)
 		testutil.Equals(t, ULIDs(12, 13), view)
 		testutil.Equals(t, ULIDs(1, 2, 10), dups)
 		testutil.Equals(t, []ulid.ULID{}, hidden)
@@ -179,9 +218,17 @@ func TestDeduplicateFilterHidesUnpublished(t *testing.T) {
 		// A planner sees the complete outputs of range 2 and the unsplit
 		// sources of range 1, never the withheld half of range 1.
 		A2, B2 := ULID(20), ULID(21)
-		view, dups, hidden := run(t, nil, meta(ULID(1)), meta(ULID(2)), meta(ULID(3)), meta(ULID(4)),
+		view, dups, hidden := run(
+			t,
+			nil,
+			meta(ULID(1)),
+			meta(ULID(2)),
+			meta(ULID(3)),
+			meta(ULID(4)),
 			output(A, 0, 2, []ulid.ULID{A, B}, ULID(1), ULID(2)),
-			output(A2, 0, 2, []ulid.ULID{A2, B2}, ULID(3), ULID(4)), output(B2, 1, 2, []ulid.ULID{A2, B2}, ULID(3), ULID(4)))
+			output(A2, 0, 2, []ulid.ULID{A2, B2}, ULID(3), ULID(4)),
+			output(B2, 1, 2, []ulid.ULID{A2, B2}, ULID(3), ULID(4)),
+		)
 		testutil.Equals(t, ULIDs(1, 2, 20, 21), view)
 		testutil.Equals(t, ULIDs(3, 4), dups)
 		testutil.Equals(t, []ulid.ULID{A}, hidden)

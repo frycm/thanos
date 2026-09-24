@@ -73,7 +73,14 @@ func testGroup(t *testing.T, metas ...*metadata.Meta) *Group {
 		0,
 		false,
 		false,
-		cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(),
+		cnt(),
+		cnt(),
+		cnt(),
+		cnt(),
+		cnt(),
+		cnt(),
+		cnt(),
+		cnt(),
 		metadata.NoneFunc,
 		1,
 		1,
@@ -240,9 +247,20 @@ type singleBlockPlanner struct {
 func (p singleBlockPlanner) PlansSingleBlockGroups() bool { return p.single }
 
 func TestPlansSingleBlockGroups(t *testing.T) {
-	testutil.Equals(t, false, plansSingleBlockGroups(stubPlanner{}))
-	testutil.Equals(t, false, plansSingleBlockGroups(singleBlockPlanner{}))
-	testutil.Equals(t, true, plansSingleBlockGroups(singleBlockPlanner{single: true}))
+	for _, tcase := range []struct {
+		name    string
+		planner Planner
+
+		expected bool
+	}{
+		{name: "planner without the method", planner: stubPlanner{}},
+		{name: "planner that declines", planner: singleBlockPlanner{}},
+		{name: "planner that plans them", planner: singleBlockPlanner{single: true}, expected: true},
+	} {
+		t.Run(tcase.name, func(t *testing.T) {
+			testutil.Equals(t, tcase.expected, plansSingleBlockGroups(tcase.planner))
+		})
+	}
 }
 
 // TestGroupCompactSkipsExecutorWhenNothingPlanned asserts the executor is not
@@ -283,10 +301,20 @@ func TestGroupPlanHaltsOnOverlap(t *testing.T) {
 func TestExportedErrorConstructors(t *testing.T) {
 	id := ulid.MustNew(7, nil)
 
-	testutil.Equals(t, true, IsHaltError(NewHaltError(errors.New("boom"))))
-	testutil.Equals(t, true, IsRetryError(NewRetryError(errors.New("boom"))))
-	testutil.Equals(t, true, IsIssue347Error(NewIssue347Error(errors.New("boom"), id)))
-	testutil.Equals(t, true, IsOutOfOrderChunkError(NewOutOfOrderChunksError(errors.New("boom"), id)))
+	for _, tcase := range []struct {
+		name string
+		err  error
+		is   func(error) bool
+	}{
+		{name: "halt", err: NewHaltError(errors.New("boom")), is: IsHaltError},
+		{name: "retry", err: NewRetryError(errors.New("boom")), is: IsRetryError},
+		{name: "issue 347", err: NewIssue347Error(errors.New("boom"), id), is: IsIssue347Error},
+		{name: "out of order chunks", err: NewOutOfOrderChunksError(errors.New("boom"), id), is: IsOutOfOrderChunkError},
+	} {
+		t.Run(tcase.name, func(t *testing.T) {
+			testutil.Equals(t, true, tcase.is(tcase.err))
+		})
+	}
 }
 
 // TestSetSiblings: a plan names the live blocks that share a set with one of
@@ -295,7 +323,7 @@ func TestExportedErrorConstructors(t *testing.T) {
 // view, and nothing when no set is involved.
 func TestSetSiblings(t *testing.T) {
 	id := func(i int) ulid.ULID { return ulid.MustNew(uint64(i), nil) }
-	meta := func(i int, set ...int) *metadata.Meta {
+	setMeta := func(i int, set ...int) *metadata.Meta {
 		m := &metadata.Meta{BlockMeta: tsdb.BlockMeta{ULID: id(i)}}
 		if len(set) > 0 {
 			m.Thanos.Output = &metadata.ThanosOutput{Index: 0, Count: 1}
@@ -314,7 +342,7 @@ func TestSetSiblings(t *testing.T) {
 	// 1 and 2 were split together: set {1, 2, 9}, where 9 is gone. 3 named 1
 	// as its sibling: set {3, 1}. 4 names 2 and 5: set {4, 2, 5}. 6 is
 	// unrelated, 7 names only gone blocks.
-	add(meta(1, 1, 2, 9), meta(2, 1, 2, 9), meta(3, 3, 1), meta(4, 4, 2, 5), meta(5), meta(6), meta(7, 7, 8))
+	add(setMeta(1, 1, 2, 9), setMeta(2, 1, 2, 9), setMeta(3, 3, 1), setMeta(4, 4, 2, 5), setMeta(5), setMeta(6), setMeta(7, 7, 8))
 
 	got := SetSiblings(view, []*metadata.Meta{view[id(1)]})
 	testutil.Equals(t, []ulid.ULID{id(2), id(3)}, got, "1's own set and 3's set name it")
