@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -170,6 +171,7 @@ func DefaultSyncedStateLabelValues() [][]string {
 		{FailedMeta},
 		{labelExcludedMeta},
 		{timeExcludedMeta},
+		{resolutionExcludedMeta},
 		{duplicateMeta},
 		{MarkedForDeletionMeta},
 		{MarkedForNoCompactionMeta},
@@ -763,6 +765,271 @@ func (f *TimePartitionMetaFilter) Filter(_ context.Context, metas map[ulid.ULID]
 		delete(metas, id)
 	}
 	return nil
+}
+
+// resolutionExcludedMeta is the synced label value of the blocks
+// ResolutionMetaFilter hides.
+const resolutionExcludedMeta = "resolution-excluded"
+
+var _ MetadataFilter = &ResolutionMetaFilter{}
+
+// ResolutionMetaFilter is a MetadataFilter that filters out blocks outside a
+// resolution range, so a store gateway can be told to serve only downsampled
+// blocks the same way min-time/max-time partition by time.
+//
+// Hiding a finer block requires coverage of its sources and full time range.
+// A block below the minimum resolution is hidden only when each source is
+// covered across the block's full time range by
+// a retained block AT the minimum resolution: the query path substitutes finer
+// blocks for missing coarser ones but never the other way around, so coverage
+// at a coarser level than the minimum would be unreachable for queries asking
+// exactly the minimum. Second, a block without a source genealogy
+// (Compaction.Sources empty) can never be proven covered and is always kept -
+// the guard fails open, because hiding an uncovered block does not shift
+// queries to a lower resolution, it silently drops the range.
+//
+// Query selection must also check source coverage: temporal overlap with a
+// coarse block alone does not replace the unique data in a retained fine block.
+// Kept-but-uncovered blocks are reported (gauge and log) by the filter
+// Reporter returns, as the fix is to get them downsampled, not to hide them. No
+// coverage guard exists for the maximum bound: dropping a coarse block loses
+// nothing as long as the finer blocks it was built from are served elsewhere,
+// which is this filter's contract, same as time partitioning.
+//
+// Only blocks every other filter retained may count as coverage, so this
+// filter has to run after every filter that can drop a covering block for good
+// (too fresh, marked for deletion, parquet-migrated, ...). The one exception is
+// the time partition: it has to run AFTER this filter. A finer block straddling
+// the partition boundary is covered by blocks on both sides of it, and with the
+// out-of-window cover already dropped, the straddling block could never be
+// proven covered and would be served in full for a range the in-window cover
+// serves too. Serving is per range, so the partition is free to drop the
+// out-of-window cover afterwards.
+type ResolutionMetaFilter struct {
+	logger                       log.Logger
+	minResolution, maxResolution int64
+	mu                           sync.Mutex
+	// fallbacks are the finer blocks the latest Filter hid; covers are the
+	// blocks at the minimum resolution whose data hid at least one of them.
+	// Only covers need their index verified before a fallback is retired:
+	// every other block at the minimum resolution hides nothing.
+	fallbacks map[ulid.ULID]*metadata.Meta
+	covers    map[ulid.ULID]*metadata.Meta
+
+	// uncoveredBlocks, if set, reports how many blocks below the minimum
+	// resolution are being served for lack of coverage - the alertable form of
+	// the log line in warnUncovered.
+	uncoveredBlocks prometheus.Gauge
+
+	lastUncovered string
+}
+
+// coarsestResolution is the coarsest downsampling resolution Thanos produces
+// (downsample.ResLevel2, restated here because that package builds on this
+// one). A filter admitting everything up to it cannot exclude any block.
+const coarsestResolution = int64(3600 * 1000)
+
+// NewResolutionMetaFilter creates ResolutionMetaFilter. uncoveredBlocks may be
+// nil. Run Reporter after the filter to report the uncovered blocks it kept.
+func NewResolutionMetaFilter(logger log.Logger, minResolution, maxResolution int64, uncoveredBlocks prometheus.Gauge) *ResolutionMetaFilter {
+	return &ResolutionMetaFilter{logger: logger, minResolution: minResolution, maxResolution: maxResolution, uncoveredBlocks: uncoveredBlocks}
+}
+
+// MinimumResolution is the resolution whose blocks may replace finer fallbacks.
+func (f *ResolutionMetaFilter) MinimumResolution() int64 {
+	return f.minResolution
+}
+
+// Hidden returns the blocks below the minimum resolution the latest fetch hid
+// behind covers at the minimum. A request for data finer than the minimum
+// gets nothing for their ranges, unless the store loaded them back as
+// fallbacks.
+func (f *ResolutionMetaFilter) Hidden() []*metadata.Meta {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	hidden := make([]*metadata.Meta, 0, len(f.fallbacks))
+	for _, m := range f.fallbacks {
+		hidden = append(hidden, m)
+	}
+	return hidden
+}
+
+// Reporter returns the filter that reports (gauge and log) the blocks below
+// the minimum resolution still being served. It removes nothing. It has to run
+// LAST, after the time partition in particular: the resolution filter keeps a
+// block straddling the partition boundary when the cover on the far side is
+// missing, and the partition then drops the blocks that are not served anyway,
+// so only what remains here is served uncovered and worth an alert.
+func (f *ResolutionMetaFilter) Reporter() MetadataFilter {
+	return &resolutionUncoveredReporter{f: f}
+}
+
+// Filter filters out blocks that are outside of the specified resolution range.
+func (f *ResolutionMetaFilter) Filter(_ context.Context, metas map[ulid.ULID]*metadata.Meta, synced GaugeVec, modified GaugeVec) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fallbacks, f.covers = nil, nil
+	if f.minResolution <= 0 && f.maxResolution >= coarsestResolution {
+		// Every possible resolution is in range: nothing to hide, and no
+		// coverage bookkeeping to pay for on every sync.
+		return nil
+	}
+
+	// Sources of the retained blocks at exactly the minimum resolution, per
+	// block stream - the only level guaranteed reachable for every accepted
+	// query (see the type comment). The stream keying is a deliberate defense,
+	// not bookkeeping: source ULIDs can recur across label sets when a lineage
+	// was relabeled (thanos tools bucket rewrite), and coverage from another
+	// label set would hide a block whose own labels then lose the range. A
+	// stream is a label set without the compactor's shard label: the shards
+	// of a block split by series hold its series between them, so they cover
+	// it together, and a coarser block covers each of its shards (see
+	// resolutionCoverage). Unlike the deduplicate filter's single-parent rule,
+	// coverage may be assembled from several blocks together, since serving is
+	// per range, not per parent. Note that replica labels stripped by a
+	// compactor mean a pre-deduplication raw block never matches its
+	// deduplicated cover's label set; such blocks stay served (fail open)
+	// until the compactor deletes them, which is the transient, safe
+	// direction.
+	var minLevelSources resolutionCoverage
+	if f.minResolution > 0 {
+		minLevelSources = coverageAtResolution(metas, f.minResolution)
+	}
+
+	for id, m := range metas {
+		res := m.Thanos.Downsample.Resolution
+		switch {
+		case res > f.maxResolution:
+			// Hidden unconditionally: the finer blocks it was built from are
+			// served elsewhere.
+		case res < f.minResolution:
+			if !minLevelSources.covers(m) {
+				// Kept and served; Reporter accounts for it.
+				continue
+			}
+			if f.fallbacks == nil {
+				f.fallbacks = map[ulid.ULID]*metadata.Meta{}
+				f.covers = map[ulid.ULID]*metadata.Meta{}
+			}
+			f.fallbacks[id] = m
+			for _, cover := range minLevelSources.coveringBlocks(m) {
+				if c, ok := metas[cover]; ok {
+					f.covers[cover] = c
+				}
+			}
+		default:
+			continue
+		}
+		synced.WithLabelValues(resolutionExcludedMeta).Inc()
+		delete(metas, id)
+	}
+	return nil
+}
+
+// Replaces reports whether the block, at the minimum resolution, hid at least
+// one finer block in the latest fetch. Only those blocks have to be verified
+// before they are relied on; the rest hide nothing.
+func (f *ResolutionMetaFilter) Replaces(id ulid.ULID) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.covers[id]
+	return ok
+}
+
+// FallbacksFor returns the finer blocks hidden by the latest fetch whose
+// coverage cannot be relied on. Metadata alone must not evict a usable finer
+// block: a cover the store gateway retained (present in retained, the metadata
+// that survived every filter) counts only when usable reports it loaded and
+// readable. A cover that a later filter removed from retained - the time
+// partition dropping the far side of a block straddling its boundary - still
+// counts: it is another store gateway's to serve, and this store gateway serves
+// the range in question from the cover it did retain. Callers must apply the
+// filters that follow this filter, in particular the time partition, before
+// loading the fallbacks.
+func (f *ResolutionMetaFilter) FallbacksFor(retained map[ulid.ULID]*metadata.Meta, usable func(*metadata.Meta) bool) map[ulid.ULID]*metadata.Meta {
+	f.mu.Lock()
+	covers := make([]*metadata.Meta, 0, len(f.covers))
+	for _, m := range f.covers {
+		covers = append(covers, m)
+	}
+	hidden := make(map[ulid.ULID]*metadata.Meta, len(f.fallbacks))
+	maps.Copy(hidden, f.fallbacks)
+	f.mu.Unlock()
+
+	// usable may load an index header, so it runs without the filter's lock.
+	trusted := make(map[ulid.ULID]*metadata.Meta, len(covers))
+	for _, m := range covers {
+		if _, inView := retained[m.ULID]; !inView || usable(m) {
+			trusted[m.ULID] = m
+		}
+	}
+	coverage := coverageAtResolution(trusted, f.minResolution)
+	fallbacks := make(map[ulid.ULID]*metadata.Meta, len(hidden))
+	for id, m := range hidden {
+		if !coverage.covers(m) {
+			fallbacks[id] = m
+		}
+	}
+	return fallbacks
+}
+
+var _ MetadataFilter = &resolutionUncoveredReporter{}
+
+// resolutionUncoveredReporter is the filter Reporter returns.
+type resolutionUncoveredReporter struct {
+	f *ResolutionMetaFilter
+}
+
+// Filter reports the blocks below the minimum resolution still present: the
+// ones the resolution filter kept for lack of coverage, and the fallbacks the
+// store loaded back because a cover could not be used. Either way they are
+// served below the minimum, which is what the gauge alerts on.
+func (r *resolutionUncoveredReporter) Filter(_ context.Context, metas map[ulid.ULID]*metadata.Meta, _ GaugeVec, _ GaugeVec) error {
+	f := r.f
+	if f.minResolution <= 0 {
+		return nil
+	}
+	var uncovered []string
+	for id, m := range metas {
+		if m.Thanos.Downsample.Resolution < f.minResolution {
+			uncovered = append(uncovered, id.String())
+		}
+	}
+	if f.uncoveredBlocks != nil {
+		f.uncoveredBlocks.Set(float64(len(uncovered)))
+	}
+	f.warnUncovered(uncovered)
+	return nil
+}
+
+// warnUncovered reports served-though-below-minimum blocks, once per change of
+// the set rather than on every sync: uncovered blocks are typically uncovered
+// for a long time, and re-logging an unbounded ULID list every few minutes
+// drowns the one occurrence that matters.
+func (f *ResolutionMetaFilter) warnUncovered(uncovered []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(uncovered) == 0 {
+		f.lastUncovered = ""
+		return
+	}
+	slices.Sort(uncovered)
+	joined := strings.Join(uncovered, ",")
+	if joined == f.lastUncovered {
+		return
+	}
+	f.lastUncovered = joined
+
+	const maxListed = 20
+	listed := uncovered
+	if len(listed) > maxListed {
+		listed = listed[:maxListed]
+	}
+	level.Warn(f.logger).Log(
+		"msg", "serving blocks below the minimum resolution because no retained block at the minimum resolution covers them; check why downsampling did not happen",
+		"blocks", strings.Join(listed, ","),
+		"total", len(uncovered),
+	)
 }
 
 var _ MetadataFilter = &LabelShardedMetaFilter{}

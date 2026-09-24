@@ -420,6 +420,15 @@ type BucketStore struct {
 	// Query gate which limits the maximum amount of concurrent queries.
 	queryGate gate.Gate
 
+	// sourceCoverage prevents time-overlapping coarse blocks from hiding
+	// finer blocks retained by the resolution filter for their unique sources.
+	sourceCoverage            bool
+	resolutionFilter          *block.ResolutionMetaFilter
+	resolutionFallbackFilters []block.MetadataFilter
+	// replacementsVerified holds the loaded blocks whose index header was read
+	// successfully because they hide a finer block. Guarded by mtx.
+	replacementsVerified map[ulid.ULID]struct{}
+
 	// chunksLimiterFactory creates a new limiter used to limit the number of chunks fetched by each Series() call.
 	chunksLimiterFactory ChunksLimiterFactory
 	// seriesLimiterFactory creates a new limiter used to limit the number of touched series by each Series() call,
@@ -569,6 +578,17 @@ func WithSeriesBatchSize(seriesBatchSize int) BucketStoreOption {
 	}
 }
 
+// WithResolutionFilter enables source-aware selection and restores finer
+// blocks when their advertised replacement cannot be loaded. Filters following
+// the resolution filter must also constrain the fallback metadata.
+func WithResolutionFilter(f *block.ResolutionMetaFilter, following ...block.MetadataFilter) BucketStoreOption {
+	return func(s *BucketStore) {
+		s.sourceCoverage = true
+		s.resolutionFilter = f
+		s.resolutionFallbackFilters = following
+	}
+}
+
 func WithBlockEstimatedMaxSeriesFunc(f BlockEstimator) BucketStoreOption {
 	return func(s *BucketStore) {
 		s.blockEstimatedMaxSeriesFunc = f
@@ -675,6 +695,7 @@ func NewBucketStore(
 		chunkPool:                       pool.NoopPool[byte]{},
 		blocks:                          map[ulid.ULID]*bucketBlock{},
 		blockSets:                       map[uint64]*bucketBlockSet{},
+		replacementsVerified:            map[ulid.ULID]struct{}{},
 		blockSyncConcurrency:            blockSyncConcurrency,
 		queryGate:                       gate.NewNoop(),
 		chunksLimiterFactory:            chunksLimiterFactory,
@@ -769,6 +790,15 @@ func (s *BucketStore) SyncBlocks(ctx context.Context) error {
 	close(blockc)
 	wg.Wait()
 
+	// Fallbacks whose cover did not load are restored from a partial view
+	// too: restoring only adds blocks, and waiting for a clean sync would
+	// leave their ranges unserved meanwhile.
+	if err := s.syncResolutionFallbacks(ctx, metas); err != nil {
+		if metaFetchErr == nil {
+			return err
+		}
+		level.Warn(s.logger).Log("msg", "restoring resolution fallbacks from a partial metadata view failed; returning the metadata fetch error, the next sync retries both", "err", err)
+	}
 	if metaFetchErr != nil {
 		return metaFetchErr
 	}
@@ -894,6 +924,21 @@ func (s *BucketStore) addBlock(ctx context.Context, meta *metadata.Meta) (err er
 		}
 	}()
 
+	// A lazy reader can be constructed without reading the index. Verify a
+	// replacement before making it selectable or using it to retire a finer
+	// fallback. An unreadable replacement must follow the normal addBlock
+	// failure path, allowing syncResolutionFallbacks to retain usable data.
+	// Only blocks that actually hide a finer block are read here; the rest
+	// keep their configured lazy loading, so a cold start does not pull the
+	// index header of every block at the minimum resolution.
+	verifiedReplacement := false
+	if s.resolutionFilter != nil && s.resolutionFilter.Replaces(meta.ULID) {
+		if _, err = indexHeaderReader.IndexVersion(); err != nil {
+			return errors.Wrap(err, "load resolution replacement index header")
+		}
+		verifiedReplacement = true
+	}
+
 	b, err := newBucketBlock(
 		ctx,
 		s.metrics,
@@ -922,6 +967,7 @@ func (s *BucketStore) addBlock(ctx context.Context, meta *metadata.Meta) (err er
 	set, ok := s.blockSets[h]
 	if !ok {
 		set = newBucketBlockSet(lset)
+		set.sourceCoverage = s.sourceCoverage
 		s.blockSets[h] = set
 	}
 
@@ -929,6 +975,9 @@ func (s *BucketStore) addBlock(ctx context.Context, meta *metadata.Meta) (err er
 		return errors.Wrap(err, "add block to set")
 	}
 	s.blocks[b.meta.ULID] = b
+	if verifiedReplacement {
+		s.replacementsVerified[b.meta.ULID] = struct{}{}
+	}
 
 	s.metrics.blocksLoaded.Inc()
 	s.metrics.lastLoadedBlock.SetToCurrentTime()
@@ -942,6 +991,7 @@ func (s *BucketStore) removeBlock(id ulid.ULID) error {
 		lset := labels.FromMap(b.meta.Thanos.Labels)
 		s.blockSets[lset.Hash()].remove(id)
 		delete(s.blocks, id)
+		delete(s.replacementsVerified, id)
 	}
 	s.mtx.Unlock()
 
@@ -1627,6 +1677,12 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, seriesSrv storepb.Store
 		extLsetToRemove = make(map[string]struct{})
 		for _, l := range req.WithoutReplicaLabels {
 			extLsetToRemove[l] = struct{}{}
+		}
+	}
+
+	if warning := s.belowResolutionWarning(req, matchers, reqBlockMatchers); warning != nil {
+		if err := srv.Send(storepb.NewWarnSeriesResponse(warning)); err != nil {
+			return status.Error(codes.Unknown, errors.Wrap(err, "send series response").Error())
 		}
 	}
 
@@ -2319,10 +2375,11 @@ func (s *BucketStore) LabelValues(ctx context.Context, req *storepb.LabelValuesR
 // bucketBlockSet holds all blocks of an equal label set. It internally splits
 // them up by downsampling resolution and allows querying.
 type bucketBlockSet struct {
-	labels      labels.Labels
-	mtx         sync.RWMutex
-	resolutions []int64          // Available resolution, high to low (in milliseconds).
-	blocks      [][]*bucketBlock // Ordered buckets for the existing resolutions.
+	sourceCoverage bool
+	labels         labels.Labels
+	mtx            sync.RWMutex
+	resolutions    []int64          // Available resolution, high to low (in milliseconds).
+	blocks         [][]*bucketBlock // Ordered buckets for the existing resolutions.
 }
 
 // newBucketBlockSet initializes a new set with the known downsampling windows hard-configured.
@@ -2395,6 +2452,10 @@ func (s *bucketBlockSet) getFor(mint, maxt, maxResolutionMillis int64, blockMatc
 
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
+
+	if s.sourceCoverage {
+		return s.getForSourceCoverage(mint, maxt, maxResolutionMillis, blockMatchers)
+	}
 
 	// Find first matching resolution.
 	i := 0

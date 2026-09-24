@@ -40,6 +40,20 @@ prefix: ""
 
 In general, an average of 6 MB of local disk space is required per TSDB block stored in the object storage bucket, but for high cardinality blocks with large label set it can even go up to 30MB and more. It is for the pre-computed index, which includes symbols and postings offsets as well as metadata JSON.
 
+## Resolution filtering and failures
+
+`--min-block-resolution` prefers downsampled blocks while retaining finer data whose sources and time range are not covered at the minimum resolution. The default `0s` minimum preserves the existing behavior. `--max-block-resolution` is a hard upper bound; data excluded by that bound must be served elsewhere. Both flags accept only the resolutions the compactor produces: `0s`, `5m` and `1h`.
+
+Coverage is judged per block stream: blocks with the same external labels, apart from the compactor's `__compactor_shard__` label. A block split by series into shards is covered by the shards of its downsampled data together, a shard by a coarser block holding it, and never by part of its series or by another stream's blocks.
+
+Coverage advertised by metadata is not enough to remove a fallback. The store first attempts to load replacements, then loads or retains the finer blocks still needed when a replacement fails to load. This also applies on cold start, without eagerly loading all raw blocks when replacements load successfully. Blocks at the configured minimum resolution that hide a finer block have their index headers checked before becoming selectable, including when lazy index downloading is enabled; other blocks keep their configured lazy-loading behavior. A fallback that cannot be loaded is logged and retried on the next sync, like any other block. Fallbacks obey the same time partition, and when coverage disappears from the bucket, retained finer data becomes eligible again on the next successful sync.
+
+A finer block straddling a `--min-time`/`--max-time` boundary counts the cover on the far side of that boundary as served by the store responsible for it. To see that cover, a store with a minimum resolution applies the time partition after the resolution filter, so the filters before it read the metadata of the whole bucket rather than of its window: one deletion-mark lookup per block per sync, as the compactor does.
+
+A request asking for data finer than the minimum resolution (`max_source_resolution` below it) is served from the finer blocks the store still holds. When blocks hidden behind covers at the minimum fall into the request's range and labels, their ranges are missing from the answer, and the store adds a warning naming the gap and the fix: raise the query's `max_source_resolution`, enable `--query.auto-downsampling` on the querier, or route the query to a store serving finer blocks. The querier's rate-family cap sends such requests for short range selectors. A request the store answers completely gets no warning, so strict partial-response queries keep working.
+
+This cannot restore blocks already deleted by retention or guarantee successful queries during an object-store outage. A strict query must fail when selected data cannot be read; it must not silently report an incomplete result as success.
+
 ## Flags
 
 ```$ mdox-exec="thanos store --help"
@@ -196,6 +210,22 @@ Flags:
                                  in RFC3339 format or time duration relative
                                  to current time, such as -1d or 2h45m. Valid
                                  duration units are ms, s, m, h, d, w, y.
+      --min-block-resolution=0s  Minimum downsampling resolution of
+                                 blocks to serve, one of 0s, 5m or 1h.
+                                 Queries have to ask for data at this
+                                 resolution or coarser (max_source_resolution,
+                                 or --query.auto-downsampling on the querier);
+                                 a finer request is answered only from the finer
+                                 blocks this store still serves, since a store
+                                 cannot substitute coarser data on the client's
+                                 behalf. Blocks of a finer resolution whose
+                                 data is not covered by a retained block at this
+                                 resolution are still served, as hiding those
+                                 would drop the range entirely.
+      --max-block-resolution=1h  Maximum downsampling resolution of blocks to
+                                 serve, one of 0s, 5m or 1h. Blocks of a coarser
+                                 resolution are not served; make sure another
+                                 store serves them.
       --selector.relabel-config-file=<file-path>
                                  Path to YAML file with relabeling
                                  configuration that allows selecting blocks
