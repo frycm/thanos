@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -85,6 +86,7 @@ const (
 	timeExcludedMeta  = "time-excluded"
 	tooFreshMeta      = "too-fresh"
 	duplicateMeta     = "duplicate"
+	unpublishedMeta   = "unpublished"
 	// Blocks that are marked for deletion can be loaded as well. This is done to make sure that we load blocks that are meant to be deleted,
 	// but don't have a replacement block yet.
 	MarkedForDeletionMeta = "marked-for-deletion"
@@ -171,6 +173,7 @@ func DefaultSyncedStateLabelValues() [][]string {
 		{labelExcludedMeta},
 		{timeExcludedMeta},
 		{duplicateMeta},
+		{unpublishedMeta},
 		{MarkedForDeletionMeta},
 		{MarkedForNoCompactionMeta},
 		{ParquetMigratedMeta},
@@ -812,6 +815,14 @@ type DefaultDeduplicateFilter struct {
 	duplicateIDs []ulid.ULID
 	concurrency  int
 	mu           sync.Mutex
+
+	// published, if set, says whether a block may supersede the blocks it was
+	// made from, beyond what its metadata says. See SetPublishedFunc.
+	published func(*metadata.Meta) bool
+	// hideUnpublished withholds unpublished blocks from the view; see
+	// HideUnpublished.
+	hideUnpublished bool
+	unpublished     []*metadata.Meta
 }
 
 // NewDeduplicateFilter creates DefaultDeduplicateFilter.
@@ -819,25 +830,86 @@ func NewDeduplicateFilter(concurrency int) *DefaultDeduplicateFilter {
 	return &DefaultDeduplicateFilter{concurrency: concurrency}
 }
 
+// HideUnpublished makes the filter withhold unpublished blocks from the view
+// altogether, not only from superseding anything. A compactor needs this: an
+// unpublished block is the staged output of a plan that has not replaced its
+// sources, and were it compacted further - a shard merged with the next range
+// of its group, say - the result would be a block with no set of its own,
+// published by default, whose sources include the unsplit sources of the
+// failed plan. It would supersede them with the series of the missing
+// siblings gone. Leftovers still count as duplicates of a later, published
+// attempt at the same plan first, so that garbage collection retires them.
+// Blocks withheld this way are reported by UnpublishedIDs.
+func (f *DefaultDeduplicateFilter) HideUnpublished() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.hideUnpublished = true
+}
+
+// UnpublishedIDs returns the blocks the last Filter withheld as unpublished.
+func (f *DefaultDeduplicateFilter) UnpublishedIDs() []ulid.ULID {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ids := make([]ulid.ULID, 0, len(f.unpublished))
+	for _, m := range f.unpublished {
+		ids = append(ids, m.ULID)
+	}
+	return ids
+}
+
+// Unpublished returns the metadata of the blocks the last Filter withheld as
+// unpublished. Withheld blocks are out of every view built on the filter, so
+// whatever must still reach them - retention, for one - takes them from here.
+func (f *DefaultDeduplicateFilter) Unpublished() []*metadata.Meta {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.unpublished)
+}
+
+// SetPublishedFunc lets the caller declare further blocks unpublished: a block
+// for which it returns false supersedes nothing, however complete its
+// sources, and is itself superseded by a published block with the same
+// sources. A manager that verifies its workers' results uses it to keep a
+// result it rejected from retiring the plan's sources.
+func (f *DefaultDeduplicateFilter) SetPublishedFunc(published func(*metadata.Meta) bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.published = published
+}
+
 // Filter filters out duplicate blocks that can be formed
 // from two or more overlapping blocks that fully submatches the source blocks of the older blocks.
 func (f *DefaultDeduplicateFilter) Filter(_ context.Context, metas map[ulid.ULID]*metadata.Meta, synced GaugeVec, modified GaugeVec) error {
 	var filterWg, dupWg sync.WaitGroup
-	var groupChan = make(chan []*metadata.Meta)
+	var groupChan = make(chan groupWork)
 
-	var dupsChan = make(chan ulid.ULID)
+	var dupsChan = make(chan filtered)
+
+	f.mu.Lock()
+	hideUnpublished, publishedFunc := f.hideUnpublished, f.published
+	f.mu.Unlock()
 
 	dupWg.Go(func() {
 		dups := make([]ulid.ULID, 0)
-		for dup := range dupsChan {
-			if metas[dup] != nil {
-				dups = append(dups, dup)
+		unpublished := make([]*metadata.Meta, 0)
+		for out := range dupsChan {
+			m := metas[out.id]
+			delete(metas, out.id)
+			if out.unpublished {
+				if m != nil {
+					unpublished = append(unpublished, m)
+				}
+				synced.WithLabelValues(unpublishedMeta).Inc()
+				continue
+			}
+			if m != nil {
+				dups = append(dups, out.id)
 			}
 			synced.WithLabelValues(duplicateMeta).Inc()
-			delete(metas, dup)
 		}
 		f.mu.Lock()
 		f.duplicateIDs = dups
+		f.unpublished = unpublished
 		f.mu.Unlock()
 	})
 
@@ -845,9 +917,51 @@ func (f *DefaultDeduplicateFilter) Filter(_ context.Context, metas map[ulid.ULID
 	for i := 0; i < f.concurrency; i++ {
 		filterWg.Go(func() {
 			for group := range groupChan {
-				f.filterGroup(group, dupsChan)
+				f.filterGroup(group.metas, group.published, hideUnpublished, dupsChan)
 			}
 		})
+	}
+
+	// A block supersedes the blocks it was made from only once it is
+	// published: every block of the set its compaction produced is present,
+	// and the caller has nothing against it. Until then the sources are the
+	// only complete copy of the data. Presence is judged on the view the
+	// filters before this one left, not on the bucket: a compactor sharded by
+	// a selector relabeling that separates the shards of one stream sees
+	// incomplete sets and withholds them, so such a selector must keep a
+	// stream's shards together.
+	present := make(map[ulid.ULID]struct{}, len(metas))
+	for id := range metas {
+		present[id] = struct{}{}
+	}
+	exists := func(id ulid.ULID) bool {
+		_, ok := present[id]
+		return ok
+	}
+	// A block is published by its own complete set, or by another block's
+	// complete set that names it: a compaction of some blocks of a set names
+	// the rest as its siblings, so that they keep a complete set once the
+	// blocks they shared one with are gone. Only a set that names its holder
+	// vouches for others: a set a tool copied under a new ID without renaming
+	// says nothing about the copy, and whether it is complete is unknown.
+	certified := make(map[ulid.ULID]struct{})
+	for _, m := range metas {
+		if m.Thanos.Output == nil || !slices.Contains(m.Thanos.Output.Blocks, m.ULID) || !m.Thanos.Published(m.ULID, exists) {
+			continue
+		}
+		for _, id := range m.Thanos.Output.Blocks {
+			certified[id] = struct{}{}
+		}
+	}
+	published := func(m *metadata.Meta) bool {
+		if publishedFunc != nil && !publishedFunc(m) {
+			return false
+		}
+		if m.Thanos.Published(m.ULID, exists) {
+			return true
+		}
+		_, ok := certified[m.ULID]
+		return ok
 	}
 
 	// We need only look within a compaction group for duplicates, so splitting by group key gives us parallelizable streams.
@@ -857,7 +971,7 @@ func (f *DefaultDeduplicateFilter) Filter(_ context.Context, metas map[ulid.ULID
 		metasByCompactionGroup[groupKey] = append(metasByCompactionGroup[groupKey], meta)
 	}
 	for _, group := range metasByCompactionGroup {
-		groupChan <- group
+		groupChan <- groupWork{metas: group, published: published}
 	}
 	close(groupChan)
 	filterWg.Wait()
@@ -868,12 +982,36 @@ func (f *DefaultDeduplicateFilter) Filter(_ context.Context, metas map[ulid.ULID
 	return nil
 }
 
-func (f *DefaultDeduplicateFilter) filterGroup(metaSlice []*metadata.Meta, dupsChan chan ulid.ULID) {
+// groupWork is one compaction group to deduplicate, with the publication
+// rule to judge its blocks by.
+type groupWork struct {
+	metas     []*metadata.Meta
+	published func(*metadata.Meta) bool
+}
+
+// filtered is a block Filter takes out of the view: a duplicate, or an
+// unpublished block when the filter hides those.
+type filtered struct {
+	id          ulid.ULID
+	unpublished bool
+}
+
+func (f *DefaultDeduplicateFilter) filterGroup(metaSlice []*metadata.Meta, published func(*metadata.Meta) bool, hideUnpublished bool, dupsChan chan filtered) {
+	isPublished := make(map[ulid.ULID]bool, len(metaSlice))
+	for _, m := range metaSlice {
+		isPublished[m.ULID] = published(m)
+	}
 	sort.Slice(metaSlice, func(i, j int) bool {
 		ilen := len(metaSlice[i].Compaction.Sources)
 		jlen := len(metaSlice[j].Compaction.Sources)
 
 		if ilen == jlen {
+			// A published block comes before an unpublished one with the
+			// same sources - the incomplete leftovers of an earlier attempt
+			// at the same plan - so that it supersedes it.
+			if ip, jp := isPublished[metaSlice[i].ULID], isPublished[metaSlice[j].ULID]; ip != jp {
+				return ip
+			}
 			return metaSlice[i].ULID.Compare(metaSlice[j].ULID) < 0
 		}
 
@@ -889,7 +1027,11 @@ childLoop:
 			parentSources := parent.Compaction.Sources
 
 			// child's sources are present in parent's sources, filter it out.
-			if contains(parentSources, childSources) {
+			// An unpublished parent supersedes nothing: the sources it was
+			// made from are still the only complete copy. And a block never
+			// supersedes another of its own set: they record the same
+			// sources while each holds other data.
+			if contains(parentSources, childSources) && isPublished[parent.ULID] && !sameOutputSet(parent, child) {
 				duplicates = append(duplicates, child.ULID)
 				continue childLoop
 			}
@@ -900,7 +1042,18 @@ childLoop:
 	}
 
 	for _, duplicate := range duplicates {
-		dupsChan <- duplicate
+		dupsChan <- filtered{id: duplicate}
+	}
+	if !hideUnpublished {
+		return
+	}
+	// What is left unpublished is a staged output whose plan has not
+	// replaced its sources: not to be compacted or downsampled further, and
+	// not to be served in place of them.
+	for _, m := range coveringSet {
+		if !isPublished[m.ULID] {
+			dupsChan <- filtered{id: m.ULID, unpublished: true}
+		}
 	}
 }
 
@@ -910,6 +1063,14 @@ func (f *DefaultDeduplicateFilter) DuplicateIDs() []ulid.ULID {
 	defer f.mu.Unlock()
 
 	return f.duplicateIDs
+}
+
+// sameOutputSet reports whether the child is one of the blocks the parent's
+// compaction produced together with it. A set that does not name the parent
+// is not the parent's own (see Thanos.Published) and does not count.
+func sameOutputSet(parent, child *metadata.Meta) bool {
+	set := parent.Thanos.Output
+	return set != nil && slices.Contains(set.Blocks, parent.ULID) && slices.Contains(set.Blocks, child.ULID)
 }
 
 func contains(s1, s2 []ulid.ULID) bool {
