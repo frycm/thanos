@@ -347,11 +347,7 @@ func (d *BucketDump) Without(ext func(string) bool) *BucketDump {
 // replica, per aggregate.
 func (d *BucketDump) replicaGroups(replicaLabels []string) map[string][]map[downsample.AggrType][]Sample {
 	out := map[string][]map[downsample.AggrType][]Sample{}
-	keys := make([]string, 0, len(d.Series))
-	for k := range d.Series {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
+	keys := slices.Sorted(maps.Keys(d.Series))
 	for _, k := range keys {
 		dk := d.keys[k]
 		key := fmt.Sprintf("res=%d series=%s", dk.res, labels.NewBuilder(dk.lset).Del(replicaLabels...).Labels().String())
@@ -487,11 +483,7 @@ func deduplicatedDifferences(t *testing.T, want, got *BucketDump, replicaLabels 
 	for k := range g {
 		keys[k] = struct{}{}
 	}
-	sorted := make([]string, 0, len(keys))
-	for k := range keys {
-		sorted = append(sorted, k)
-	}
-	sort.Strings(sorted)
+	sorted := slices.Sorted(maps.Keys(keys))
 	var diffs []string
 	for _, k := range sorted {
 		ws, gs := w[k], g[k]

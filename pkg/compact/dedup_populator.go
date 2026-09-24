@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"slices"
 	"strings"
 
@@ -206,12 +207,7 @@ func (p DeduplicatingBlockPopulator) PopulateBlock(ctx context.Context, metrics 
 		}
 	}
 
-	sorted := make([]string, 0, len(symbols))
-	for s := range symbols {
-		sorted = append(sorted, s)
-	}
-	slices.Sort(sorted)
-	for _, s := range sorted {
+	for _, s := range slices.Sorted(maps.Keys(symbols)) {
 		if err := indexw.AddSymbol(s); err != nil {
 			return fmt.Errorf("add symbol: %w", err)
 		}
@@ -373,11 +369,7 @@ func (p DeduplicatingBlockPopulator) replicaPostings(ctx context.Context, all in
 	for k, refs := range groups {
 		byReplica[k.replica] = append(byReplica[k.replica], refs)
 	}
-	order := make([]string, 0, len(byReplica))
-	for r := range byReplica {
-		order = append(order, r)
-	}
-	slices.SortFunc(order, func(a, b string) int { return labels.Compare(replicas[a], replicas[b]) })
+	order := slices.SortedFunc(maps.Keys(byReplica), func(a, b string) int { return labels.Compare(replicas[a], replicas[b]) })
 
 	out := make([][]storage.SeriesRef, 0, len(order))
 	for _, r := range order {

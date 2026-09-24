@@ -5,7 +5,6 @@ package compact
 
 import (
 	"cmp"
-	"context"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -80,7 +79,7 @@ func samplesOf(v float64, from, to int64) []string {
 // that a series lacking the label merges with its replicas, and that the
 // label leaves the symbol table.
 func TestDeduplicatingBlockPopulator(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	dir := t.TempDir()
 	l := labels.FromStrings
 	x := writeBlock(t, dir,
@@ -141,7 +140,7 @@ func TestDeduplicatingBlockPopulator(t *testing.T) {
 // - the compaction writes what the querier's penalty deduplication returns
 // for the same replicas in the same order.
 func TestDeduplicatingBlockPopulatorMatchesQueryTimeDeduplication(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	dir := t.TempDir()
 	lset := func(r string) labels.Labels { return labels.FromStrings("__name__", "up", "job", "api", "replica", r) }
 	// A has a long gap in the middle, which makes penalty deduplication
@@ -198,7 +197,7 @@ func (s *listSeriesSet) Warnings() annotations.Annotations { return nil }
 // partition tallies cover the sources. A partition that hashes the replica
 // label is refused.
 func TestDeduplicatingBlockPopulatorPartitions(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	dir := t.TempDir()
 	var series []labels.Labels
 	for i := range 40 {
@@ -252,7 +251,7 @@ func TestDeduplicatingBlockPopulatorPartitions(t *testing.T) {
 // series per replicated pair, records the labels in its metadata, and the
 // metrics count what was merged.
 func TestLocalPlanExecutorDeduplicatesSeriesReplicas(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	bkt := objstore.NewInMemBucket()
 	logger := log.NewNopLogger()
 	dir := t.TempDir()
@@ -344,7 +343,7 @@ func queryTimePenalty(t *testing.T, lset labels.Labels, replicas ...[]chunks.Sam
 // for that block alone, and every sample is a real one. Groups within one
 // block are TestDeduplicatingBlockPopulatorPerChunkGroup's.
 func TestDeduplicatingBlockPopulatorAfterAGap(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	dir := t.TempDir()
 	lset := func(r string) labels.Labels { return labels.FromStrings("__name__", "up", "replica", r) }
 	window := func(from int64, gap bool) (a, b []chunks.Sample) {
@@ -388,7 +387,7 @@ func chunkGroups(t *testing.T, blockDir string) [][2]int64 {
 	testutil.Ok(t, err)
 	defer func() { testutil.Ok(t, ir.Close()) }()
 	k, v := index.AllPostingsKey()
-	all, err := ir.Postings(context.Background(), k, v)
+	all, err := ir.Postings(t.Context(), k, v)
 	testutil.Ok(t, err)
 	var ranges [][2]int64
 	for all.Next() {
@@ -433,7 +432,7 @@ func within(samples []chunks.Sample, from, to int64) []chunks.Sample {
 // every boundary, and replicas in lockstep once one of them has a gap;
 // replicas in lockstep without gaps do not differ at all.
 func TestDeduplicatingBlockPopulatorPerChunkGroup(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	lset := func(r string) labels.Labels { return labels.FromStrings("__name__", "up", "replica", r) }
 	stripped := labels.FromStrings("__name__", "up")
 	for _, tc := range []struct {

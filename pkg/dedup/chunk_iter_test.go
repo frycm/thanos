@@ -507,7 +507,7 @@ func TestDedupChunkSeriesMergerTiesGoToTheFirstSeries(t *testing.T) {
 	var replicas []storage.ChunkSeries
 	for i := range 5 {
 		var chks [][]chunks.Sample
-		for j := 0; j < i; j++ {
+		for j := range i {
 			chks = append(chks, chunk(int64(j*3), int64(j*3+1), -1))
 		}
 		chks = append(chks, chunk(20, 25, float64(i)))
