@@ -40,11 +40,13 @@ type PlanOptions struct {
 // in process or dispatching the work to a worker.
 func Plan(metas map[ulid.ULID]*metadata.Meta, opts PlanOptions) ([]Candidate, error) {
 	// Blocks whose sources are already covered by a downsampled block do not need
-	// downsampling again. Coverage is per block stream: a downsampled block
-	// covers a source only for blocks with exactly its external labels. Blocks
-	// of different streams can record the same sources - the outputs of a
-	// compaction split by series do - while each holds other series, so a
-	// source ULID alone says nothing about which series have been downsampled.
+	// downsampling again. Coverage is per block stream and shard: the shards of
+	// a compaction split by series record the same sources while each holds
+	// other series, so a source ULID alone says nothing about which series
+	// have been downsampled. A shard's downsampled block covers that shard; an
+	// unsplit block is covered by the downsampled blocks of all its shards
+	// together, or it would be downsampled again every pass once its own
+	// downsampled block was compacted into a split one.
 	sources5m := coverage{}
 	sources1h := coverage{}
 
@@ -109,31 +111,96 @@ func Plan(metas map[ulid.ULID]*metadata.Meta, opts PlanOptions) ([]Candidate, er
 }
 
 // coverage records which sources the downsampled blocks of a block stream -
-// one set of external labels - account for.
-type coverage map[coverageKey]struct{}
+// a set of external labels without the compactor's shard label - account
+// for, per shard: the shards a compaction split by series into hold the
+// stream's series between them, each only its own part.
+type coverage map[uint64]*streamCoverage
 
-type coverageKey struct {
-	stream uint64
-	source ulid.ULID
+type streamCoverage struct {
+	shards map[shardRef]map[ulid.ULID]struct{}
+	finest uint64
 }
 
-func streamOf(m *metadata.Meta) uint64 {
-	return labels.FromMap(m.Thanos.Labels).Hash()
+// shardRef is a shard of a block stream: index of count, 0-based; the whole,
+// unsplit stream is 0 of 1. Shard i of M holds exactly what shards i and i+M
+// of 2M hold together.
+type shardRef struct{ index, count uint64 }
+
+func (s shardRef) parent() (shardRef, bool) {
+	if s.count <= 1 {
+		return s, false
+	}
+	half := s.count / 2
+	return shardRef{index: s.index % half, count: half}, true
+}
+
+func (s shardRef) children() [2]shardRef {
+	return [2]shardRef{{index: s.index, count: 2 * s.count}, {index: s.index + s.count, count: 2 * s.count}}
+}
+
+// streamOf returns the block's stream and its shard in it. A block whose
+// shard label does not parse is a stream of its own, as any label set.
+func streamOf(m *metadata.Meta) (uint64, shardRef) {
+	index, count, ok, err := metadata.Shard(m.Thanos.Labels)
+	if err != nil || !ok {
+		return labels.FromMap(m.Thanos.Labels).Hash(), shardRef{index: 0, count: 1}
+	}
+	return labels.NewBuilder(labels.FromMap(m.Thanos.Labels)).Del(metadata.CompactorShardLabel).Labels().Hash(), shardRef{index: index, count: count}
 }
 
 func (c coverage) add(m *metadata.Meta) {
-	stream := streamOf(m)
-	for _, id := range m.Compaction.Sources {
-		c[coverageKey{stream: stream, source: id}] = struct{}{}
+	stream, s := streamOf(m)
+	sc := c[stream]
+	if sc == nil {
+		sc = &streamCoverage{shards: map[shardRef]map[ulid.ULID]struct{}{}}
+		c[stream] = sc
 	}
+	if sc.shards[s] == nil {
+		sc.shards[s] = make(map[ulid.ULID]struct{}, len(m.Compaction.Sources))
+	}
+	for _, id := range m.Compaction.Sources {
+		sc.shards[s][id] = struct{}{}
+	}
+	sc.finest = max(sc.finest, s.count)
 }
 
-// covers reports whether every source of the block already appears in a
-// downsampled block of the same stream.
+// covers reports whether every source of the block already appears in the
+// downsampled blocks of its stream for every series the block may hold:
+// through its own shard, a coarser shard holding it, or finer shards that
+// together hold all of it. Downsampling one shard never covers another.
 func (c coverage) covers(m *metadata.Meta) bool {
-	stream := streamOf(m)
+	stream, s := streamOf(m)
+	sc := c[stream]
+	if sc == nil {
+		return false
+	}
+	for a, ok := s, true; ok; a, ok = a.parent() {
+		if sc.coveredBy(a, m) {
+			return true
+		}
+	}
+	return sc.coveredBelow(s, m)
+}
+
+func (sc *streamCoverage) coveredBy(s shardRef, m *metadata.Meta) bool {
+	sources, ok := sc.shards[s]
+	if !ok {
+		return false
+	}
 	for _, id := range m.Compaction.Sources {
-		if _, ok := c[coverageKey{stream: stream, source: id}]; !ok {
+		if _, found := sources[id]; !found {
+			return false
+		}
+	}
+	return true
+}
+
+func (sc *streamCoverage) coveredBelow(s shardRef, m *metadata.Meta) bool {
+	if s.count*2 > sc.finest {
+		return false
+	}
+	for _, child := range s.children() {
+		if !sc.coveredBy(child, m) && !sc.coveredBelow(child, m) {
 			return false
 		}
 	}

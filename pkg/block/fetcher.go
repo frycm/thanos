@@ -6,6 +6,7 @@ package block
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"maps"
 	"os"
@@ -965,9 +966,12 @@ func (f *DefaultDeduplicateFilter) Filter(_ context.Context, metas map[ulid.ULID
 	}
 
 	// We need only look within a compaction group for duplicates, so splitting by group key gives us parallelizable streams.
+	// Shards of a compaction split by series are separate compaction groups
+	// but one lineage: a shard supersedes the blocks it was made from, whatever
+	// their shard label, so they are deduplicated together.
 	metasByCompactionGroup := make(map[string][]*metadata.Meta)
 	for _, meta := range metas {
-		groupKey := meta.Thanos.GroupKey()
+		groupKey := dedupGroupKey(meta)
 		metasByCompactionGroup[groupKey] = append(metasByCompactionGroup[groupKey], meta)
 	}
 	for _, group := range metasByCompactionGroup {
@@ -987,6 +991,63 @@ func (f *DefaultDeduplicateFilter) Filter(_ context.Context, metas map[ulid.ULID
 type groupWork struct {
 	metas     []*metadata.Meta
 	published func(*metadata.Meta) bool
+}
+
+// dedupGroupKey is the compaction group key without the compactor's shard
+// label, so that the shards of one block stream are deduplicated with the
+// blocks they were made from.
+func dedupGroupKey(m *metadata.Meta) string {
+	if _, ok := m.Thanos.Labels[metadata.CompactorShardLabel]; !ok {
+		return m.Thanos.GroupKey()
+	}
+	lbls := make(map[string]string, len(m.Thanos.Labels))
+	for k, v := range m.Thanos.Labels {
+		if k != metadata.CompactorShardLabel {
+			lbls[k] = v
+		}
+	}
+	return fmt.Sprintf("%d@%v", m.Thanos.Downsample.Resolution, labels.FromMap(lbls).Hash())
+}
+
+// shardCount is the block's shard count, zero for an unsplit block or a label
+// that does not parse.
+func shardCount(m *metadata.Meta) uint64 {
+	_, count, ok, err := metadata.Shard(m.Thanos.Labels)
+	if err != nil || !ok {
+		return 0
+	}
+	return count
+}
+
+// shardCovers says whether a block whose sources include another block's
+// sources supersedes it, given their shard labels. Within one shard, or
+// between unsplit blocks, it always does. A shard supersedes the unsplit
+// blocks it was made from and the coarser shards of its own lineage - shard
+// i of M is made from shard i mod S of S - but never a sibling shard of the
+// same plan, which records the same sources and holds other series, and an
+// unsplit block never supersedes a shard.
+func shardCovers(parent, child *metadata.Meta) bool {
+	pi, pc, pok, perr := metadata.Shard(parent.Thanos.Labels)
+	ci, cc, cok, cerr := metadata.Shard(child.Thanos.Labels)
+	if perr != nil || cerr != nil {
+		// A label that does not parse is not a shard of anything; fall back
+		// to comparing labels exactly, as for any other block.
+		return maps.Equal(parent.Thanos.Labels, child.Thanos.Labels)
+	}
+	switch {
+	case !pok && !cok:
+		return true
+	case pok && !cok:
+		return true
+	case !pok && cok:
+		return false
+	case pc == cc:
+		return pi == ci
+	case pc > cc && pc%cc == 0:
+		return pi%cc == ci
+	default:
+		return false
+	}
 }
 
 // filtered is a block Filter takes out of the view: a duplicate, or an
@@ -1012,6 +1073,13 @@ func (f *DefaultDeduplicateFilter) filterGroup(metaSlice []*metadata.Meta, publi
 			if ip, jp := isPublished[metaSlice[i].ULID], isPublished[metaSlice[j].ULID]; ip != jp {
 				return ip
 			}
+			// A shard made from a single block records the same sources as
+			// that block, and a finer shard made from a coarser one alone
+			// records the same sources as it; the finer has to come first
+			// to supersede the coarser, whatever their ULIDs say.
+			if ic, jc := shardCount(metaSlice[i]), shardCount(metaSlice[j]); ic != jc {
+				return ic > jc
+			}
 			return metaSlice[i].ULID.Compare(metaSlice[j].ULID) < 0
 		}
 
@@ -1031,7 +1099,7 @@ childLoop:
 			// made from are still the only complete copy. And a block never
 			// supersedes another of its own set: they record the same
 			// sources while each holds other data.
-			if contains(parentSources, childSources) && isPublished[parent.ULID] && !sameOutputSet(parent, child) {
+			if contains(parentSources, childSources) && isPublished[parent.ULID] && !sameOutputSet(parent, child) && shardCovers(parent, child) {
 				duplicates = append(duplicates, child.ULID)
 				continue childLoop
 			}

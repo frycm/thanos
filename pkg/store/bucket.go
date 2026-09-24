@@ -1565,6 +1565,24 @@ func debugFoundBlockSetOverview(logger log.Logger, mint, maxt, maxResolutionMill
 	level.Debug(logger).Log("msg", "Blocks source resolutions", "blocks", len(bs), "Maximum Resolution", maxResolutionMillis, "mint", mint, "maxt", maxt, "lset", lset.String(), "spans", strings.Join(parts, "\n"))
 }
 
+// withoutShardLabel adds the compactor's shard label to the set of external
+// labels removed from what the block serves, when the block carries it. Shards
+// of one compaction are separate blocks with disjoint series; the label only
+// exists so that the compactor and this store gateway keep them apart, and
+// must not reach queriers. Blocks without the label keep the caller's set
+// untouched.
+func withoutShardLabel(b *bucketBlock, extLsetToRemove map[string]struct{}) map[string]struct{} {
+	if !b.extLset.Has(metadata.CompactorShardLabel) {
+		return extLsetToRemove
+	}
+	out := make(map[string]struct{}, len(extLsetToRemove)+1)
+	for k := range extLsetToRemove {
+		out[k] = struct{}{}
+	}
+	out[metadata.CompactorShardLabel] = struct{}{}
+	return out
+}
+
 // Series implements the storepb.StoreServer interface.
 func (s *BucketStore) Series(req *storepb.SeriesRequest, seriesSrv storepb.Store_SeriesServer) (err error) {
 	srv := newFlushableServer(
@@ -1672,7 +1690,7 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, seriesSrv storepb.Store
 				s.metrics.seriesFetchDurationSum,
 				s.metrics.chunkFetchDuration,
 				s.metrics.chunkFetchDurationSum,
-				extLsetToRemove,
+				withoutShardLabel(blk, extLsetToRemove),
 				s.enabledLazyExpandedPostings,
 				s.seriesMatchRatio,
 				s.postingGroupMaxKeySeriesRatio,
@@ -1964,7 +1982,7 @@ func (s *BucketStore) LabelNames(ctx context.Context, req *storepb.LabelNamesReq
 				// b.extLset is already sorted by label name, no need to sort it again.
 				extRes := make([]string, 0, b.extLset.Len())
 				b.extLset.Range(func(l labels.Label) {
-					if _, ok := extLsetToRemove[l.Name]; !ok {
+					if _, ok := extLsetToRemove[l.Name]; !ok && l.Name != metadata.CompactorShardLabel {
 						extRes = append(extRes, l.Name)
 					}
 				})
@@ -1992,7 +2010,7 @@ func (s *BucketStore) LabelNames(ctx context.Context, req *storepb.LabelNamesReq
 					s.metrics.seriesFetchDurationSum,
 					nil,
 					nil,
-					extLsetToRemove,
+					withoutShardLabel(b, extLsetToRemove),
 					s.enabledLazyExpandedPostings,
 					s.seriesMatchRatio,
 					s.postingGroupMaxKeySeriesRatio,
@@ -2099,7 +2117,7 @@ func (s *BucketStore) LabelValues(ctx context.Context, req *storepb.LabelValuesR
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, errors.Wrap(err, "translate request labels matchers").Error())
 	}
-	if slices.Contains(req.WithoutReplicaLabels, req.Label) {
+	if slices.Contains(req.WithoutReplicaLabels, req.Label) || req.Label == metadata.CompactorShardLabel {
 		return &storepb.LabelValuesResponse{}, nil
 	}
 
