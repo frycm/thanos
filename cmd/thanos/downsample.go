@@ -140,7 +140,7 @@ func RunDownsample(
 					metrics.downsamples.WithLabelValues(resolutionLabel)
 					metrics.downsampleFailures.WithLabelValues(resolutionLabel)
 				}
-				if err := downsampleBucket(ctx, logger, metrics, insBkt, metas, dataDir, downsampleConcurrency, blockFilesConcurrency, hashFunc, false); err != nil {
+				if err := downsampleBucket(ctx, logger, metrics, insBkt, metas, downsample.PlanOptions{}, dataDir, downsampleConcurrency, blockFilesConcurrency, hashFunc, false); err != nil {
 					return errors.Wrap(err, "downsampling failed")
 				}
 
@@ -149,7 +149,7 @@ func RunDownsample(
 				if err != nil {
 					return errors.Wrap(err, "sync before second pass of downsampling")
 				}
-				if err := downsampleBucket(ctx, logger, metrics, insBkt, metas, dataDir, downsampleConcurrency, blockFilesConcurrency, hashFunc, false); err != nil {
+				if err := downsampleBucket(ctx, logger, metrics, insBkt, metas, downsample.PlanOptions{}, dataDir, downsampleConcurrency, blockFilesConcurrency, hashFunc, false); err != nil {
 					return errors.Wrap(err, "downsampling failed")
 				}
 				return nil
@@ -186,6 +186,7 @@ func downsampleBucket(
 	metrics *DownsampleMetrics,
 	bkt objstore.Bucket,
 	metas map[ulid.ULID]*metadata.Meta,
+	opts downsample.PlanOptions,
 	dir string,
 	downsampleConcurrency int,
 	blockFilesConcurrency int,
@@ -207,7 +208,7 @@ func downsampleBucket(
 		}
 	}()
 
-	candidates, err := downsample.Plan(metas)
+	candidates, err := downsample.Plan(metas, opts)
 	if err != nil {
 		return err
 	}

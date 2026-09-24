@@ -5,7 +5,6 @@ package compacttest
 
 import (
 	"context"
-	"maps"
 	"math"
 	"os"
 	"path/filepath"
@@ -86,9 +85,10 @@ type Hooks struct {
 	// Executor builds the executor that runs the node's compaction plans. The
 	// default executes them in process.
 	Executor func(n *Node, planner compact.Planner) compact.PlanExecutor
-	// Downsample runs one downsampling pass over the synced metadata. The
-	// default downsamples in process what downsample.Plan selects.
-	Downsample func(ctx context.Context, n *Node, metas map[ulid.ULID]*metadata.Meta, noCompact map[ulid.ULID]*metadata.NoCompactMark, noDownsample map[ulid.ULID]*metadata.NoDownsampleMark) error
+	// Downsample runs one downsampling pass over the synced metadata, planned
+	// with the given options. The default downsamples in process what
+	// downsample.Plan selects.
+	Downsample func(ctx context.Context, n *Node, metas map[ulid.ULID]*metadata.Meta, opts downsample.PlanOptions) error
 }
 
 // Node is one compactor process wired exactly as cmd/thanos/compact.go wires
@@ -115,7 +115,7 @@ type Node struct {
 	Ctx  context.Context
 	stop context.CancelFunc
 
-	downsample func(ctx context.Context, n *Node, metas map[ulid.ULID]*metadata.Meta, noCompact map[ulid.ULID]*metadata.NoCompactMark, noDownsample map[ulid.ULID]*metadata.NoDownsampleMark) error
+	downsample func(ctx context.Context, n *Node, metas map[ulid.ULID]*metadata.Meta, opts downsample.PlanOptions) error
 
 	mtx        sync.Mutex
 	iterCancel context.CancelFunc
@@ -215,7 +215,7 @@ func (n *Node) Iterate(ctx context.Context) error {
 		if err := n.Syncer.SyncMetas(ctx); err != nil {
 			return errors.Wrapf(err, "sync before downsampling pass %d", pass)
 		}
-		if err := n.downsample(ctx, n, n.Syncer.Metas(), n.NoCompactFilter.NoCompactMarkedBlocks(), n.NoDownsampleFilter.NoDownsampleMarkedBlocks()); err != nil {
+		if err := n.downsample(ctx, n, n.Syncer.Metas(), n.DownsamplePlanOptions()); err != nil {
 			return errors.Wrapf(err, "downsampling pass %d", pass)
 		}
 	}
@@ -237,15 +237,18 @@ func (n *Node) Stop() { n.stop() }
 // Stopped reports whether the node was stopped.
 func (n *Node) Stopped() bool { return n.Ctx.Err() != nil }
 
-// downsampleInProcess is the binary's standalone downsampling pass: blocks
-// marked no-downsample are taken out of the view, and what downsample.Plan
-// selects is downsampled here.
-func downsampleInProcess(ctx context.Context, n *Node, metas map[ulid.ULID]*metadata.Meta, _ map[ulid.ULID]*metadata.NoCompactMark, noDownsample map[ulid.ULID]*metadata.NoDownsampleMark) error {
-	metas = maps.Clone(metas)
-	for id := range noDownsample {
-		delete(metas, id)
+// DownsamplePlanOptions is what the binary tells downsample.Plan about the
+// node's synced view at each downsampling pass.
+func (n *Node) DownsamplePlanOptions() downsample.PlanOptions {
+	return downsample.PlanOptions{
+		NoDownsampleMarked: n.NoDownsampleFilter.NoDownsampleMarkedBlocks(),
 	}
-	candidates, err := downsample.Plan(metas)
+}
+
+// downsampleInProcess is the binary's standalone downsampling pass: what
+// downsample.Plan selects is downsampled here.
+func downsampleInProcess(ctx context.Context, n *Node, metas map[ulid.ULID]*metadata.Meta, opts downsample.PlanOptions) error {
+	candidates, err := downsample.Plan(metas, opts)
 	if err != nil {
 		return err
 	}
