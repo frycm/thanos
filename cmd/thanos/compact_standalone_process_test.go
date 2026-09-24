@@ -85,8 +85,18 @@ func newCompactorProcessFixture(t *testing.T, ctx context.Context, buckets int) 
 	for window := range 5 {
 		for _, receiver := range []string{"r0", "r1"} {
 			mint := int64(window) * 2 * time.Hour.Milliseconds()
-			id, err := e2eutil.CreateBlock(ctx, prepare, series, 20, mint, mint+2*time.Hour.Milliseconds(),
-				labels.FromStrings("tenant", "one", "receiver_replica", receiver), 0, metadata.NoneFunc, nil)
+			id, err := e2eutil.CreateBlock(
+				ctx,
+				prepare,
+				series,
+				20,
+				mint,
+				mint+2*time.Hour.Milliseconds(),
+				labels.FromStrings("tenant", "one", "receiver_replica", receiver),
+				0,
+				metadata.NoneFunc,
+				nil,
+			)
 			testutil.Ok(t, err)
 			for _, bkt := range f.Buckets {
 				testutil.Ok(t, block.Upload(ctx, logger, bkt, filepath.Join(prepare, id.String()), metadata.NoneFunc))
@@ -123,7 +133,7 @@ func (f *compactorProcessFixture) Start(args []string) compactorProcess {
 	cmd.Stdout, cmd.Stderr = out, out
 	testutil.Ok(f.t, cmd.Start())
 	done := make(chan error, 1)
-	go func() { err := cmd.Wait(); _ = out.Close(); done <- err; close(done) }()
+	go func() { waitErr := cmd.Wait(); _ = out.Close(); done <- waitErr; close(done) }()
 	f.t.Cleanup(func() { _ = cmd.Process.Kill(); <-done })
 	return compactorProcess{done: done, log: logfile}
 }
@@ -167,8 +177,15 @@ func processBucketSamples(t *testing.T, bkt objstore.Bucket) map[string][]string
 	ctx := t.Context()
 	logger := log.NewNopLogger()
 	instrumented := objstore.WithNoopInstr(bkt)
-	fetcher, err := block.NewMetaFetcher(logger, 1, instrumented, block.NewConcurrentLister(logger, instrumented), "", nil,
-		[]block.MetadataFilter{block.NewIgnoreDeletionMarkFilter(logger, instrumented, 0, 1), block.NewDeduplicateFilter(1)})
+	fetcher, err := block.NewMetaFetcher(
+		logger,
+		1,
+		instrumented,
+		block.NewConcurrentLister(logger, instrumented),
+		"",
+		nil,
+		[]block.MetadataFilter{block.NewIgnoreDeletionMarkFilter(logger, instrumented, 0, 1), block.NewDeduplicateFilter(1)},
+	)
 	testutil.Ok(t, err)
 	metas, _, err := fetcher.Fetch(ctx)
 	testutil.Ok(t, err)
@@ -180,23 +197,23 @@ func processBucketSamples(t *testing.T, bkt objstore.Bucket) map[string][]string
 		}
 		dir := filepath.Join(t.TempDir(), id.String())
 		testutil.Ok(t, block.Download(ctx, logger, bkt, id, dir))
-		b, err := tsdb.OpenBlock(logutil.GoKitLogToSlog(logger), dir, nil, nil)
-		testutil.Ok(t, err)
-		ir, err := b.Index()
-		testutil.Ok(t, err)
-		cr, err := b.Chunks()
-		testutil.Ok(t, err)
+		b, blockErr := tsdb.OpenBlock(logutil.GoKitLogToSlog(logger), dir, nil, nil)
+		testutil.Ok(t, blockErr)
+		ir, blockErr := b.Index()
+		testutil.Ok(t, blockErr)
+		cr, blockErr := b.Chunks()
+		testutil.Ok(t, blockErr)
 		name, value := index.AllPostingsKey()
-		postings, err := ir.Postings(ctx, name, value)
-		testutil.Ok(t, err)
+		postings, blockErr := ir.Postings(ctx, name, value)
+		testutil.Ok(t, blockErr)
 		for postings.Next() {
 			var builder labels.ScratchBuilder
 			var chks []chunks.Meta
 			testutil.Ok(t, ir.Series(postings.At(), &builder, &chks))
 			key := labels.FromMap(m.Thanos.Labels).String() + builder.Labels().String()
 			for _, cm := range chks {
-				ch, _, err := cr.ChunkOrIterable(cm)
-				testutil.Ok(t, err)
+				ch, _, chkErr := cr.ChunkOrIterable(cm)
+				testutil.Ok(t, chkErr)
 				it := ch.Iterator(nil)
 				for typ := it.Next(); typ != chunkenc.ValNone; typ = it.Next() {
 					testutil.Equals(t, chunkenc.ValFloat, typ)

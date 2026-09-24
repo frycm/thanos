@@ -38,6 +38,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/dedup"
 	"github.com/thanos-io/thanos/pkg/errors"
 	"github.com/thanos-io/thanos/pkg/logutil"
+	"github.com/thanos-io/thanos/pkg/runutil"
 )
 
 // Sample is one raw or aggregated sample; histograms are compared by their
@@ -69,7 +70,7 @@ type ServedBlock struct {
 }
 
 // BucketDump is what a store gateway would serve from a bucket: the blocks
-// that carry no deletion mark, deduplicated the way the store's fetcher does,
+// that carry no deletion mark, deduplicated the way the store gateway's fetcher does,
 // and every series and sample in them keyed by resolution, external labels
 // and series labels.
 type BucketDump struct {
@@ -112,6 +113,7 @@ func DumpBucket(t *testing.T, bkt objstore.Bucket) *BucketDump {
 	dir := t.TempDir()
 	for id, m := range metas {
 		sb := ServedBlock{ID: id, Ext: labels.FromMap(m.Thanos.Labels).String(), Res: m.Thanos.Downsample.Resolution, MinT: m.MinTime, MaxT: m.MaxTime, Meta: m}
+		sb.Sources = make([]string, 0, len(m.Compaction.Sources))
 		for _, s := range m.Compaction.Sources {
 			sb.Sources = append(sb.Sources, s.String())
 		}
@@ -191,8 +193,8 @@ func (d *BucketDump) ReadBlock(t *testing.T, ctx context.Context, bkt objstore.B
 			d.keys[key] = dumpKey{res: m.Thanos.Downsample.Resolution, lset: lb.Labels()}
 		}
 		for _, c := range chks {
-			chk, _, err := chunkr.ChunkOrIterable(c)
-			testutil.Ok(t, err)
+			chk, _, chkErr := chunkr.ChunkOrIterable(c)
+			testutil.Ok(t, chkErr)
 			if m.Thanos.Downsample.Resolution == 0 {
 				byAggr[AggrRaw] = append(byAggr[AggrRaw], chunkSamples(t, chk)...)
 				continue
@@ -200,8 +202,8 @@ func (d *BucketDump) ReadBlock(t *testing.T, ctx context.Context, bkt objstore.B
 			ac, ok := chk.(*downsample.AggrChunk)
 			testutil.Assert(t, ok, "block %s at resolution %d holds a %T, not an aggregate chunk", m.ULID, m.Thanos.Downsample.Resolution, chk)
 			for _, at := range AggrTypes {
-				sub, err := ac.Get(at)
-				if err != nil {
+				sub, getErr := ac.Get(at)
+				if getErr != nil {
 					continue // Not every aggregate is present for every series.
 				}
 				byAggr[at] = append(byAggr[at], chunkSamples(t, sub)...)
@@ -300,7 +302,7 @@ func SameContent(t *testing.T, want, got *BucketDump, what string) bool {
 
 // Layout describes the served blocks by what they are made of, not by ID.
 func (d *BucketDump) Layout() []string {
-	var out []string
+	out := make([]string, 0, len(d.Blocks))
 	for _, b := range d.Blocks {
 		out = append(out, fmt.Sprintf("res=%d ext=%s [%d,%d) sources=%v", b.Res, b.Ext, b.MinT, b.MaxT, b.Sources))
 	}
@@ -596,8 +598,10 @@ func (d *BucketDump) AssertNoOverlaps(t *testing.T) {
 		slices.SortFunc(bs, func(a, b ServedBlock) int { return int(a.MinT - b.MinT) })
 		for i := 1; i < len(bs); i++ {
 			if bs[i].MinT < bs[i-1].MaxT {
-				t.Errorf("group %s: served blocks %s [%d,%d) and %s [%d,%d) overlap", k,
-					bs[i-1].ID, bs[i-1].MinT, bs[i-1].MaxT, bs[i].ID, bs[i].MinT, bs[i].MaxT)
+				t.Errorf(
+					"group %s: served blocks %s [%d,%d) and %s [%d,%d) overlap",
+					k, bs[i-1].ID, bs[i-1].MinT, bs[i-1].MaxT, bs[i].ID, bs[i].MinT, bs[i].MaxT,
+				)
 			}
 		}
 	}
@@ -646,13 +650,13 @@ func SourceObjects(t *testing.T, bkt objstore.Bucket, ids []ulid.ULID) map[strin
 	t.Helper()
 	objects := map[string][]byte{}
 	for _, id := range ids {
-		testutil.Ok(t, bkt.Iter(t.Context(), id.String()+"/", func(name string) error {
+		testutil.Ok(t, bkt.Iter(t.Context(), id.String()+"/", func(name string) (err error) {
 			if strings.HasSuffix(name, metadata.DeletionMarkFilename) {
 				return nil
 			}
 			r, err := bkt.Get(t.Context(), name)
 			testutil.Ok(t, err)
-			defer r.Close()
+			defer runutil.CloseWithErrCapture(&err, r, "close %s", name)
 			objects[name], err = io.ReadAll(r)
 			return err
 		}, objstore.WithRecursiveIter()))
@@ -663,28 +667,27 @@ func SourceObjects(t *testing.T, bkt objstore.Bucket, ids []ulid.ULID) map[strin
 // Fingerprint summarizes the bucket: every object name, and the content of
 // every metadata and marker file. Two identical fingerprints around a pass
 // mean the pass changed nothing.
-func Fingerprint(bkt objstore.Bucket) string {
+func Fingerprint(t testing.TB, bkt objstore.Bucket) string {
+	t.Helper()
 	h := sha256.New()
 	ctx := context.Background()
-	_ = bkt.Iter(ctx, "", func(name string) error {
+	testutil.Ok(t, bkt.Iter(ctx, "", func(name string) (err error) {
 		_, _ = h.Write([]byte(name))
-		if strings.HasSuffix(name, ".json") {
-			rc, err := bkt.Get(ctx, name)
-			if err != nil {
-				return nil
-			}
-			defer rc.Close()
-			buf := make([]byte, 64<<10)
-			for {
-				k, err := rc.Read(buf)
-				_, _ = h.Write(buf[:k])
-				if err != nil {
-					break
-				}
-			}
+		if !strings.HasSuffix(name, ".json") {
+			return nil
 		}
-		return nil
-	}, objstore.WithRecursiveIter())
+		rc, err := bkt.Get(ctx, name)
+		if bkt.IsObjNotFoundErr(err) {
+			// Deleted since it was listed, by a compactor still at work.
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		defer runutil.ExhaustCloseWithErrCapture(&err, rc, "close %s", name)
+		_, err = io.Copy(h, rc)
+		return err
+	}, objstore.WithRecursiveIter()))
 	return hex.EncodeToString(h.Sum(nil))
 }
 

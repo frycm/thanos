@@ -1423,7 +1423,7 @@ func (ex LocalPlanExecutor) Execute(ctx context.Context, dir string, cg *Group, 
 		output PlanOutput
 		index  int
 	}
-	outputOf := map[ulid.ULID]producedBy{}
+	outputOf := make(map[ulid.ULID]producedBy, len(outputs))
 
 	begin = time.Now()
 	var compIDs []ulid.ULID
@@ -1457,12 +1457,12 @@ func (ex LocalPlanExecutor) Execute(ctx context.Context, dir string, cg *Group, 
 				}
 				populator = PartitionedBlockPopulator{Partition: *out.Series, Stats: &stats[i]}
 			}
-			ids, e := ex.Comp.CompactWithBlockPopulator(dir, toCompactDirs, nil, populator)
-			if e != nil {
+			ids, err := ex.Comp.CompactWithBlockPopulator(dir, toCompactDirs, nil, populator)
+			if err != nil {
 				if out.Series != nil {
-					return errors.Wrapf(e, "series partition %d of %d", out.Series.Index, out.Series.Count)
+					return errors.Wrapf(err, "series partition %d of %d", out.Series.Index, out.Series.Count)
 				}
-				return e
+				return err
 			}
 			for _, id := range ids {
 				outputOf[id] = producedBy{output: out, index: i}
@@ -1555,7 +1555,8 @@ func (ex LocalPlanExecutor) Execute(ctx context.Context, dir string, cg *Group, 
 			// reader seeing one of them knows what else has to be there. The
 			// set also names the plan's siblings, so that they keep a
 			// complete set once the sources they shared one with are gone.
-			set := slices.Clone(compIDs)
+			set := make([]ulid.ULID, 0, len(compIDs)+len(plan.Siblings))
+			set = append(set, compIDs...)
 			for _, sibling := range plan.Siblings {
 				if !slices.Contains(set, sibling) {
 					set = append(set, sibling)
@@ -1589,7 +1590,7 @@ func (ex LocalPlanExecutor) Execute(ctx context.Context, dir string, cg *Group, 
 
 		if ex.PreUploadCheck != nil {
 			if err := ex.PreUploadCheck(ctx, cg, compIDs); err != nil {
-				return nil, errors.Wrapf(err, "pre upload check failed for result block %s", compID)
+				return nil, errors.Wrapf(err, "run pre upload check for result block %s", compID)
 			}
 		}
 

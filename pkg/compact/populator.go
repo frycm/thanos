@@ -5,7 +5,6 @@ package compact
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"log/slog"
 	"maps"
@@ -49,7 +48,18 @@ var _ tsdb.BlockPopulator = PartitionedBlockPopulator{}
 // tsdb.DefaultBlockPopulator.PopulateBlock, except that each block's postings
 // are filtered to the partition before merging and the symbol table is built
 // from the kept series rather than merged from the source blocks' tables.
-func (p PartitionedBlockPopulator) PopulateBlock(ctx context.Context, metrics *tsdb.CompactorMetrics, logger *slog.Logger, chunkPool chunkenc.Pool, mergeFunc storage.VerticalChunkSeriesMergeFunc, blocks []tsdb.BlockReader, meta *tsdb.BlockMeta, indexw tsdb.IndexWriter, chunkw tsdb.ChunkWriter, postingsFunc tsdb.IndexReaderPostingsFunc) (err error) {
+func (p PartitionedBlockPopulator) PopulateBlock(
+	ctx context.Context,
+	metrics *tsdb.CompactorMetrics,
+	logger *slog.Logger,
+	chunkPool chunkenc.Pool,
+	mergeFunc storage.VerticalChunkSeriesMergeFunc,
+	blocks []tsdb.BlockReader,
+	meta *tsdb.BlockMeta,
+	indexw tsdb.IndexWriter,
+	chunkw tsdb.ChunkWriter,
+	postingsFunc tsdb.IndexReaderPostingsFunc,
+) (rerr error) {
 	if len(blocks) == 0 {
 		return errors.New("cannot populate block from no readers")
 	}
@@ -64,11 +74,11 @@ func (p PartitionedBlockPopulator) PopulateBlock(ctx context.Context, metrics *t
 		overlapping bool
 	)
 	defer func() {
-		errs := tsdb_errors.NewMulti(err)
+		errs := tsdb_errors.NewMulti(rerr)
 		if cerr := tsdb_errors.CloseAll(closers); cerr != nil {
-			errs.Add(fmt.Errorf("close: %w", cerr))
+			errs.Add(errors.Wrap(cerr, "close"))
 		}
-		err = errs.Err()
+		rerr = errs.Err()
 		metrics.PopulatingBlocks.Set(0)
 	}()
 	metrics.PopulatingBlocks.Set(1)
@@ -85,7 +95,7 @@ func (p PartitionedBlockPopulator) PopulateBlock(ctx context.Context, metrics *t
 			if i > 0 && b.Meta().MinTime < globalMaxt {
 				metrics.OverlappingBlocks.Inc()
 				overlapping = true
-				logger.Info("Found overlapping blocks during compaction", "ulid", meta.ULID)
+				logger.Info("found overlapping blocks during compaction", "block", meta.ULID)
 			}
 			if b.Meta().MaxTime > globalMaxt {
 				globalMaxt = b.Meta().MaxTime
@@ -94,25 +104,25 @@ func (p PartitionedBlockPopulator) PopulateBlock(ctx context.Context, metrics *t
 
 		indexr, err := b.Index()
 		if err != nil {
-			return fmt.Errorf("open index reader for block %+v: %w", b.Meta(), err)
+			return errors.Wrapf(err, "open index reader for block %+v", b.Meta())
 		}
 		closers = append(closers, indexr)
 
 		chunkr, err := b.Chunks()
 		if err != nil {
-			return fmt.Errorf("open chunk reader for block %+v: %w", b.Meta(), err)
+			return errors.Wrapf(err, "open chunk reader for block %+v", b.Meta())
 		}
 		closers = append(closers, chunkr)
 
 		tombsr, err := b.Tombstones()
 		if err != nil {
-			return fmt.Errorf("open tombstone reader for block %+v: %w", b.Meta(), err)
+			return errors.Wrapf(err, "open tombstone reader for block %+v", b.Meta())
 		}
 		closers = append(closers, tombsr)
 
 		refs, err := p.partitionPostings(ctx, postingsFunc(ctx, indexr), indexr, symbols)
 		if err != nil {
-			return fmt.Errorf("partition postings of block %+v: %w", b.Meta(), err)
+			return errors.Wrapf(err, "partition postings of block %+v", b.Meta())
 		}
 		// Blocks meta is half open: [min, max), so subtract 1 to ensure we don't hold samples with exact meta.MaxTime timestamp.
 		sets = append(sets, tsdb.NewBlockChunkSeriesSet(b.Meta().ULID, indexr, chunkr, tombsr, index.NewListPostings(refs), meta.MinTime, meta.MaxTime-1, false))
@@ -120,7 +130,7 @@ func (p PartitionedBlockPopulator) PopulateBlock(ctx context.Context, metrics *t
 
 	for _, s := range slices.Sorted(maps.Keys(symbols)) {
 		if err := indexw.AddSymbol(s); err != nil {
-			return fmt.Errorf("add symbol: %w", err)
+			return errors.Wrap(err, "add symbol")
 		}
 	}
 
@@ -148,16 +158,16 @@ func (p PartitionedBlockPopulator) PopulateBlock(ctx context.Context, metrics *t
 			chks = append(chks, chksIter.At())
 		}
 		if err := chksIter.Err(); err != nil {
-			return fmt.Errorf("chunk iter: %w", err)
+			return errors.Wrap(err, "chunk iter")
 		}
 		if len(chks) == 0 {
 			continue
 		}
 		if err := chunkw.WriteChunks(chks...); err != nil {
-			return fmt.Errorf("write chunks: %w", err)
+			return errors.Wrap(err, "write chunks")
 		}
 		if err := indexw.AddSeries(ref, s.Labels(), chks...); err != nil {
-			return fmt.Errorf("add series: %w", err)
+			return errors.Wrap(err, "add series")
 		}
 
 		meta.Stats.NumChunks += uint64(len(chks))
@@ -174,13 +184,13 @@ func (p PartitionedBlockPopulator) PopulateBlock(ctx context.Context, metrics *t
 		}
 		for _, chk := range chks {
 			if err := chunkPool.Put(chk.Chunk); err != nil {
-				return fmt.Errorf("put chunk: %w", err)
+				return errors.Wrap(err, "put chunk")
 			}
 		}
 		ref++
 	}
 	if err := set.Err(); err != nil {
-		return fmt.Errorf("iterate compaction set: %w", err)
+		return errors.Wrap(err, "iterate compaction set")
 	}
 	return nil
 }
