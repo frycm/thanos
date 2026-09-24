@@ -14,6 +14,7 @@
 package compacttest
 
 import (
+	"cmp"
 	"context"
 	"flag"
 	"fmt"
@@ -116,18 +117,14 @@ func HACorpus() []TenantSpec {
 // BuildCorpus creates the blocks of the tenants on disk.
 func BuildCorpus(t *testing.T, name string, tenants []TenantSpec) *Corpus {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
 
 	c := &Corpus{Name: name}
 	dir := t.TempDir()
 	for _, tn := range tenants {
-		if tn.SeriesReplicaLabel == "" {
-			tn.SeriesReplicaLabel = "prometheus_replica"
-		}
-		if tn.ExternalReplicaLabel == "" {
-			tn.ExternalReplicaLabel = "receiver_replica"
-		}
+		tn.SeriesReplicaLabel = cmp.Or(tn.SeriesReplicaLabel, "prometheus_replica")
+		tn.ExternalReplicaLabel = cmp.Or(tn.ExternalReplicaLabel, "receiver_replica")
 		receivers := tn.Receivers
 		if len(receivers) == 0 {
 			receivers = []string{""}
@@ -185,7 +182,7 @@ func BuildCorpus(t *testing.T, name string, tenants []TenantSpec) *Corpus {
 // checked against the input exactly.
 func (c *Corpus) Upload(t *testing.T, bkt objstore.Bucket) {
 	t.Helper()
-	ctx := context.Background()
+	ctx := t.Context()
 	logger := log.NewNopLogger()
 	for _, b := range c.Blocks {
 		testutil.Ok(t, block.Upload(ctx, logger, bkt, b.Dir, metadata.NoneFunc))
