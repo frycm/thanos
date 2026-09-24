@@ -579,7 +579,7 @@ func resFilterMeta(resolution int64, lset map[string]string, sources ...ulid.ULI
 }
 
 func TestResolutionMetaFilter_Filter(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 120*time.Second)
 	defer cancel()
 
 	const res5m, res1h = int64(300000), int64(3600000)
@@ -620,7 +620,7 @@ func TestResolutionMetaFilter_Filter(t *testing.T) {
 // another filter removed (too fresh, marked for deletion, parquet-migrated) must
 // not count as coverage, so the finer block it was built from stays served.
 func TestResolutionMetaFilter_CoveringBlockRemovedByOtherFilter(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 120*time.Second)
 	defer cancel()
 
 	raw := ULID(1)
@@ -1606,7 +1606,7 @@ func TestRecursiveLister_MetaJsonOrderIsIrrelevant(t *testing.T) {
 // at a coarser level is unreachable for a query asking exactly the minimum,
 // and the finer block has to stay served.
 func TestResolutionMetaFilter_CoverageMustBeAtTheMinimumResolution(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 120*time.Second)
 	defer cancel()
 
 	raw := ULID(1)
@@ -1631,7 +1631,7 @@ func TestResolutionMetaFilter_CoverageMustBeAtTheMinimumResolution(t *testing.T)
 // coverage loop was vacuously true and the block was hidden even though
 // nothing covers its data - exactly the silent gap the guard exists to prevent.
 func TestResolutionMetaFilter_EmptySourcesIsNeverCovered(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 120*time.Second)
 	defer cancel()
 
 	orphan := ULID(1)
@@ -1659,7 +1659,7 @@ func TestResolutionMetaFilter_EmptySourcesIsNeverCovered(t *testing.T) {
 // admitting every resolution does no work: the default flag values cover
 // raw through 1h, and every store gateway pays for this filter on every sync.
 func TestResolutionMetaFilter_NoOpRangeShortCircuits(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 120*time.Second)
 	defer cancel()
 
 	// A block that would be hidden as vacuously covered if the passes ran.
@@ -1679,7 +1679,7 @@ func TestResolutionMetaFilter_NoOpRangeShortCircuits(t *testing.T) {
 // exported through a gauge (the alertable form), and it tracks the set as it
 // shrinks back to zero.
 func TestResolutionMetaFilter_UncoveredGaugeAndBoundedLogging(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 120*time.Second)
 	defer cancel()
 
 	gauge := promauto.With(nil).NewGauge(prometheus.GaugeOpts{Name: "test_uncovered"})
@@ -1711,7 +1711,7 @@ func TestResolutionMetaFilter_UncoveredGaugeAndBoundedLogging(t *testing.T) {
 // far side of the time partition - unconditionally, as another store's to
 // serve. Only the blocks that hid something are covers at all.
 func TestResolutionMetaFilter_FallbacksTrustCoversBeyondTheView(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 120*time.Second)
 	defer cancel()
 
 	const res5m, res1h = int64(300000), int64(3600000)
@@ -1763,7 +1763,7 @@ func TestResolutionMetaFilter_FallbacksTrustCoversBeyondTheView(t *testing.T) {
 }
 
 func TestResolutionMetaFilter_CoverageAcrossTheTimePartition(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 120*time.Second)
 	defer cancel()
 
 	const res5m, res1h = int64(300000), int64(3600000)
@@ -1872,7 +1872,7 @@ func TestResolutionMetaFilter_ShardsCoverTheirStream(t *testing.T) {
 			metas := maps.Clone(tc.covers)
 			metas[ULID(1)] = tc.block
 			m := newTestFetcherMetrics()
-			testutil.Ok(t, f.Filter(context.Background(), metas, m.Synced, nil))
+			testutil.Ok(t, f.Filter(t.Context(), metas, m.Synced, nil))
 			_, served := metas[ULID(1)]
 			testutil.Equals(t, tc.covered, !served)
 			if tc.covered {
@@ -1899,7 +1899,7 @@ func TestResolutionMetaFilter_ShardsCoverTheirStream(t *testing.T) {
 		ULID(100): resFilterMeta(res5m, map[string]string{"tenant": "2", compactorShardLabel: "1_of_2"}, ULIDs(1, 2)...),
 		ULID(101): resFilterMeta(res5m, map[string]string{"tenant": "2", compactorShardLabel: "2_of_2"}, ULIDs(1, 2)...),
 	}
-	testutil.Ok(t, f.Filter(context.Background(), metas, newTestFetcherMetrics().Synced, nil))
+	testutil.Ok(t, f.Filter(t.Context(), metas, newTestFetcherMetrics().Synced, nil))
 	_, served := metas[ULID(1)]
 	testutil.Equals(t, true, served)
 }

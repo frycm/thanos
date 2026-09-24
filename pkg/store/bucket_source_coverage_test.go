@@ -4,7 +4,6 @@
 package store
 
 import (
-	"context"
 	"slices"
 	"strings"
 	"testing"
@@ -117,7 +116,7 @@ func TestBelowResolutionWarning(t *testing.T) {
 	f := block.NewResolutionMetaFilter(log.NewNopLogger(), res5m, int64(3600000), nil)
 	metas := map[ulid.ULID]*metadata.Meta{rawID: meta(rawID, 0), coverID: meta(coverID, res5m)}
 	synced := promauto.With(nil).NewGaugeVec(prometheus.GaugeOpts{Name: "synced"}, []string{"state"})
-	testutil.Ok(t, f.Filter(context.Background(), metas, synced, nil))
+	testutil.Ok(t, f.Filter(t.Context(), metas, synced, nil))
 	testutil.Equals(t, 1, len(f.Hidden()))
 
 	s := &BucketStore{resolutionFilter: f, blocks: map[ulid.ULID]*bucketBlock{}}
