@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"path"
 	"strconv"
@@ -36,6 +37,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/compact"
+	"github.com/thanos-io/thanos/pkg/compact/distributed"
 	"github.com/thanos-io/thanos/pkg/compact/downsample"
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/dedup"
@@ -176,6 +178,16 @@ func runCompact(
 	conf compactConfig,
 	flagsMap map[string]string,
 ) (rerr error) {
+	if conf.mode == compactModeWorker {
+		return runCompactWorker(g, logger, reg, component, conf)
+	}
+	if conf.mode == compactModeManager && conf.managerLeaseTTL <= 0 {
+		return errors.New("--compact.manager.lease-ttl must be positive")
+	}
+	if conf.mode == compactModeManager && conf.managerJournalID == "" {
+		return errors.New("--compact.manager.journal-id is required in manager mode")
+	}
+
 	deleteDelay := time.Duration(conf.deleteDelay)
 	compactMetrics := newCompactMetrics(reg, deleteDelay)
 	downsampleMetrics := newDownsampleMetrics(reg)
@@ -414,6 +426,47 @@ func runCompact(
 		)
 	}
 
+	// In manager mode planning stays here but execution moves to workers, so the
+	// compactor is given a remote executor instead of compacting in process, and
+	// downsampling is dispatched to workers as well.
+	var scheduler *distributed.Scheduler
+	if conf.mode == compactModeManager {
+		scheduler, err = distributed.NewScheduler(ctx, logger, insBkt, reg, distributed.ManagerConfig{
+			JournalID:          conf.managerJournalID,
+			SelectorHash:       distributed.SelectorHash([]byte(relabelContentYaml)),
+			DedupFunc:          conf.dedupFunc,
+			DedupReplicaLabels: dedupReplicaLabels,
+			LeaseTTL:           conf.managerLeaseTTL,
+			MaxAttempts:        conf.managerMaxAttempts,
+			JournalRetention:   conf.managerJournalRetention,
+			MaxTaskSeries:      conf.managerMaxTaskSeries,
+			MaxTaskIndexBytes:  int64(conf.managerMaxTaskIndexSize),
+		})
+		if err != nil {
+			return errors.Wrap(err, "create compaction scheduler")
+		}
+		planExecutor = distributed.NewRemotePlanExecutor(logger, insBkt, scheduler, planner, conf.managerMaxInflightPerGroup, nil)
+		downsampleBlocks = func(ctx context.Context, metas map[ulid.ULID]*metadata.Meta, opts downsample.PlanOptions) error {
+			return distributed.DispatchDownsampling(
+				ctx,
+				logger,
+				insBkt,
+				scheduler,
+				metas,
+				opts,
+				conf.downsampleConcurrency,
+				metadata.HashFunc(conf.hashFunc),
+				conf.blockFilesConcurrency,
+				conf.acceptMalformedIndex,
+				downsampleMetrics.downsamples,
+				downsampleMetrics.downsampleFailures,
+			)
+		}
+		// A worker's output supersedes the blocks it was made from only once
+		// this manager has verified it; a result it rejected never does.
+		duplicateBlocksFilter.SetPublishedFunc(scheduler.PublishedFunc())
+	}
+
 	compactor, err := compact.NewBucketCompactorWithExecutor(
 		logger,
 		sy,
@@ -428,6 +481,28 @@ func runCompact(
 	)
 	if err != nil {
 		return errors.Wrap(err, "create bucket compactor")
+	}
+
+	if scheduler != nil {
+		// Workers reach the manager over the HTTP server every Thanos component
+		// already runs, so no new listener or protocol is involved.
+		mux := http.NewServeMux()
+		distributed.RegisterServer(mux, logger, scheduler)
+		srv.Handle(distributed.APIPrefix+"/", mux)
+
+		schedulerCtx, cancelScheduler := context.WithCancel(ctx)
+		g.Add(func() error {
+			// Expire leases whose worker went away, so their tasks go back to the
+			// queue rather than sitting with a worker that will never report.
+			return runutil.Repeat(conf.managerLeaseTTL/4, schedulerCtx.Done(), func() error {
+				return schedulerMaintenanceError(logger, scheduler.Maintain())
+			})
+		}, func(error) {
+			cancelScheduler()
+		})
+
+		level.Info(logger).Log("msg", "running compact in manager mode; compaction is executed by workers",
+			"journalID", conf.managerJournalID, "generation", scheduler.Generation())
 	}
 
 	retentionByResolution := map[compact.ResolutionLevel]time.Duration{
@@ -555,6 +630,13 @@ func runCompact(
 				if conf.haltOnError {
 					level.Error(logger).Log("msg", "critical error detected; halting", "err", err)
 					compactMetrics.halted.Set(1)
+					if scheduler != nil {
+						// Freeze the fleet too: the task API keeps serving
+						// while this loop blocks, and without this the
+						// workers would keep executing queued tasks whose
+						// outputs nobody verifies.
+						scheduler.Halt(err)
+					}
 					select {}
 				} else {
 					return errors.Wrap(err, "critical error detected")
@@ -745,7 +827,32 @@ type compactConfig struct {
 	progressCalculateInterval                      time.Duration
 	filterConf                                     *store.FilterConfig
 	disableAdminOperations                         bool
+
+	mode                       string
+	managerJournalID           string
+	managerLeaseTTL            time.Duration
+	managerMaxAttempts         int
+	managerJournalRetention    time.Duration
+	managerMaxInflightPerGroup int
+	managerMaxTaskSeries       uint64
+	managerMaxTaskIndexSize    units.Base2Bytes
+	workerManagerAddress       string
+	workerID                   string
+	workerPollInterval         time.Duration
+	workerHeartbeatInterval    time.Duration
+	dnsSDResolver              string
 }
+
+// Compactor modes. The mode is an explicit flag rather than something inferred
+// from other flags, because a manager and a standalone compactor are configured
+// identically: inferring would make the difference between "plans only" and
+// "also writes blocks" hinge on a flag being forgotten, and two processes
+// writing one shard is exactly what this design has to prevent.
+const (
+	compactModeStandalone = "standalone"
+	compactModeManager    = "manager"
+	compactModeWorker     = "worker"
+)
 
 func (cc *compactConfig) registerFlag(cmd extkingpin.FlagClause) {
 	cmd.Flag("debug.halt-on-error", "Halt the process if a critical compaction error is detected.").
@@ -799,6 +906,45 @@ func (cc *compactConfig) registerFlag(cmd extkingpin.FlagClause) {
 		Default("5m").DurationVar(&cc.cleanupBlocksInterval)
 	cmd.Flag("compact.progress-interval", "Frequency of calculating the compaction progress in the background when --wait has been enabled. Setting it to \"0s\" disables it. Now compaction, downsampling and retention progress are supported.").
 		Default("5m").DurationVar(&cc.progressCalculateInterval)
+
+	cmd.Flag("compact.mode", "Experimental. Role this compactor runs as. In 'standalone' it plans and compacts in one process, as it always has. In 'manager' it plans and dispatches work to workers but never compacts itself, and exactly one manager may run per shard. In 'worker' it executes tasks handed out by a manager and does nothing on its own.").
+		Default(compactModeStandalone).Hidden().EnumVar(&cc.mode, compactModeStandalone, compactModeManager, compactModeWorker)
+
+	cmd.Flag("compact.manager.journal-id", "Experimental. Identifier of this shard's work journal in the bucket. Every manager needs its own; two shards sharing one corrupts both. Required in 'manager' and 'worker' mode.").
+		Hidden().StringVar(&cc.managerJournalID)
+
+	cmd.Flag("compact.manager.lease-ttl", "Experimental. How long a task lease survives without a heartbeat before the task is handed to another worker.").
+		Default("5m").Hidden().DurationVar(&cc.managerLeaseTTL)
+
+	cmd.Flag("compact.manager.max-attempts", "Experimental. How often a task is retried before the manager gives up on it.").
+		Default("3").Hidden().IntVar(&cc.managerMaxAttempts)
+
+	cmd.Flag("compact.manager.journal-retention", "Experimental. How long finished tasks are kept in the journal.").
+		Default("24h").Hidden().DurationVar(&cc.managerJournalRetention)
+
+	cmd.Flag("compact.manager.max-inflight-per-group", "Experimental. How many non-overlapping plans the manager keeps in flight for a single compaction group. Raising this is what lets one block stream be compacted by several workers at once.").
+		Default("4").Hidden().IntVar(&cc.managerMaxInflightPerGroup)
+
+	cmd.Flag("compact.manager.max-task-series", "Experimental. Refuse to dispatch a task whose source blocks report more series than this, in total, or per output block when the plan names several. Such a plan is recorded as oversized in the journal and its blocks are withheld from planning until an operator intervenes. 0 disables the limit.").
+		Default("0").Hidden().Uint64Var(&cc.managerMaxTaskSeries)
+
+	cmd.Flag("compact.manager.max-task-index-size", "Experimental. Refuse to dispatch a task whose source blocks carry more index data than this, in total, whatever the number of output blocks: the worker downloads them all. Such a plan is recorded as oversized in the journal and its blocks are withheld from planning until an operator intervenes. 0 disables the limit.").
+		Default("0").Hidden().BytesVar(&cc.managerMaxTaskIndexSize)
+
+	cmd.Flag("compact.worker.manager-address", "Experimental. Address of the compactor manager, either host:port or a Thanos service discovery address such as dnssrv+_http._tcp.thanos-compact-manager.thanos.svc. Required in 'worker' mode.").
+		Hidden().StringVar(&cc.workerManagerAddress)
+
+	cmd.Flag("compact.worker.id", "Experimental. Identifies this worker to the manager. Defaults to the hostname.").
+		Hidden().StringVar(&cc.workerID)
+
+	cmd.Flag("compact.worker.poll-interval", "Experimental. How long a worker waits before asking for work again after finding none.").
+		Default("5s").Hidden().DurationVar(&cc.workerPollInterval)
+
+	cmd.Flag("compact.worker.heartbeat-interval", "Experimental. How often a worker extends the lease on the task it is running.").
+		Default("30s").Hidden().DurationVar(&cc.workerHeartbeatInterval)
+
+	cmd.Flag("compact.worker.sd-dns-resolver", "Experimental. Resolver to use for the manager address. Possible options: [golang, miekgdns].").
+		Default("miekgdns").Hidden().EnumVar(&cc.dnsSDResolver, "golang", "miekgdns")
 
 	cmd.Flag("compact.concurrency", "Number of goroutines to use when compacting groups.").
 		Default("1").IntVar(&cc.compactionConcurrency)
@@ -875,4 +1021,22 @@ func dedupFuncFor(conf compactConfig) (storage.VerticalChunkSeriesMergeFunc, err
 	default:
 		return nil, errors.Errorf("unsupported deduplication func, got %s", conf.dedupFunc)
 	}
+}
+
+// schedulerMaintenanceError decides what a failed maintenance tick means for
+// the manager. A halt - another manager took the journal over, or the journal
+// has been unwritable for too long - ends the manager: it must not stay alive
+// doing nothing while its journal ages past the point where a rollback takes
+// it for stopped, and then wake up to race that rollback. Anything else is
+// transient and is retried on the next tick.
+func schedulerMaintenanceError(logger log.Logger, err error) error {
+	if err == nil {
+		return nil
+	}
+	if compact.IsHaltError(err) {
+		level.Error(logger).Log("msg", "critical error during scheduler maintenance; stopping the manager", "err", err)
+		return err
+	}
+	level.Warn(logger).Log("msg", "scheduler maintenance failed; retrying on the next tick", "err", err)
+	return nil
 }
