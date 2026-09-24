@@ -4,7 +4,7 @@
 package block
 
 import (
-	"context"
+	"maps"
 	"slices"
 	"testing"
 
@@ -21,7 +21,7 @@ import (
 // other although they record the same sources, and an unsplit block never
 // supersedes a shard.
 func TestDeduplicateFilterWithShards(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	shard := func(v string) map[string]string {
 		if v == "" {
 			return map[string]string{"tenant": "a"}
@@ -127,7 +127,7 @@ func TestDeduplicateFilterWithShards(t *testing.T) {
 // are the only complete copy of the series the missing shards would hold, and
 // garbage collection must not retire them on the strength of one shard.
 func TestDeduplicateFilterShardsSupersedeOnlyAsASet(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	base := map[string]string{"tenant": "a"}
 	shard := func(v string) map[string]string {
 		return map[string]string{"tenant": "a", metadata.CompactorShardLabel: v}
@@ -155,12 +155,7 @@ func TestDeduplicateFilterShardsSupersedeOnlyAsASet(t *testing.T) {
 		}
 		f := NewDeduplicateFilter(1)
 		testutil.Ok(t, f.Filter(ctx, metas, newTestFetcherMetrics().Synced, nil))
-		ids := make([]ulid.ULID, 0, len(metas))
-		for id := range metas {
-			ids = append(ids, id)
-		}
-		slices.SortFunc(ids, func(a, b ulid.ULID) int { return a.Compare(b) })
-		return ids
+		return slices.SortedFunc(maps.Keys(metas), func(a, b ulid.ULID) int { return a.Compare(b) })
 	}
 
 	set := []ulid.ULID{ULID(10), ULID(11)}

@@ -4,8 +4,8 @@
 package block
 
 import (
-	"context"
 	"fmt"
+	"maps"
 	"math/rand"
 	"slices"
 	"testing"
@@ -36,7 +36,7 @@ func TestShardTreeNeverLosesCoverage(t *testing.T) {
 	for seed := int64(1); seed <= 150; seed++ {
 		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
 			s := newShardTreeSim(seed, ranges, residues)
-			for i := 0; i < steps; i++ {
+			for range steps {
 				s.step()
 				s.sync(t)
 				s.check(t)
@@ -212,12 +212,7 @@ func (s *shardTreeSim) siblings(plan []*simBlock) []ulid.ULID {
 			collect(o.set)
 		}
 	}
-	var out []ulid.ULID
-	for id := range named {
-		out = append(out, id)
-	}
-	slices.SortFunc(out, func(a, b ulid.ULID) int { return a.Compare(b) })
-	return out
+	return slices.SortedFunc(maps.Keys(named), func(a, b ulid.ULID) int { return a.Compare(b) })
 }
 
 // merge compacts two visible, adjacent blocks of the same shard into one, as
@@ -268,7 +263,7 @@ func (s *shardTreeSim) sync(t *testing.T) {
 	}
 	f := NewDeduplicateFilter(1)
 	f.HideUnpublished()
-	testutil.Ok(t, f.Filter(context.Background(), metas, newTestFetcherMetrics().Synced, nil))
+	testutil.Ok(t, f.Filter(t.Context(), metas, newTestFetcherMetrics().Synced, nil))
 	for _, id := range f.DuplicateIDs() {
 		byID[id].deleted = true
 	}

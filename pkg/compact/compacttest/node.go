@@ -186,9 +186,7 @@ func NewNode(t *testing.T, shared objstore.Bucket, conf NodeConfig, hooks Hooks)
 	}
 	if conf.Split.Enabled() {
 		split := conf.Split
-		if split.MaxIndexSizeBytes == 0 {
-			split.MaxIndexSizeBytes = conf.MaxIndexSize
-		}
+		split.MaxIndexSizeBytes = cmp.Or(split.MaxIndexSizeBytes, conf.MaxIndexSize)
 		planner = compact.WithBlockSplitting(planner, n.Logger, split, nil, insBkt, counter(), n.Syncer.Metas, n.NoCompactFilter.NoCompactMarkedBlocks)
 	}
 	cleaner := compact.NewBlocksCleaner(n.Logger, insBkt, ignoreDeletionMarkFilter, conf.DeleteDelay, counter(), counter())

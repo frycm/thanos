@@ -4,7 +4,6 @@
 package store
 
 import (
-	"context"
 	"math/rand"
 	"path/filepath"
 	"slices"
@@ -72,10 +71,10 @@ func TestBucketStoreStripsCompactorShardLabel(t *testing.T) {
 	)
 	testutil.Ok(t, err)
 	defer func() { testutil.Ok(t, store.Close()) }()
-	testutil.Ok(t, store.SyncBlocks(context.Background()))
+	testutil.Ok(t, store.SyncBlocks(t.Context()))
 	testutil.Equals(t, 2, len(store.blocks), "both shard blocks must be loaded")
 
-	srv := newStoreSeriesServer(context.Background())
+	srv := newStoreSeriesServer(t.Context())
 	testutil.Ok(t, store.Series(&storepb.SeriesRequest{
 		MinTime:  0,
 		MaxTime:  1000,
@@ -107,16 +106,16 @@ func TestBucketStoreStripsCompactorShardLabel(t *testing.T) {
 		}
 	}
 
-	names, err := store.LabelNames(context.Background(), &storepb.LabelNamesRequest{Start: 0, End: 1000})
+	names, err := store.LabelNames(t.Context(), &storepb.LabelNamesRequest{Start: 0, End: 1000})
 	testutil.Ok(t, err)
 	testutil.Assert(t, slices.Contains(names.Names, "ext1"), "external labels other than the shard label are served: %v", names.Names)
 	testutil.Assert(t, !slices.Contains(names.Names, metadata.CompactorShardLabel), "the shard label is among the label names: %v", names.Names)
 
-	values, err := store.LabelValues(context.Background(), &storepb.LabelValuesRequest{Label: metadata.CompactorShardLabel, Start: 0, End: 1000})
+	values, err := store.LabelValues(t.Context(), &storepb.LabelValuesRequest{Label: metadata.CompactorShardLabel, Start: 0, End: 1000})
 	testutil.Ok(t, err)
 	testutil.Equals(t, 0, len(values.Values), "the shard label has no values to serve")
 
-	values, err = store.LabelValues(context.Background(), &storepb.LabelValuesRequest{Label: "ext1", Start: 0, End: 1000})
+	values, err = store.LabelValues(t.Context(), &storepb.LabelValuesRequest{Label: "ext1", Start: 0, End: 1000})
 	testutil.Ok(t, err)
 	testutil.Equals(t, []string{"1"}, values.Values)
 

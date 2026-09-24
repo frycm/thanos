@@ -700,10 +700,7 @@ func StreamLeavesFunc(metas func() map[ulid.ULID]*metadata.Meta) func(labels map
 		if len(seen) == 0 {
 			return nil
 		}
-		var leaves []ShardRef
-		for r := range seen {
-			leaves = append(leaves, r)
-		}
+		leaves := slices.Collect(maps.Keys(seen))
 		for j := range finest {
 			if !(ShardRef{j, finest}).refines(source) {
 				continue // Not this plan's series.

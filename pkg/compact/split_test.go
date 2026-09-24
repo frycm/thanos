@@ -165,13 +165,13 @@ func TestShardStragglerPlanner(t *testing.T) {
 
 	t.Run("the inner plan wins", func(t *testing.T) {
 		p := WithBlockSplitting(fixedPlanner{plan: []*metadata.Meta{uncovered, newest}}, log.NewNopLogger(), SplitConfig{MaxShards: 8}, nil, objstore.NewInMemBucket(), noopCounter(), view(shards...), noMarks)
-		plan, err := p.Plan(context.Background(), group, nil, nil)
+		plan, err := p.Plan(t.Context(), group, nil, nil)
 		testutil.Ok(t, err)
 		testutil.Equals(t, []*metadata.Meta{uncovered, newest}, plan)
 	})
 	t.Run("a covered block is planned alone", func(t *testing.T) {
 		p := WithBlockSplitting(fixedPlanner{}, log.NewNopLogger(), SplitConfig{MaxShards: 8}, nil, objstore.NewInMemBucket(), noopCounter(), view(shards...), noMarks)
-		plan, err := p.Plan(context.Background(), group, nil, nil)
+		plan, err := p.Plan(t.Context(), group, nil, nil)
 		testutil.Ok(t, err)
 		testutil.Equals(t, []*metadata.Meta{straggler}, plan)
 	})
@@ -180,26 +180,26 @@ func TestShardStragglerPlanner(t *testing.T) {
 			return map[ulid.ULID]*metadata.NoCompactMark{straggler.ULID: {}}
 		}
 		p := WithBlockSplitting(fixedPlanner{}, log.NewNopLogger(), SplitConfig{MaxShards: 8}, nil, objstore.NewInMemBucket(), noopCounter(), view(shards...), marks)
-		plan, err := p.Plan(context.Background(), group, nil, nil)
+		plan, err := p.Plan(t.Context(), group, nil, nil)
 		testutil.Ok(t, err)
 		testutil.Equals(t, 0, len(plan), "the block poking out of the coverage and the uncovered one must not be planned")
 	})
 	t.Run("a covered block is planned even as the last block of its group", func(t *testing.T) {
 		covered := rangeMeta(14, base, 100, 200)
 		p := WithBlockSplitting(fixedPlanner{}, log.NewNopLogger(), SplitConfig{MaxShards: 8}, nil, objstore.NewInMemBucket(), noopCounter(), view(shards...), noMarks)
-		plan, err := p.Plan(context.Background(), []*metadata.Meta{covered}, nil, nil)
+		plan, err := p.Plan(t.Context(), []*metadata.Meta{covered}, nil, nil)
 		testutil.Ok(t, err)
 		testutil.Equals(t, []*metadata.Meta{covered}, plan)
 	})
 	t.Run("an uncovered newest block is left alone", func(t *testing.T) {
 		p := WithBlockSplitting(fixedPlanner{}, log.NewNopLogger(), SplitConfig{MaxShards: 8}, nil, objstore.NewInMemBucket(), noopCounter(), view(shards...), noMarks)
-		plan, err := p.Plan(context.Background(), []*metadata.Meta{uncovered, newest}, nil, nil)
+		plan, err := p.Plan(t.Context(), []*metadata.Meta{uncovered, newest}, nil, nil)
 		testutil.Ok(t, err)
 		testutil.Equals(t, 0, len(plan))
 	})
 	t.Run("no shards, no stragglers", func(t *testing.T) {
 		p := WithBlockSplitting(fixedPlanner{}, log.NewNopLogger(), SplitConfig{MaxShards: 8}, nil, objstore.NewInMemBucket(), noopCounter(), view(), noMarks)
-		plan, err := p.Plan(context.Background(), group, nil, nil)
+		plan, err := p.Plan(t.Context(), group, nil, nil)
 		testutil.Ok(t, err)
 		testutil.Equals(t, 0, len(plan))
 	})
@@ -208,7 +208,7 @@ func TestShardStragglerPlanner(t *testing.T) {
 		downsampled := rangeMeta(21, shard("1_of_2"), 0, 400)
 		downsampled.Thanos.Downsample.Resolution = 300000
 		p := WithBlockSplitting(fixedPlanner{}, log.NewNopLogger(), SplitConfig{MaxShards: 8}, nil, objstore.NewInMemBucket(), noopCounter(), view(other, downsampled), noMarks)
-		plan, err := p.Plan(context.Background(), group, nil, nil)
+		plan, err := p.Plan(t.Context(), group, nil, nil)
 		testutil.Ok(t, err)
 		testutil.Equals(t, 0, len(plan))
 	})
@@ -219,28 +219,28 @@ func TestShardStragglerPlanner(t *testing.T) {
 		finer := rangeMeta(50, shard("5_of_8"), 100, 200)
 		p := WithBlockSplitting(fixedPlanner{}, log.NewNopLogger(), SplitConfig{MaxShards: 8}, nil, objstore.NewInMemBucket(), noopCounter(), view(finer), noMarks)
 		lone := rangeMeta(51, shard("1_of_4"), 0, 100)
-		plan, err := p.Plan(context.Background(), []*metadata.Meta{lone}, nil, nil)
+		plan, err := p.Plan(t.Context(), []*metadata.Meta{lone}, nil, nil)
 		testutil.Ok(t, err)
 		testutil.Equals(t, []*metadata.Meta{lone}, plan)
 		// A sibling lineage's refinement is not this block's problem.
 		p = WithBlockSplitting(fixedPlanner{}, log.NewNopLogger(), SplitConfig{MaxShards: 8}, nil, objstore.NewInMemBucket(), noopCounter(), view(rangeMeta(52, shard("2_of_8"), 100, 200)), noMarks)
-		plan, err = p.Plan(context.Background(), []*metadata.Meta{lone}, nil, nil)
+		plan, err = p.Plan(t.Context(), []*metadata.Meta{lone}, nil, nil)
 		testutil.Ok(t, err)
 		testutil.Equals(t, 0, len(plan))
 	})
 	t.Run("a shard block is a straggler only under finer shards of its lineage", func(t *testing.T) {
 		p := WithBlockSplitting(fixedPlanner{}, log.NewNopLogger(), SplitConfig{MaxShards: 8}, nil, objstore.NewInMemBucket(), noopCounter(), view(shards...), noMarks)
-		plan, err := p.Plan(context.Background(), []*metadata.Meta{rangeMeta(30, shard("1_of_2"), 0, 100), rangeMeta(31, shard("1_of_2"), 100, 200)}, nil, nil)
+		plan, err := p.Plan(t.Context(), []*metadata.Meta{rangeMeta(30, shard("1_of_2"), 0, 100), rangeMeta(31, shard("1_of_2"), 100, 200)}, nil, nil)
 		testutil.Ok(t, err)
 		testutil.Equals(t, 0, len(plan), "the covering shards are the block's own shard, not finer ones")
 
 		finer := []*metadata.Meta{rangeMeta(40, shard("1_of_4"), 0, 400), rangeMeta(41, shard("3_of_4"), 0, 400)}
 		p = WithBlockSplitting(fixedPlanner{}, log.NewNopLogger(), SplitConfig{MaxShards: 8}, nil, objstore.NewInMemBucket(), noopCounter(), view(finer...), noMarks)
-		plan, err = p.Plan(context.Background(), []*metadata.Meta{rangeMeta(30, shard("1_of_2"), 0, 100)}, nil, nil)
+		plan, err = p.Plan(t.Context(), []*metadata.Meta{rangeMeta(30, shard("1_of_2"), 0, 100)}, nil, nil)
 		testutil.Ok(t, err)
 		testutil.Equals(t, 1, len(plan), "1 of 2 is refined by 1 and 3 of 4")
 
-		plan, err = p.Plan(context.Background(), []*metadata.Meta{rangeMeta(32, shard("2_of_2"), 0, 100)}, nil, nil)
+		plan, err = p.Plan(t.Context(), []*metadata.Meta{rangeMeta(32, shard("2_of_2"), 0, 100)}, nil, nil)
 		testutil.Ok(t, err)
 		testutil.Equals(t, 0, len(plan), "2 of 2 is not refined by 1 and 3 of 4")
 	})
@@ -299,19 +299,19 @@ func TestPlannerNewestAcrossShards(t *testing.T) {
 	}
 
 	plain := &tsdbBasedPlanner{logger: log.NewNopLogger(), ranges: ranges, noCompBlocksFunc: noMarks}
-	plan, err := plain.Plan(context.Background(), group, nil, nil)
+	plan, err := plain.Plan(t.Context(), group, nil, nil)
 	testutil.Ok(t, err)
 	testutil.Equals(t, 0, len(plan), "without the stream view the last range is the newest and is left alone")
 
 	streamAware := (&tsdbBasedPlanner{logger: log.NewNopLogger(), ranges: ranges, noCompBlocksFunc: noMarks}).
 		WithStreamNewestAcrossShards(view(rangeMeta(10, unsplit, 400, 500)))
-	plan, err = streamAware.Plan(context.Background(), group, nil, nil)
+	plan, err = streamAware.Plan(t.Context(), group, nil, nil)
 	testutil.Ok(t, err)
 	testutil.Equals(t, 4, len(plan), "with a newer unsplit block in the stream the last range is planned")
 
 	sameStreamOnly := (&tsdbBasedPlanner{logger: log.NewNopLogger(), ranges: ranges, noCompBlocksFunc: noMarks}).
 		WithStreamNewestAcrossShards(view(rangeMeta(11, map[string]string{"tenant": "b"}, 400, 500)))
-	plan, err = sameStreamOnly.Plan(context.Background(), group, nil, nil)
+	plan, err = sameStreamOnly.Plan(t.Context(), group, nil, nil)
 	testutil.Ok(t, err)
 	testutil.Equals(t, 0, len(plan), "a newer block of another stream does not count")
 }
@@ -365,7 +365,7 @@ func TestStreamLeavesFunc(t *testing.T) {
 // shards; plans within the limit, or already at the target count, keep the
 // group's labels.
 func TestSplitPlannerPlanOutputs(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	base := map[string]string{"tenant": "a"}
 	shard := func(v string) map[string]string {
 		return map[string]string{"tenant": "a", metadata.CompactorShardLabel: v}
@@ -538,7 +538,7 @@ func (p candidatePlanner) Plan(_ context.Context, candidates []*metadata.Meta, _
 // itself: a shard group's plan is small in bytes, but its shard count leaves
 // no room under the cap.
 func TestSplitPlannerRefusesWhatTheCapCannotHold(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	shard := map[string]string{"tenant": "a", metadata.CompactorShardLabel: "1_of_8"}
 	big := metaWith(150*gib, 0, shard)
 	big.ULID = ulid.MustNew(1, nil)
@@ -586,7 +586,7 @@ func TestSplitPlannerRefusesWhatTheCapCannotHold(t *testing.T) {
 // measured in the bucket, as the index size filter measures it, instead of
 // counting as empty and leaving the plan under-split.
 func TestSplitPlannerLooksUpMissingIndexSizes(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	bkt := objstore.NewInMemBucket()
 	base := map[string]string{"tenant": "a"}
 	a, b := metaWith(0, 0, base), metaWith(0, 0, base)
@@ -620,7 +620,7 @@ func TestSplitPlannerLooksUpMissingIndexSizes(t *testing.T) {
 // that made them, and blocks that named them as siblings since - and nothing
 // else.
 func TestSplitPlannerPlanSiblings(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	shard := func(v string) map[string]string {
 		return map[string]string{"tenant": "a", metadata.CompactorShardLabel: v}
 	}
@@ -661,7 +661,7 @@ func TestSplitPlannerPlanSiblings(t *testing.T) {
 // failing planning, and it is not split towards a count the cap no longer
 // allows, which would only rewrite it as itself, pass after pass.
 func TestSplitPlannerStragglersRespectTheCap(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	shard := func(v string) map[string]string {
 		return map[string]string{"tenant": "a", metadata.CompactorShardLabel: v}
 	}
@@ -754,7 +754,7 @@ func TestSplitPlannerSiblingsReachThePlan(t *testing.T) {
 	testutil.Ok(t, cg.AppendMeta(next))
 
 	p := WithBlockSplitting(candidatePlanner{plan: []*metadata.Meta{a, next}}, log.NewNopLogger(), SplitConfig{MaxShards: 8, MaxSeries: 100}, nil, objstore.NewInMemBucket(), noopCounter(), func() map[ulid.ULID]*metadata.Meta { return all }, nil)
-	plan, err := cg.Plan(context.Background(), p, make(chan error, 1))
+	plan, err := cg.Plan(t.Context(), p, make(chan error, 1))
 	testutil.Ok(t, err)
 	testutil.Equals(t, []*metadata.Meta{a, next}, plan.Sources)
 	testutil.Equals(t, []ulid.ULID{b.ULID}, plan.Siblings, "b's set with a stays complete through the plan's outputs")
