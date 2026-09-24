@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -394,6 +395,9 @@ func (g *DefaultGrouper) Groups(blocks map[ulid.ULID]*metadata.Meta) (res []*Gro
 			if err != nil {
 				return nil, errors.Wrap(err, "create compaction group")
 			}
+			// A plan's siblings live in other groups; the view is what
+			// names them, whatever planner the compactor runs.
+			group.view = blocks
 			groups[groupKey] = group
 			res = append(res, group)
 		}
@@ -456,6 +460,9 @@ type Group struct {
 	blockFilesConcurrency         int
 	compactBlocksFetchConcurrency int
 	extensions                    any
+	// view is the synced view the group was cut from, if the grouper kept
+	// it: planning names a plan's siblings from it when the planner does not.
+	view map[ulid.ULID]*metadata.Meta
 }
 
 // NewGroup returns a new compaction group.
@@ -646,7 +653,7 @@ func (ps *CompactionProgressCalculator) ProgressCalculate(ctx context.Context, g
 	for len(groups) > 0 {
 		tmpGroups := make([]*Group, 0, len(groups))
 		for _, g := range groups {
-			if len(g.IDs()) == 1 {
+			if len(g.IDs()) == 1 && !plansSingleBlockGroups(ps.planner) {
 				continue
 			}
 			plan, err := ps.planner.Plan(ctx, g.metasByMinTime, nil, g.Extensions())
@@ -911,6 +918,17 @@ type Compactor interface {
 // Compact plans and runs a single compaction against the group. The compacted result
 // is uploaded into the bucket the blocks were retrieved from.
 func (cg *Group) Compact(ctx context.Context, dir string, planner Planner, comp Compactor, blockDeletableChecker BlockDeletableChecker, compactionLifecycleCallback CompactionLifecycleCallback) (shouldRerun bool, compIDs []ulid.ULID, rerr error) {
+	return cg.CompactWithExecutor(ctx, dir, planner, LocalPlanExecutor{
+		Comp:                   comp,
+		BlockDeletableChecker:  blockDeletableChecker,
+		Callback:               compactionLifecycleCallback,
+		MarkSourcesForDeletion: true,
+	})
+}
+
+// CompactWithExecutor plans a single compaction against the group and hands the
+// resulting plan to the given executor.
+func (cg *Group) CompactWithExecutor(ctx context.Context, dir string, planner Planner, executor PlanExecutor) (shouldRerun bool, compIDs []ulid.ULID, rerr error) {
 	cg.compactionRunsStarted.Inc()
 
 	subDir := filepath.Join(dir, cg.Key())
@@ -947,7 +965,7 @@ func (cg *Group) Compact(ctx context.Context, dir string, planner Planner, comp 
 
 	errChan := make(chan error, 1)
 	err := tracing.DoInSpanWithErr(ctx, "compaction_group", func(ctx context.Context) (err error) {
-		shouldRerun, compIDs, err = cg.compact(ctx, subDir, planner, comp, blockDeletableChecker, compactionLifecycleCallback, errChan)
+		shouldRerun, compIDs, err = cg.compact(ctx, subDir, planner, executor, errChan)
 		return err
 	}, opentracing.Tags{"group.key": cg.Key()})
 	errChan <- err
@@ -969,6 +987,13 @@ type Issue347Error struct {
 
 func issue347Error(err error, brokenBlock ulid.ULID) Issue347Error {
 	return Issue347Error{err: err, id: brokenBlock}
+}
+
+// NewIssue347Error returns an error that will invoke the repair process for the
+// given broken block. It is exported so that out-of-process executors can
+// reconstruct the error class reported by a remote worker.
+func NewIssue347Error(err error, brokenBlock ulid.ULID) error {
+	return issue347Error(err, brokenBlock)
 }
 
 func (e Issue347Error) Error() string {
@@ -995,10 +1020,43 @@ func outOfOrderChunkError(err error, brokenBlock ulid.ULID) OutOfOrderChunksErro
 	return OutOfOrderChunksError{err: err, id: brokenBlock}
 }
 
+// NewOutOfOrderChunksError returns an error signaling that the given block
+// contains out-of-order chunks. It is exported so that out-of-process executors
+// can reconstruct the error class reported by a remote worker.
+func NewOutOfOrderChunksError(err error, brokenBlock ulid.ULID) error {
+	return outOfOrderChunkError(err, brokenBlock)
+}
+
 // IsOutOfOrderChunkError returns true if the base error is a OutOfOrderChunkError.
 func IsOutOfOrderChunkError(err error) bool {
 	_, ok := errors.Cause(err).(OutOfOrderChunksError)
 	return ok
+}
+
+// partitionsCover checks that outputs which each hold one partition of the
+// sources' series together hold every series, from the tallies their
+// populators kept. The outputs of a plan replace its sources, so a series no
+// output kept would be lost with them. Partitions fail to cover when they do
+// not hash as the sources were partitioned: a shard block re-partitioned
+// with other labels left out of the hash holds series that none of the finer
+// partitions claims. An output without a partition holds every series.
+func partitionsCover(outputs []PlanOutput, stats []PartitionStats) error {
+	var walked, kept uint64
+	for i, out := range outputs {
+		if out.Series == nil {
+			return nil
+		}
+		if i > 0 && stats[i].Walked != walked {
+			return errors.Errorf("series partition %d of %d walked %d series of the sources where the first walked %d", out.Series.Index, out.Series.Count, stats[i].Walked, walked)
+		}
+		walked = stats[i].Walked
+		kept += stats[i].Kept
+	}
+	if kept != walked {
+		return errors.Errorf("the plan's %d series partitions together hold %d of the %d series of the sources, so the plan would lose the rest; "+
+			"a partition of a shard block must leave the same labels out of its hash as the shard was made with", len(outputs), kept, walked)
+	}
+	return nil
 }
 
 // HaltError is a type wrapper for errors that should halt any further progress on compactions.
@@ -1008,6 +1066,13 @@ type HaltError struct {
 
 func halt(err error) HaltError {
 	return HaltError{err: err}
+}
+
+// NewHaltError returns an error that will halt any further compaction progress.
+// It is exported so that out-of-process executors can reconstruct the error class
+// reported by a remote worker.
+func NewHaltError(err error) error {
+	return halt(err)
 }
 
 func (e HaltError) Error() string {
@@ -1163,17 +1228,28 @@ func RepairIssue347(ctx context.Context, logger log.Logger, bkt objstore.Bucket,
 	return nil
 }
 
-func (cg *Group) compact(ctx context.Context, dir string, planner Planner, comp Compactor, blockDeletableChecker BlockDeletableChecker, compactionLifecycleCallback CompactionLifecycleCallback, errChan chan error) (bool, []ulid.ULID, error) {
+// Plan runs the pre-compaction overlap check for the group and asks the planner
+// which blocks should be compacted next. An empty result means there is nothing
+// to do for this group right now.
+//
+// Planning is separated from execution so that the resulting plan can be handed
+// to an arbitrary PlanExecutor, possibly running in a different process.
+func (cg *Group) Plan(ctx context.Context, planner Planner, errChan chan error) (Plan, error) {
 	cg.mtx.Lock()
 	defer cg.mtx.Unlock()
 
+	return cg.planLocked(ctx, planner, errChan)
+}
+
+// planLocked implements Plan. Callers have to hold cg.mtx.
+func (cg *Group) planLocked(ctx context.Context, planner Planner, errChan chan error) (Plan, error) {
 	// Check for overlapped blocks.
 	overlappingBlocks := false
 	if err := cg.areBlocksOverlapping(nil); err != nil {
 		// TODO(bwplotka): It would really nice if we could still check for other overlaps than replica. In fact this should be checked
 		// in syncer itself. Otherwise with vertical compaction enabled we will sacrifice this important check.
 		if !cg.enableVerticalCompaction {
-			return false, nil, halt(errors.Wrap(err, "pre compaction overlap check"))
+			return Plan{}, halt(errors.Wrap(err, "pre compaction overlap check"))
 		}
 
 		overlappingBlocks = true
@@ -1184,21 +1260,86 @@ func (cg *Group) compact(ctx context.Context, dir string, planner Planner, comp 
 		toCompact, e = planner.Plan(ctx, cg.metasByMinTime, errChan, cg.Extensions())
 		return e
 	}); err != nil {
-		return false, nil, errors.Wrap(err, "plan compaction")
+		return Plan{}, errors.Wrap(err, "plan compaction")
 	}
 	if len(toCompact) == 0 {
-		// Nothing to do.
-		return false, nil, nil
+		return Plan{}, nil
 	}
 
+	plan := Plan{Sources: toCompact, OverlappingBlocks: overlappingBlocks}
+	if op, ok := planner.(OutputPlanner); ok {
+		outputs, err := op.PlanOutputs(ctx, cg, toCompact)
+		if err != nil {
+			return Plan{}, errors.Wrap(err, "plan compaction outputs")
+		}
+		for _, o := range outputs {
+			if o.Series != nil {
+				if err := o.Series.Validate(); err != nil {
+					return Plan{}, errors.Wrap(err, "plan compaction outputs")
+				}
+			}
+		}
+		plan.Outputs = outputs
+	}
+	// Sets outlive their members only if every plan names its siblings, so
+	// without a planner that does, the group's view does: a bucket holding
+	// sets needs them named whether or not what made the sets still runs.
+	if sp, ok := planner.(SiblingPlanner); ok {
+		siblings, err := sp.PlanSiblings(ctx, cg, toCompact)
+		if err != nil {
+			return Plan{}, errors.Wrap(err, "plan compaction siblings")
+		}
+		plan.Siblings = siblings
+	} else if cg.view != nil {
+		plan.Siblings = SetSiblings(cg.view, toCompact)
+	}
+	return plan, nil
+}
+
+// PlanExecutor executes a compaction plan produced for a group: it downloads the
+// plan's source blocks, compacts them into the plan's outputs and uploads the
+// resulting block(s) into the bucket the sources were retrieved from. It
+// returns the IDs of the blocks it produced. An empty result means the plan
+// yielded no data, because all source blocks were empty; an output whose
+// series partition is empty produces no block either.
+//
+// Implementations have to preserve the error taxonomy of this package
+// (HaltError, RetryError, Issue347Error, OutOfOrderChunksError), as the control
+// loop of BucketCompactor dispatches on it, and may return ErrPlanDeferred to
+// leave a plan for a later pass.
+type PlanExecutor interface {
+	Execute(ctx context.Context, dir string, cg *Group, plan Plan) ([]ulid.ULID, error)
+}
+
+// LocalPlanExecutor executes a compaction plan in the current process. It is the
+// default executor and implements the behavior the compactor has always had.
+type LocalPlanExecutor struct {
+	Comp                  Compactor
+	BlockDeletableChecker BlockDeletableChecker
+	Callback              CompactionLifecycleCallback
+
+	// PreUploadCheck, if non-nil, is called once compaction has finished but
+	// before each resulting block is uploaded. Returning an error aborts the
+	// execution without uploading the block.
+	PreUploadCheck func(ctx context.Context, cg *Group, compIDs []ulid.ULID) error
+
+	// MarkSourcesForDeletion controls whether source blocks are marked for
+	// deletion in the bucket once the compacted result has been uploaded. It is
+	// true for the in-process compactor.
+	MarkSourcesForDeletion bool
+}
+
+// Execute implements PlanExecutor.
+func (ex LocalPlanExecutor) Execute(ctx context.Context, dir string, cg *Group, plan Plan) ([]ulid.ULID, error) {
+	toCompact, overlappingBlocks := plan.Sources, plan.OverlappingBlocks
 	level.Info(cg.logger).Log("msg", "compaction available and planned", "plan", fmt.Sprintf("%v", toCompact))
 
 	// Once we have a plan we need to download the actual data.
 	groupCompactionBegin := time.Now()
 	begin := groupCompactionBegin
 
-	if err := compactionLifecycleCallback.PreCompactionCallback(ctx, cg.logger, cg, toCompact); err != nil {
-		return false, nil, errors.Wrapf(err, "failed to run pre compaction callback for plan: %s", fmt.Sprintf("%v", toCompact))
+	if err := ex.Callback.PreCompactionCallback(ctx, cg.logger, cg, toCompact); err != nil {
+		return nil, errors.Wrapf(err, "failed to run pre compaction callback for plan: %s", fmt.Sprintf("%v", toCompact))
 	}
 	level.Info(cg.logger).Log("msg", "finished running pre compaction callback; downloading blocks", "duration", time.Since(begin), "duration_ms", time.Since(begin).Milliseconds(), "plan", fmt.Sprintf("%v", toCompact))
 
@@ -1255,35 +1396,72 @@ func (cg *Group) compact(ctx context.Context, dir string, planner Planner, comp 
 	sourceBlockStr := fmt.Sprintf("%v", toCompactDirs)
 
 	if err := g.Wait(); err != nil {
-		return false, nil, err
+		return nil, err
 	}
 
 	level.Info(cg.logger).Log("msg", "downloaded and verified blocks; compacting blocks", "duration", time.Since(begin), "duration_ms", time.Since(begin).Milliseconds(), "plan", sourceBlockStr)
 
+	// outputs are the blocks to produce; a plan that names none produces
+	// the one block the compactor has always produced.
+	outputs := plan.Outputs
+	if len(outputs) == 0 {
+		outputs = []PlanOutput{{}}
+	}
+	// outputOf remembers which output each result block is, for its labels
+	// and its place in the set the plan produces.
+	type producedBy struct {
+		output PlanOutput
+		index  int
+	}
+	outputOf := make(map[ulid.ULID]producedBy, len(outputs))
+
 	begin = time.Now()
 	var compIDs []ulid.ULID
 	if err := tracing.DoInSpanWithErr(ctx, "compaction", func(ctx context.Context) (e error) {
-		populateBlockFunc, e := compactionLifecycleCallback.GetBlockPopulator(ctx, cg.logger, cg)
+		populateBlockFunc, e := ex.Callback.GetBlockPopulator(ctx, cg.logger, cg)
 		if e != nil {
 			return e
 		}
-		compIDs, e = comp.CompactWithBlockPopulator(dir, toCompactDirs, nil, populateBlockFunc)
-		return e
+		if len(outputs) > 1 {
+			level.Info(cg.logger).Log("msg", "compacting into several blocks", "outputs", len(outputs), "plan", sourceBlockStr)
+		}
+		stats := make([]PartitionStats, len(outputs))
+		for i, out := range outputs {
+			populator := populateBlockFunc
+			if out.Series != nil {
+				if _, isDefault := populateBlockFunc.(tsdb.DefaultBlockPopulator); !isDefault {
+					return errors.Errorf("cannot partition a compaction whose lifecycle callback provides its own block populator (%T)", populateBlockFunc)
+				}
+				populator = PartitionedBlockPopulator{Partition: *out.Series, Stats: &stats[i]}
+			}
+			ids, err := ex.Comp.CompactWithBlockPopulator(dir, toCompactDirs, nil, populator)
+			if err != nil {
+				if out.Series != nil {
+					return errors.Wrapf(err, "series partition %d of %d", out.Series.Index, out.Series.Count)
+				}
+				return err
+			}
+			for _, id := range ids {
+				outputOf[id] = producedBy{output: out, index: i}
+			}
+			compIDs = append(compIDs, ids...)
+		}
+		return partitionsCover(outputs, stats)
 	}); err != nil {
-		return false, nil, halt(errors.Wrapf(err, "compact blocks %v", toCompactDirs))
+		return nil, halt(errors.Wrapf(err, "compact blocks %v", toCompactDirs))
 	}
 	if len(compIDs) == 0 {
 		// No compacted blocks means all compacted blocks are of no sample.
 		level.Info(cg.logger).Log("msg", "no compacted blocks, deleting source blocks", "blocks", sourceBlockStr)
 		for _, meta := range toCompact {
-			if meta.Stats.NumSamples == 0 {
-				if err := cg.deleteBlock(meta.ULID, filepath.Join(dir, meta.ULID.String()), blockDeletableChecker); err != nil {
+			if ex.MarkSourcesForDeletion && meta.Stats.NumSamples == 0 {
+				if err := cg.deleteBlock(meta.ULID, filepath.Join(dir, meta.ULID.String()), ex.BlockDeletableChecker); err != nil {
 					level.Warn(cg.logger).Log("msg", "failed to mark for deletion an empty block found during compaction", "block", meta.ULID)
 				}
 			}
 		}
 		// Even though no compacted blocks, there may be more work to do.
-		return true, nil, nil
+		return nil, nil
 	}
 	cg.compactions.Inc()
 	if overlappingBlocks {
@@ -1302,12 +1480,12 @@ func (cg *Group) compact(ctx context.Context, dir string, planner Planner, comp 
 		index := filepath.Join(bdir, block.IndexFilename)
 
 		if err := os.Remove(filepath.Join(bdir, "tombstones")); err != nil {
-			return false, nil, errors.Wrap(err, "remove tombstones")
+			return nil, errors.Wrap(err, "remove tombstones")
 		}
 
 		newMeta, err := metadata.ReadFromDir(bdir)
 		if err != nil {
-			return false, nil, errors.Wrap(err, "read new meta")
+			return nil, errors.Wrap(err, "read new meta")
 		}
 
 		var stats block.HealthStats
@@ -1320,15 +1498,38 @@ func (cg *Group) compact(ctx context.Context, dir string, planner Planner, comp 
 			return stats.AnyErr()
 		})
 		if !cg.acceptMalformedIndex && err != nil {
-			return false, nil, halt(errors.Wrapf(err, "invalid result block %s", bdir))
+			return nil, halt(errors.Wrapf(err, "invalid result block %s", bdir))
 		}
 
+		outLabels := cg.labels.Map()
+		if l := outputOf[compID].output.Labels; l != nil {
+			outLabels = maps.Clone(l)
+		}
 		thanosMeta := metadata.Thanos{
-			Labels:       cg.labels.Map(),
+			Labels:       outLabels,
 			Downsample:   metadata.ThanosDownsample{Resolution: cg.resolution},
 			Source:       metadata.CompactorSource,
 			SegmentFiles: block.GetSegmentFiles(bdir),
 			Extensions:   cg.Extensions(),
+		}
+		if len(plan.Outputs) > 0 || len(plan.Siblings) > 0 {
+			// The outputs of a plan replace the sources as a set, and only a
+			// complete set may: each block records the whole set, so that a
+			// reader seeing one of them knows what else has to be there. The
+			// set also names the plan's siblings, so that they keep a
+			// complete set once the sources they shared one with are gone.
+			set := make([]ulid.ULID, 0, len(compIDs)+len(plan.Siblings))
+			set = append(set, compIDs...)
+			for _, sibling := range plan.Siblings {
+				if !slices.Contains(set, sibling) {
+					set = append(set, sibling)
+				}
+			}
+			thanosMeta.Output = &metadata.ThanosOutput{
+				Index:  outputOf[compID].index,
+				Count:  len(outputs),
+				Blocks: set,
+			}
 		}
 		if stats.ChunkMaxSize > 0 {
 			thanosMeta.IndexStats.ChunkMaxSize = stats.ChunkMaxSize
@@ -1338,28 +1539,34 @@ func (cg *Group) compact(ctx context.Context, dir string, planner Planner, comp 
 		}
 		newMeta, err = metadata.InjectThanos(cg.logger, bdir, thanosMeta, nil)
 		if err != nil {
-			return false, nil, errors.Wrapf(err, "failed to finalize the block %s", bdir)
+			return nil, errors.Wrapf(err, "failed to finalize the block %s", bdir)
 		}
 		// Ensure the output block is not overlapping with anything else,
 		// unless vertical compaction is enabled.
 		if !cg.enableVerticalCompaction {
 			if err := cg.areBlocksOverlapping(newMeta, toCompact...); err != nil {
-				return false, nil, halt(errors.Wrapf(err, "resulted compacted block %s overlaps with something", bdir))
+				return nil, halt(errors.Wrapf(err, "resulted compacted block %s overlaps with something", bdir))
 			}
 		}
 
 		begin = time.Now()
 
+		if ex.PreUploadCheck != nil {
+			if err := ex.PreUploadCheck(ctx, cg, compIDs); err != nil {
+				return nil, errors.Wrapf(err, "run pre upload check for result block %s", compID)
+			}
+		}
+
 		err = tracing.DoInSpanWithErr(ctx, "compaction_block_upload", func(ctx context.Context) error {
 			return block.Upload(ctx, cg.logger, cg.bkt, bdir, cg.hashFunc, objstore.WithUploadConcurrency(cg.blockFilesConcurrency))
 		})
 		if err != nil {
-			return false, nil, retry(errors.Wrapf(err, "upload of %s failed", compID))
+			return nil, retry(errors.Wrapf(err, "upload of %s failed", compID))
 		}
 		level.Info(cg.logger).Log("msg", "uploaded block", "result_block", compID, "duration", time.Since(begin), "duration_ms", time.Since(begin).Milliseconds())
 		level.Info(cg.logger).Log("msg", "running post compaction callback", "result_block", compID)
-		if err := compactionLifecycleCallback.PostCompactionCallback(ctx, cg.logger, cg, compID); err != nil {
-			return false, nil, retry(errors.Wrapf(err, "failed to run post compaction callback for result block %s", compID))
+		if err := ex.Callback.PostCompactionCallback(ctx, cg.logger, cg, compID); err != nil {
+			return nil, retry(errors.Wrapf(err, "failed to run post compaction callback for result block %s", compID))
 		}
 		level.Info(cg.logger).Log("msg", "finished running post compaction callback", "result_block", compID)
 	}
@@ -1368,16 +1575,46 @@ func (cg *Group) compact(ctx context.Context, dir string, planner Planner, comp 
 	// into the next planning cycle.
 	// Eventually the block we just uploaded should get synced into the group again (including sync-delay).
 	for _, meta := range toCompact {
+		if !ex.MarkSourcesForDeletion {
+			continue
+		}
 		if err := tracing.DoInSpanWithErr(ctx, "compaction_block_delete", func(ctx context.Context) error {
-			return cg.deleteBlock(meta.ULID, filepath.Join(dir, meta.ULID.String()), blockDeletableChecker)
+			return cg.deleteBlock(meta.ULID, filepath.Join(dir, meta.ULID.String()), ex.BlockDeletableChecker)
 		}, opentracing.Tags{"block.id": meta.ULID}); err != nil {
-			return false, nil, retry(errors.Wrapf(err, "mark old block for deletion from bucket"))
+			return nil, retry(errors.Wrapf(err, "mark old block for deletion from bucket"))
 		}
 		cg.groupGarbageCollectedBlocks.Inc()
 	}
 
 	level.Info(cg.logger).Log("msg", "finished compacting blocks", "duration", time.Since(groupCompactionBegin),
 		"duration_ms", time.Since(groupCompactionBegin).Milliseconds(), "result_blocks", compIDStrs, "source_blocks", sourceBlockStr)
+	return compIDs, nil
+}
+
+func (cg *Group) compact(ctx context.Context, dir string, planner Planner, executor PlanExecutor, errChan chan error) (bool, []ulid.ULID, error) {
+	cg.mtx.Lock()
+	defer cg.mtx.Unlock()
+
+	plan, err := cg.planLocked(ctx, planner, errChan)
+	if err != nil {
+		return false, nil, err
+	}
+	if plan.Empty() {
+		// Nothing to do.
+		return false, nil, nil
+	}
+
+	compIDs, err := executor.Execute(ctx, dir, cg, plan)
+	if err != nil {
+		if errors.Is(err, ErrPlanDeferred) {
+			// The executor chose to sit this plan out. No rerun: replanning
+			// would produce the same plan and defer it again, forever.
+			return false, nil, nil
+		}
+		return false, nil, err
+	}
+
+	// Even if no blocks were produced, because all sources were empty, there may be more work to do.
 	return true, compIDs, nil
 }
 
@@ -1403,10 +1640,8 @@ type BucketCompactor struct {
 	logger                         log.Logger
 	sy                             *Syncer
 	grouper                        Grouper
-	comp                           Compactor
 	planner                        Planner
-	blockDeletableChecker          BlockDeletableChecker
-	compactionLifecycleCallback    CompactionLifecycleCallback
+	planExecutor                   PlanExecutor
 	compactDir                     string
 	bkt                            objstore.Bucket
 	concurrency                    int
@@ -1463,14 +1698,52 @@ func NewBucketCompactorWithCheckerAndCallback(
 	if concurrency <= 0 {
 		return nil, errors.Errorf("invalid concurrency level (%d), concurrency level must be > 0", concurrency)
 	}
+	return NewBucketCompactorWithExecutor(
+		logger,
+		sy,
+		grouper,
+		planner,
+		LocalPlanExecutor{
+			Comp:                   comp,
+			BlockDeletableChecker:  blockDeletableChecker,
+			Callback:               compactionLifecycleCallback,
+			MarkSourcesForDeletion: true,
+		},
+		compactDir,
+		bkt,
+		concurrency,
+		skipBlocksWithOutOfOrderChunks,
+		blocksCleaner,
+	)
+}
+
+// NewBucketCompactorWithExecutor creates a new bucket compactor that hands every
+// compaction plan it produces to the given executor. It is the injection point
+// for executing compaction outside of this process.
+func NewBucketCompactorWithExecutor(
+	logger log.Logger,
+	sy *Syncer,
+	grouper Grouper,
+	planner Planner,
+	planExecutor PlanExecutor,
+	compactDir string,
+	bkt objstore.Bucket,
+	concurrency int,
+	skipBlocksWithOutOfOrderChunks bool,
+	blocksCleaner *BlocksCleaner,
+) (*BucketCompactor, error) {
+	if concurrency <= 0 {
+		return nil, errors.Errorf("invalid concurrency level (%d), concurrency level must be > 0", concurrency)
+	}
+	if planExecutor == nil {
+		return nil, errors.New("plan executor must not be nil")
+	}
 	return &BucketCompactor{
 		logger:                         logger,
 		sy:                             sy,
 		grouper:                        grouper,
 		planner:                        planner,
-		comp:                           comp,
-		blockDeletableChecker:          blockDeletableChecker,
-		compactionLifecycleCallback:    compactionLifecycleCallback,
+		planExecutor:                   planExecutor,
 		compactDir:                     compactDir,
 		bkt:                            bkt,
 		concurrency:                    concurrency,
@@ -1510,7 +1783,7 @@ func (c *BucketCompactor) Compact(ctx context.Context) (rerr error) {
 		for i := 0; i < c.concurrency; i++ {
 			wg.Go(func() {
 				for g := range groupChan {
-					shouldRerunGroup, _, err := g.Compact(workCtx, c.compactDir, c.planner, c.comp, c.blockDeletableChecker, c.compactionLifecycleCallback)
+					shouldRerunGroup, _, err := g.CompactWithExecutor(workCtx, c.compactDir, c.planner, c.planExecutor)
 					if err == nil {
 						if shouldRerunGroup {
 							mtx.Lock()
@@ -1594,8 +1867,9 @@ func (c *BucketCompactor) Compact(ctx context.Context) (rerr error) {
 		var groupErrs errutil.MultiError
 	groupLoop:
 		for _, g := range groups {
-			// Ignore groups with only one block because there is nothing to compact.
-			if len(g.IDs()) == 1 {
+			// Ignore groups with only one block because there is nothing to
+			// compact, unless the planner has work for such groups.
+			if len(g.IDs()) == 1 && !plansSingleBlockGroups(c.planner) {
 				continue
 			}
 			select {

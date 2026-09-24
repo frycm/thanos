@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/go-kit/log"
@@ -105,9 +106,69 @@ type Thanos struct {
 	// Extensions are used for plugin any arbitrary additional information for block. Optional.
 	Extensions any `json:"extensions,omitempty"`
 
+	// Output, when present, records the block's place among the blocks one
+	// compaction produced together. Such blocks replace their sources only as
+	// a set: until every block of the set is in the bucket, the sources are
+	// the only complete copy of the data, and readers must not let one of the
+	// set supersede them. Optional; absent for a compaction whose plan named
+	// neither outputs nor siblings.
+	Output *ThanosOutput `json:"output,omitempty"`
+
 	// UploadTime is used to track when the meta.json file was uploaded to the object storage
 	// without an extra Attributes call. Used for consistency filter.
 	UploadTime time.Time `json:"upload_time,omitempty"`
+}
+
+// ThanosOutput is the block's place among the blocks one compaction produced.
+type ThanosOutput struct {
+	// Index of the output the block is, among the Count outputs the plan named.
+	Index int `json:"index"`
+	Count int `json:"count"`
+	// Blocks are every block the compaction produced, this one included, in
+	// no particular order, and any block outside the compaction the outputs
+	// complete a set with: the blocks the compaction's sources shared their
+	// own set with, which keep a complete set this way once the sources are
+	// gone. A planned output missing from it held no series. The set is
+	// published once every block in it exists, and so is every block a
+	// published set names.
+	Blocks []ulid.ULID `json:"blocks"`
+}
+
+// Published reports whether every block of the block's own set is present,
+// as told by exists. A block without an Output is its own set, and so is a
+// block whose Output does not name it: such a set was copied from a source
+// by a tool that kept the source's metadata, and says nothing about this
+// block. A block whose own set is incomplete may still be published by
+// another block's complete set that names it; readers with a view of every
+// block judge that, see block.DefaultDeduplicateFilter.
+func (m *Thanos) Published(id ulid.ULID, exists func(ulid.ULID) bool) bool {
+	if m.Output == nil || !slices.Contains(m.Output.Blocks, id) {
+		return true
+	}
+	for _, sibling := range m.Output.Blocks {
+		if !exists(sibling) {
+			return false
+		}
+	}
+	return true
+}
+
+// RenameInOutput makes a copy of a block, written under a new ID by a tool
+// that keeps the block's metadata, take the original's place in the block's
+// set. Without it the copy's set would not name the copy: the copy could
+// neither complete the set nor keep the blocks the set names published once
+// the original is gone.
+func (m *Thanos) RenameInOutput(from, to ulid.ULID) {
+	if m.Output == nil {
+		return
+	}
+	blocks := slices.Clone(m.Output.Blocks)
+	for i, id := range blocks {
+		if id == from {
+			blocks[i] = to
+		}
+	}
+	m.Output = &ThanosOutput{Index: m.Output.Index, Count: m.Output.Count, Blocks: blocks}
 }
 
 type IndexStats struct {

@@ -18,6 +18,8 @@ It is recommend to upgrade the storage components first (Receive, Store, etc.) a
 
 ### Added
 
+- [#4](https://github.com/frycm/thanos/issues/4) Compact: blocks record the set of blocks their compaction produced (`thanos.output` in `meta.json`) and replace their sources only once the whole set is uploaded; blocks of an incomplete set are withheld from compaction and downsampling and counted as `state="unpublished"` in `thanos_blocks_meta_synced`.
+
 ### Changed
 
 ### Removed

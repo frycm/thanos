@@ -18,6 +18,7 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/oklog/run"
+	"github.com/oklog/ulid/v2"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
@@ -235,6 +236,9 @@ func runCompact(
 	// This is to make sure compactor will not accidentally perform compactions with gap instead.
 	ignoreDeletionMarkFilter := block.NewIgnoreDeletionMarkFilter(logger, insBkt, deleteDelay/2, conf.blockMetaFetchConcurrency)
 	duplicateBlocksFilter := block.NewDeduplicateFilter(conf.blockMetaFetchConcurrency)
+	// A compactor must not compact, downsample or retire around the staged
+	// outputs of a plan that has not replaced its sources.
+	duplicateBlocksFilter.HideUnpublished()
 	noCompactMarkerFilter := compact.NewGatherNoCompactionMarkFilter(logger, insBkt, conf.blockMetaFetchConcurrency)
 	noDownsampleMarkerFilter := downsample.NewGatherNoDownsampleMarkFilter(logger, insBkt, conf.blockMetaFetchConcurrency)
 	labelShardedMetaFilter := block.NewLabelShardedMetaFilter(relabelConfig)
@@ -330,19 +334,9 @@ func runCompact(
 		}
 	}()
 
-	var mergeFunc storage.VerticalChunkSeriesMergeFunc
-	switch conf.dedupFunc {
-	case compact.DedupAlgorithmPenalty:
-		mergeFunc = dedup.NewChunkSeriesMerger()
-
-		if len(dedupReplicaLabels) == 0 {
-			return errors.New("penalty based deduplication needs at least one replica label specified")
-		}
-	case "":
-		mergeFunc = storage.NewCompactingChunkSeriesMerger(storage.ChainedSeriesMerge)
-
-	default:
-		return errors.Errorf("unsupported deduplication func, got %s", conf.dedupFunc)
+	mergeFunc, err := dedupFuncFor(conf)
+	if err != nil {
+		return err
 	}
 
 	// Instantiate the compactor with different time slices. Timestamps in TSDB
@@ -393,12 +387,39 @@ func runCompact(
 		planner = largeIndexFilterPlanner
 	}
 	blocksCleaner := compact.NewBlocksCleaner(logger, insBkt, ignoreDeletionMarkFilter, deleteDelay, compactMetrics.blocksCleaned, compactMetrics.blockCleanupFailures)
-	compactor, err := compact.NewBucketCompactor(
+
+	// How a plan is executed and how blocks are downsampled are chosen here,
+	// once: the compaction and downsampling loops below only call them.
+	localExecutor := compact.LocalPlanExecutor{
+		Comp:                   comp,
+		BlockDeletableChecker:  compact.DefaultBlockDeletableChecker{},
+		Callback:               compact.DefaultCompactionLifecycleCallback{},
+		MarkSourcesForDeletion: true,
+	}
+
+	var planExecutor compact.PlanExecutor = localExecutor
+	downsampleBlocks := func(ctx context.Context, metas map[ulid.ULID]*metadata.Meta, opts downsample.PlanOptions) error {
+		return downsampleBucket(
+			ctx,
+			logger,
+			downsampleMetrics,
+			insBkt,
+			metas,
+			opts,
+			downsamplingDir,
+			conf.downsampleConcurrency,
+			conf.blockFilesConcurrency,
+			metadata.HashFunc(conf.hashFunc),
+			conf.acceptMalformedIndex,
+		)
+	}
+
+	compactor, err := compact.NewBucketCompactorWithExecutor(
 		logger,
 		sy,
 		grouper,
 		planner,
-		comp,
+		planExecutor,
 		compactDir,
 		insBkt,
 		conf.compactionConcurrency,
@@ -460,10 +481,6 @@ func runCompact(
 			}
 
 			filteredMetas := sy.Metas()
-			noDownsampleBlocks := noDownsampleMarkerFilter.NoDownsampleMarkedBlocks()
-			for ul := range noDownsampleBlocks {
-				delete(filteredMetas, ul)
-			}
 
 			for _, meta := range filteredMetas {
 				resolutionLabel := meta.Thanos.ResolutionString()
@@ -471,18 +488,9 @@ func runCompact(
 				downsampleMetrics.downsampleFailures.WithLabelValues(resolutionLabel)
 			}
 
-			if err := downsampleBucket(
-				ctx,
-				logger,
-				downsampleMetrics,
-				insBkt,
-				filteredMetas,
-				downsamplingDir,
-				conf.downsampleConcurrency,
-				conf.blockFilesConcurrency,
-				metadata.HashFunc(conf.hashFunc),
-				conf.acceptMalformedIndex,
-			); err != nil {
+			if err := downsampleBlocks(ctx, filteredMetas, downsample.PlanOptions{
+				NoDownsampleMarked: noDownsampleMarkerFilter.NoDownsampleMarkedBlocks(),
+			}); err != nil {
 				return errors.Wrap(err, "first pass of downsampling failed")
 			}
 
@@ -494,23 +502,10 @@ func runCompact(
 			// Regenerate the filtered list of blocks after the sync,
 			// to include the blocks created by the first pass.
 			filteredMetas = sy.Metas()
-			noDownsampleBlocks = noDownsampleMarkerFilter.NoDownsampleMarkedBlocks()
-			for ul := range noDownsampleBlocks {
-				delete(filteredMetas, ul)
-			}
 
-			if err := downsampleBucket(
-				ctx,
-				logger,
-				downsampleMetrics,
-				insBkt,
-				filteredMetas,
-				downsamplingDir,
-				conf.downsampleConcurrency,
-				conf.blockFilesConcurrency,
-				metadata.HashFunc(conf.hashFunc),
-				conf.acceptMalformedIndex,
-			); err != nil {
+			if err := downsampleBlocks(ctx, filteredMetas, downsample.PlanOptions{
+				NoDownsampleMarked: noDownsampleMarkerFilter.NoDownsampleMarkedBlocks(),
+			}); err != nil {
 				return errors.Wrap(err, "second pass of downsampling failed")
 			}
 
@@ -524,7 +519,15 @@ func runCompact(
 			return errors.Wrap(err, "sync before retention")
 		}
 
-		if err := compact.ApplyRetentionPolicyByResolution(ctx, logger, insBkt, sy.Metas(), retentionByResolution, compactMetrics.blocksMarked.WithLabelValues(metadata.DeletionMarkFilename, "")); err != nil {
+		// Blocks withheld as unpublished are out of the synced view, but not
+		// out of retention: a staged output whose plan never completes would
+		// otherwise outlive its sources, and store gateways, which do not
+		// withhold it, would serve it past the retention.
+		retentionView := sy.Metas()
+		for _, m := range duplicateBlocksFilter.Unpublished() {
+			retentionView[m.ULID] = m
+		}
+		if err := compact.ApplyRetentionPolicyByResolution(ctx, logger, insBkt, retentionView, retentionByResolution, compactMetrics.blocksMarked.WithLabelValues(metadata.DeletionMarkFilename, "")); err != nil {
 			return errors.Wrap(err, "retention failed")
 		}
 
@@ -856,4 +859,20 @@ func (cc *compactConfig) registerFlag(cmd extkingpin.FlagClause) {
 	cmd.Flag("bucket-web-label", "External block label to use as group title in the bucket web UI").StringVar(&cc.label)
 
 	cmd.Flag("disable-admin-operations", "Disable UI/API admin operations like marking blocks for deletion and no compaction.").Default("false").BoolVar(&cc.disableAdminOperations)
+}
+
+// dedupFuncFor returns the vertical merge function --deduplication.func
+// selects, after checking the flags it depends on.
+func dedupFuncFor(conf compactConfig) (storage.VerticalChunkSeriesMergeFunc, error) {
+	switch conf.dedupFunc {
+	case compact.DedupAlgorithmPenalty:
+		if len(strutil.ParseFlagLabels(conf.dedupReplicaLabels)) == 0 {
+			return nil, errors.New("penalty based deduplication needs at least one replica label specified")
+		}
+		return dedup.NewChunkSeriesMerger(), nil
+	case "":
+		return storage.NewCompactingChunkSeriesMerger(storage.ChainedSeriesMerge), nil
+	default:
+		return nil, errors.Errorf("unsupported deduplication func, got %s", conf.dedupFunc)
+	}
 }
