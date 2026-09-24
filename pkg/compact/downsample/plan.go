@@ -20,14 +20,25 @@ type Candidate struct {
 	TargetResolution int64
 }
 
+// PlanOptions is what Plan is told beyond the blocks themselves. The zero value
+// plans as if no block were marked.
+type PlanOptions struct {
+	// NoDownsampleMarked are the blocks an operator marked not to be
+	// downsampled. They are never candidates, and their downsampled blocks do
+	// not count as coverage, as if they were out of view. They stay in the
+	// metas Plan is given, so that planning sees every block the compactor
+	// does.
+	NoDownsampleMarked map[ulid.ULID]*metadata.NoDownsampleMark
+}
+
 // Plan returns the blocks that need downsampling, in a deterministic order.
 //
 // A block is a candidate when no downsampled block covering all of its sources
-// exists yet, and it spans enough time to yield roughly two chunks at the target
-// resolution. Planning is separated from doing the work so that the same
-// decision can drive either downsampling in process or dispatching the work to
-// a worker.
-func Plan(metas map[ulid.ULID]*metadata.Meta) ([]Candidate, error) {
+// exists yet, it is not marked no-downsample, and it spans enough time to
+// yield roughly two chunks at the target resolution. Planning is separated
+// from doing the work so that the same decision can drive either downsampling
+// in process or dispatching the work to a worker.
+func Plan(metas map[ulid.ULID]*metadata.Meta, opts PlanOptions) ([]Candidate, error) {
 	// Blocks whose sources are already covered by a downsampled block do not need
 	// downsampling again. Coverage is per block stream and shard: the shards of
 	// a compaction split by series record the same sources while each holds
@@ -40,6 +51,9 @@ func Plan(metas map[ulid.ULID]*metadata.Meta) ([]Candidate, error) {
 	sources1h := coverage{}
 
 	for _, m := range metas {
+		if _, marked := opts.NoDownsampleMarked[m.ULID]; marked {
+			continue
+		}
 		switch m.Thanos.Downsample.Resolution {
 		case ResLevel0:
 			continue
@@ -61,6 +75,11 @@ func Plan(metas map[ulid.ULID]*metadata.Meta) ([]Candidate, error) {
 	var candidates []Candidate
 	for _, id := range ids {
 		m := metas[id]
+
+		// The operator said not to.
+		if _, ok := opts.NoDownsampleMarked[id]; ok {
+			continue
+		}
 
 		switch m.Thanos.Downsample.Resolution {
 		case ResLevel2:
