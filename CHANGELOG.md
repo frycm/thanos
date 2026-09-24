@@ -18,7 +18,7 @@ It is recommend to upgrade the storage components first (Receive, Store, etc.) a
 
 ### Added
 
-- [#8](https://github.com/frycm/thanos/issues/8) Store: `--min-block-resolution` and `--max-block-resolution` serve blocks by downsampling resolution. A block below the minimum is hidden only while retained blocks at the minimum cover all its sources over its whole time range, for every series it holds; otherwise it is served, and counted in `thanos_store_resolution_filter_uncovered_blocks`. A request asking for finer data than the minimum gets a warning when hidden blocks leave part of its answer missing.
+- [#8](https://github.com/frycm/thanos/issues/8) Store: add `--min-block-resolution` and `--max-block-resolution` to serve blocks by downsampling resolution; a finer block is hidden only while blocks at the minimum resolution cover all of its data.
 
 ### Changed
 
