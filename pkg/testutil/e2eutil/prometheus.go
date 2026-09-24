@@ -603,20 +603,20 @@ func createBlock(
 					var err error
 
 					var sampleType = sampleTypes[si.Add(1)%int64(len(sampleTypes))]
-					t := t
+					ts := t
 					if offset != nil {
-						t += offset(lset)
+						ts += offset(lset)
 					}
 
 					switch sampleType {
 					case chunkenc.ValFloat:
 						randMutex.Lock()
-						_, err = app.Append(0, lset, t, r.Float64())
+						_, err = app.Append(0, lset, ts, r.Float64())
 						randMutex.Unlock()
 					case chunkenc.ValHistogram:
-						_, err = app.AppendHistogram(0, lset, t, &histogramSample, nil)
+						_, err = app.AppendHistogram(0, lset, ts, &histogramSample, nil)
 					case chunkenc.ValFloatHistogram:
-						_, err = app.AppendHistogram(0, lset, t, nil, &floatHistogramSample)
+						_, err = app.AppendHistogram(0, lset, ts, nil, &floatHistogramSample)
 					}
 
 					if err != nil {

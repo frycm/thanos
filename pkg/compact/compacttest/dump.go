@@ -24,7 +24,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
-	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
@@ -187,9 +186,7 @@ func (d *BucketDump) ReadBlock(t *testing.T, ctx context.Context, bkt objstore.B
 			d.Series[key] = byAggr
 			// The external labels as the key has them - which is how a
 			// store gateway serves them - merged into the series labels.
-			extLabels, err := parser.ParseMetric(ext)
-			testutil.Ok(t, err)
-			lb := labels.NewBuilder(extLabels)
+			lb := labels.NewBuilder(labels.FromMap(m.Thanos.Labels))
 			builder.Labels().Range(func(l labels.Label) { lb.Set(strings.Clone(l.Name), strings.Clone(l.Value)) })
 			d.keys[key] = dumpKey{res: m.Thanos.Downsample.Resolution, lset: lb.Labels()}
 		}
@@ -346,9 +343,8 @@ func (d *BucketDump) Without(ext func(string) bool) *BucketDump {
 // resolution and labels without the replica labels, the samples of every
 // replica, per aggregate.
 func (d *BucketDump) replicaGroups(replicaLabels []string) map[string][]map[downsample.AggrType][]Sample {
-	out := map[string][]map[downsample.AggrType][]Sample{}
-	keys := slices.Sorted(maps.Keys(d.Series))
-	for _, k := range keys {
+	out := make(map[string][]map[downsample.AggrType][]Sample, len(d.Series))
+	for _, k := range slices.Sorted(maps.Keys(d.Series)) {
 		dk := d.keys[k]
 		key := fmt.Sprintf("res=%d series=%s", dk.res, labels.NewBuilder(dk.lset).Del(replicaLabels...).Labels().String())
 		out[key] = append(out[key], d.Series[k])
@@ -378,7 +374,7 @@ func penaltySequences(t *testing.T, replicas [][]Sample, counter bool) map[strin
 			var all []Sample
 			series := make([]storage.Series, 0, len(order))
 			for _, r := range order {
-				var encoded []chunks.Sample
+				encoded := make([]chunks.Sample, 0, len(replicas[r]))
 				for _, s := range replicas[r] {
 					encoded = append(encoded, indexSample{t: s.T, i: len(all)})
 					all = append(all, s)
@@ -405,8 +401,7 @@ func penaltySequences(t *testing.T, replicas [][]Sample, counter bool) map[strin
 			return
 		}
 		for i, r := range rest {
-			next := append(append([]int{}, rest[:i]...), rest[i+1:]...)
-			permute(append(append([]int{}, order...), r), next)
+			permute(append(append([]int{}, order...), r), append(append([]int{}, rest[:i]...), rest[i+1:]...))
 		}
 	}
 	idx := make([]int, len(replicas))
@@ -483,9 +478,8 @@ func deduplicatedDifferences(t *testing.T, want, got *BucketDump, replicaLabels 
 	for k := range g {
 		keys[k] = struct{}{}
 	}
-	sorted := slices.Sorted(maps.Keys(keys))
 	var diffs []string
-	for _, k := range sorted {
+	for _, k := range slices.Sorted(maps.Keys(keys)) {
 		ws, gs := w[k], g[k]
 		switch {
 		case ws == nil:

@@ -4,6 +4,7 @@
 package dedup
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/efficientgo/core/testutil"
@@ -482,13 +483,13 @@ func createSamplesWithStep(start, numOfSamples, step int) []chunks.Sample {
 func TestDedupChunkSeriesMergerTiesGoToTheFirstSeries(t *testing.T) {
 	lset := labels.FromStrings("bar", "baz")
 	chunk := func(from, to int64, v float64) []chunks.Sample {
-		var out []chunks.Sample
+		out := make([]chunks.Sample, 0, to-from+1)
 		for ts := from; ts <= to; ts++ {
 			out = append(out, sample{ts, v})
 		}
 		return out
 	}
-	values := func(s storage.ChunkSeries) map[int64]float64 {
+	values := func(t *testing.T, s storage.ChunkSeries) map[int64]float64 {
 		out := map[int64]float64{}
 		it := s.Iterator(nil)
 		for it.Next() {
@@ -504,9 +505,9 @@ func TestDedupChunkSeriesMergerTiesGoToTheFirstSeries(t *testing.T) {
 	}
 	// Five replicas; all have the same chunk at [20, 25], with their own
 	// value, and some have earlier chunks that move the heap around first.
-	var replicas []storage.ChunkSeries
+	replicas := make([]storage.ChunkSeries, 0, 5)
 	for i := range 5 {
-		var chks [][]chunks.Sample
+		chks := make([][]chunks.Sample, 0, i+1)
 		for j := range i {
 			chks = append(chks, chunk(int64(j*3), int64(j*3+1), -1))
 		}
@@ -515,10 +516,12 @@ func TestDedupChunkSeriesMergerTiesGoToTheFirstSeries(t *testing.T) {
 	}
 	m := NewChunkSeriesMerger()
 	for first := range replicas {
-		order := append([]storage.ChunkSeries{replicas[first]}, append(append([]storage.ChunkSeries{}, replicas[:first]...), replicas[first+1:]...)...)
-		got := values(m(order...))
-		for ts := int64(20); ts <= 25; ts++ {
-			testutil.Equals(t, float64(first), got[ts], "replica %d was offered first, at %d", first, ts)
-		}
+		t.Run(fmt.Sprint(first), func(t *testing.T) {
+			order := append([]storage.ChunkSeries{replicas[first]}, append(append([]storage.ChunkSeries{}, replicas[:first]...), replicas[first+1:]...)...)
+			got := values(t, m(order...))
+			for ts := int64(20); ts <= 25; ts++ {
+				testutil.Equals(t, float64(first), got[ts], "replica %d was offered first, at %d", first, ts)
+			}
+		})
 	}
 }

@@ -48,7 +48,7 @@ func (s floatSample) Copy() chunks.Sample           { return s }
 
 // constSeries is a series with value v at every timestamp in [from, to).
 func constSeries(lset labels.Labels, from, to int64, v float64) storage.Series {
-	var samples []chunks.Sample
+	samples := make([]chunks.Sample, 0, to-from)
 	for ts := from; ts < to; ts++ {
 		samples = append(samples, floatSample{t: ts * 1000, f: v})
 	}
@@ -63,7 +63,7 @@ func writeBlock(t *testing.T, dir string, series ...storage.Series) string {
 }
 
 func samplesOf(v float64, from, to int64) []string {
-	var out []string
+	out := make([]string, 0, to-from)
 	for ts := from; ts < to; ts++ {
 		out = append(out, fmt.Sprintf("%d/%v", ts*1000, v))
 	}
@@ -223,14 +223,14 @@ func TestDeduplicatingBlockPopulatorPartitions(t *testing.T) {
 	for i := range uint64(count) {
 		ps := &PartitionStats{}
 		part := &SeriesPartition{Index: i, Count: count, Without: []string{"replica"}}
-		ids, err := comp.CompactWithBlockPopulator(out, dirs, nil, DeduplicatingBlockPopulator{ReplicaLabels: []string{"replica"}, Partition: part, PartitionStats: ps})
-		testutil.Ok(t, err)
+		partIDs, perr := comp.CompactWithBlockPopulator(out, dirs, nil, DeduplicatingBlockPopulator{ReplicaLabels: []string{"replica"}, Partition: part, PartitionStats: ps})
+		testutil.Ok(t, perr)
 		testutil.Equals(t, uint64(len(series)), ps.Walked)
 		walked, kept = ps.Walked, kept+ps.Kept
-		if len(ids) == 0 {
+		if len(partIDs) == 0 {
 			continue
 		}
-		content, lsets, _ := blockContent(t, out, ids[0])
+		content, lsets, _ := blockContent(t, out, partIDs[0])
 		for k, v := range content {
 			testutil.Assert(t, part.Contains(lsets[k]), "series %s is in partition %d but hashes elsewhere", k, i)
 			_, dup := got[k]
@@ -281,8 +281,14 @@ func TestLocalPlanExecutorDeduplicatesSeriesReplicas(t *testing.T) {
 	comp, err := tsdb.NewLeveledCompactor(ctx, nil, slog.Default(), []int64{time.Hour.Milliseconds(), 2 * time.Hour.Milliseconds()}, chunkenc.NewPool(), dedup.NewChunkSeriesMerger())
 	testutil.Ok(t, err)
 	metrics := NewSeriesDedupMetrics(nil)
-	ex := LocalPlanExecutor{Comp: comp, BlockDeletableChecker: DefaultBlockDeletableChecker{}, Callback: DefaultCompactionLifecycleCallback{}, MarkSourcesForDeletion: true,
-		SeriesReplicaLabels: []string{"prometheus_replica", ""}, SeriesDedupMetrics: metrics}
+	ex := LocalPlanExecutor{
+		Comp:                   comp,
+		BlockDeletableChecker:  DefaultBlockDeletableChecker{},
+		Callback:               DefaultCompactionLifecycleCallback{},
+		MarkSourcesForDeletion: true,
+		SeriesReplicaLabels:    []string{"prometheus_replica", ""},
+		SeriesDedupMetrics:     metrics,
+	}
 
 	compIDs, err := ex.Execute(ctx, t.TempDir(), cg, Plan{Sources: sources})
 	testutil.Ok(t, err)
@@ -299,8 +305,8 @@ func TestLocalPlanExecutorDeduplicatesSeriesReplicas(t *testing.T) {
 	plain.SeriesReplicaLabels, plain.SeriesDedupMetrics = nil, nil
 	cg2, err := NewGroup(logger, bkt, "0@test", ext, 0, false, false, cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), metadata.NoneFunc, 1, 1)
 	testutil.Ok(t, err)
-	for _, m := range sources {
-		testutil.Ok(t, cg2.AppendMeta(m))
+	for _, s := range sources {
+		testutil.Ok(t, cg2.AppendMeta(s))
 	}
 	plainIDs, err := plain.Execute(ctx, t.TempDir(), cg2, Plan{Sources: sources})
 	testutil.Ok(t, err)
@@ -314,7 +320,7 @@ func TestLocalPlanExecutorDeduplicatesSeriesReplicas(t *testing.T) {
 // replicas, offered in the given order.
 func queryTimePenalty(t *testing.T, lset labels.Labels, replicas ...[]chunks.Sample) []string {
 	t.Helper()
-	var series []storage.Series
+	series := make([]storage.Series, 0, len(replicas))
 	for _, r := range replicas {
 		series = append(series, storage.NewListSeries(lset, r))
 	}

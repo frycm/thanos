@@ -1478,7 +1478,7 @@ func (ex LocalPlanExecutor) Execute(ctx context.Context, dir string, cg *Group, 
 				ex.SeriesDedupMetrics.Input.Add(float64(in))
 				ex.SeriesDedupMetrics.Output.Add(float64(out))
 			}
-			level.Info(cg.logger).Log("msg", "deduplicated series replicas", "labels", strings.Join(replicaLabels, ","), "input_series", in, "output_series", out, "plan", sourceBlockStr)
+			level.Info(cg.logger).Log("msg", "deduplicated series replicas", "labels", strings.Join(replicaLabels, ","), "inputSeries", in, "outputSeries", out, "plan", sourceBlockStr)
 		}
 		return partitionsCover(outputs, stats)
 	}); err != nil {

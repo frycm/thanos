@@ -225,14 +225,25 @@ func processBucketSamples(t *testing.T, bkt objstore.Bucket) map[string][]string
 // start, and the compacted blocks must hold each Prometheus pair's series
 // once, without the label, recording it.
 func TestCompactorProcessSeriesReplicaDedupWithoutExternalReplicaLabels(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns the compact process")
+	}
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
 	f := newCompactorProcessFixture(t, ctx, 1)
 	config := filepath.Join(t.TempDir(), "bucket.yaml")
 	testutil.Ok(t, os.WriteFile(config, []byte(fmt.Sprintf("type: FILESYSTEM\nconfig:\n  directory: %q\n", f.Dirs[0])), 0600))
-	f.Wait(f.Start([]string{"compact", "--objstore.config-file=" + config, "--data-dir=" + t.TempDir(), "--http-address=127.0.0.1:0",
-		"--consistency-delay=0s", "--compact.progress-interval=0s", "--web.disable",
-		"--deduplication.func=penalty", "--deduplication.series-replica-label=prometheus_replica"}))
+	f.Wait(f.Start([]string{
+		"compact",
+		"--objstore.config-file=" + config,
+		"--data-dir=" + t.TempDir(),
+		"--http-address=127.0.0.1:0",
+		"--consistency-delay=0s",
+		"--compact.progress-interval=0s",
+		"--web.disable",
+		"--deduplication.func=penalty",
+		"--deduplication.series-replica-label=prometheus_replica",
+	}))
 
 	got := processBucketSamples(t, f.Buckets[0])
 	for _, receiver := range []string{"r0", "r1"} {

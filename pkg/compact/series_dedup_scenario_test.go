@@ -14,12 +14,12 @@ import (
 	"github.com/thanos-io/thanos/pkg/compact/compacttest"
 )
 
-// seriesReplicaLabels are the replica labels the HA corpus writes inside its
-// series: Prometheus pairs and collector pairs behind a receiver.
-var seriesReplicaLabels = []string{"otelcol_replica", "prometheus_replica"}
+// seriesReplicaLabels returns the replica labels the HA corpus writes inside
+// its series: Prometheus pairs and collector pairs behind a receiver.
+func seriesReplicaLabels() []string { return []string{"otelcol_replica", "prometheus_replica"} }
 
 func withSeriesDedup(c compacttest.NodeConfig) compacttest.NodeConfig {
-	c.SeriesReplicaLabels = seriesReplicaLabels
+	c.SeriesReplicaLabels = seriesReplicaLabels()
 	return c
 }
 
@@ -77,7 +77,7 @@ func assertDeduplicated(t *testing.T, plain, got *compacttest.BucketDump) {
 			if downsampledOnly && strings.HasPrefix(k, "res=0 ") {
 				continue
 			}
-			if slices.ContainsFunc(seriesReplicaLabels, func(l string) bool { return strings.Contains(k, l+"=") }) {
+			if slices.ContainsFunc(seriesReplicaLabels(), func(l string) bool { return strings.Contains(k, l+"=") }) {
 				n++
 			}
 		}
@@ -90,7 +90,7 @@ func assertDeduplicated(t *testing.T, plain, got *compacttest.BucketDump) {
 	var recorded int
 	for _, b := range got.Blocks {
 		if len(b.Meta.Thanos.SeriesReplicaLabels) > 0 {
-			testutil.Equals(t, seriesReplicaLabels, b.Meta.Thanos.SeriesReplicaLabels)
+			testutil.Equals(t, seriesReplicaLabels(), b.Meta.Thanos.SeriesReplicaLabels)
 			recorded++
 		}
 	}

@@ -98,9 +98,9 @@ func (d *dedupChunksIterator) Next() bool {
 			prev = next
 		}
 
-		iter := heap.Pop(&d.h).(indexedChunkIterator)
-		if iter.Next() {
-			heap.Push(&d.h, iter)
+		popped := heap.Pop(&d.h).(indexedChunkIterator)
+		if popped.Next() {
+			heap.Push(&d.h, popped)
 		}
 	}
 	if om.empty() {

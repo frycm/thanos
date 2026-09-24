@@ -157,16 +157,16 @@ func BuildCorpus(t *testing.T, name string, tenants []TenantSpec) *Corpus {
 				if rcv != "" {
 					b.Set(tn.ExternalReplicaLabel, rcv)
 				}
-				var id ulid.ULID
-				var err error
-				if tn.ReplicaScrapeOffset > 0 {
+				create := func() (ulid.ULID, error) {
+					if tn.ReplicaScrapeOffset <= 0 {
+						return e2eutil.CreateBlock(ctx, dir, series, tn.Samples, mint, maxt, b.Labels(), 0, metadata.NoneFunc, tn.SampleTypes)
+					}
 					testutil.Assert(t, len(tn.SampleTypes) == 0, "tenant %s: scrape offsets are only supported for float samples", tn.Name)
-					id, err = e2eutil.CreateBlockWithSampleOffsets(ctx, dir, series, tn.Samples, mint, maxt, b.Labels(), func(lset labels.Labels) int64 {
+					return e2eutil.CreateBlockWithSampleOffsets(ctx, dir, series, tn.Samples, mint, maxt, b.Labels(), func(lset labels.Labels) int64 {
 						return int64(slices.Index(promReplicas, lset.Get(tn.SeriesReplicaLabel))) * tn.ReplicaScrapeOffset.Milliseconds()
 					})
-				} else {
-					id, err = e2eutil.CreateBlock(ctx, dir, series, tn.Samples, mint, maxt, b.Labels(), 0, metadata.NoneFunc, tn.SampleTypes)
 				}
+				id, err := create()
 				testutil.Ok(t, err)
 				c.Blocks = append(c.Blocks, CorpusBlock{
 					ID: id, Dir: filepath.Join(dir, id.String()), Tenant: tn.Name, Window: w, Mark: tn.NoCompact[w],

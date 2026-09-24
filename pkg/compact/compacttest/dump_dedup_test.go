@@ -20,7 +20,7 @@ import (
 // between healthy replicas, or the union of offset scrapes.
 func TestDeduplicatedDifferences(t *testing.T) {
 	series := func(from, step, n int64, v float64) []Sample {
-		var out []Sample
+		out := make([]Sample, 0, n)
 		for i := range n {
 			out = append(out, Sample{T: from + i*step, V: v + float64(i)})
 		}
@@ -42,32 +42,23 @@ func TestDeduplicatedDifferences(t *testing.T) {
 	replicaLabels := []string{"prometheus_replica"}
 
 	// Twenty synchronized samples at 15s intervals, values apart per replica.
-	a, b := series(0, 15000, 20, 100), series(0, 15000, 20, 200)
-	want := dump(map[string][]Sample{"A": a, "B": b})
-	testutil.Equals(t, 0, len(deduplicatedDifferences(t, want, dump(map[string][]Sample{"": a}), replicaLabels, 0)), "replica A alone is what A-first yields")
-	testutil.Equals(t, 0, len(deduplicatedDifferences(t, want, dump(map[string][]Sample{"": b}), replicaLabels, 0)), "replica B alone is what B-first yields")
-	testutil.Equals(t, 0, len(deduplicatedDifferences(t, want, want, replicaLabels, 0)), "the replicas themselves, deduplicated at query time")
-
-	alternating := make([]Sample, len(a))
-	for i := range a {
-		alternating[i] = a[i]
+	syncA, syncB := series(0, 15000, 20, 100), series(0, 15000, 20, 200)
+	synced := map[string][]Sample{"A": syncA, "B": syncB}
+	alternating := make([]Sample, len(syncA))
+	for i := range syncA {
+		alternating[i] = syncA[i]
 		if i%2 == 1 {
-			alternating[i] = b[i]
+			alternating[i] = syncB[i]
 		}
 	}
-	testutil.Assert(t, len(deduplicatedDifferences(t, want, dump(map[string][]Sample{"": alternating}), replicaLabels, 0)) > 0, "an output alternating between healthy replicas must be rejected")
 
 	// Offset scrapes: B five seconds after A. Penalty deduplication keeps one
 	// replica and drops the other's timestamps; the union of both is not
 	// what it serves.
-	b = series(5000, 15000, 20, 200)
-	want = dump(map[string][]Sample{"A": a, "B": b})
-	testutil.Equals(t, 0, len(deduplicatedDifferences(t, want, dump(map[string][]Sample{"": a}), replicaLabels, 0)))
-	union := append(append([]Sample{}, a...), b...)
-	testutil.Assert(t, len(deduplicatedDifferences(t, want, dump(map[string][]Sample{"": union}), replicaLabels, 0)) > 0, "the union of offset scrapes must be rejected")
-	testutil.Assert(t, len(deduplicatedDifferences(t, want, dump(map[string][]Sample{"": a[:19]}), replicaLabels, 0)) > 0, "a lost sample must be rejected")
-	duplicated := append(append([]Sample{}, a[:10]...), a[9:]...)
-	testutil.Assert(t, len(deduplicatedDifferences(t, want, dump(map[string][]Sample{"": duplicated}), replicaLabels, 0)) > 0, "a duplicated sample must be rejected")
+	offsetB := series(5000, 15000, 20, 200)
+	offset := map[string][]Sample{"A": syncA, "B": offsetB}
+	union := append(append([]Sample{}, syncA...), offsetB...)
+	duplicated := append(append([]Sample{}, syncA[:10]...), syncA[9:]...)
 
 	// Offset by 20s at a 60s step, more than the algorithm's initial
 	// penalty: read from the start of a window, the querier takes A's first
@@ -75,17 +66,40 @@ func TestDeduplicatedDifferences(t *testing.T) {
 	// windows stays with B at the second; one reading each window alone -
 	// as a compaction deduplicating window by window does - takes A's first
 	// sample of the second window again.
-	a, b = series(0, 60000, 40, 100), series(20000, 60000, 40, 200)
-	want = dump(map[string][]Sample{"A": a, "B": b})
-	perWindow := []Sample{a[0]}
-	perWindow = append(perWindow, b[0:20]...)
-	perWindow = append(perWindow, a[20])
-	perWindow = append(perWindow, b[20:]...)
-	got := dump(map[string][]Sample{"": perWindow})
-	across := append([]Sample{a[0]}, b...)
-	testutil.Equals(t, 0, len(deduplicatedDifferences(t, want, dump(map[string][]Sample{"": across}), replicaLabels, 0)), "read across windows")
-	testutil.Assert(t, len(deduplicatedDifferences(t, want, got, replicaLabels, 0)) > 0, "read across windows, the querier drops B's samples")
-	diffs := deduplicatedDifferences(t, want, got, replicaLabels, 20*time.Minute)
-	testutil.Equals(t, 0, len(diffs), "read window by window, it keeps B's first: %v", diffs)
-	testutil.Assert(t, len(deduplicatedDifferences(t, want, dump(map[string][]Sample{"": alternating}), replicaLabels, 20*time.Minute)) > 0, "windows do not excuse alternation")
+	slowA, slowB := series(0, 60000, 40, 100), series(20000, 60000, 40, 200)
+	slow := map[string][]Sample{"A": slowA, "B": slowB}
+	perWindow := []Sample{slowA[0]}
+	perWindow = append(perWindow, slowB[0:20]...)
+	perWindow = append(perWindow, slowA[20])
+	perWindow = append(perWindow, slowB[20:]...)
+	across := append([]Sample{slowA[0]}, slowB...)
+
+	for _, tc := range []struct {
+		name      string
+		want, got map[string][]Sample
+		window    time.Duration
+		wantMatch bool
+	}{
+		{name: "replica A alone is what A-first yields", want: synced, got: map[string][]Sample{"": syncA}, wantMatch: true},
+		{name: "replica B alone is what B-first yields", want: synced, got: map[string][]Sample{"": syncB}, wantMatch: true},
+		{name: "the replicas themselves, deduplicated at query time", want: synced, got: synced, wantMatch: true},
+		{name: "an output alternating between healthy replicas must be rejected", want: synced, got: map[string][]Sample{"": alternating}},
+		{name: "replica A alone is what A-first yields for offset scrapes", want: offset, got: map[string][]Sample{"": syncA}, wantMatch: true},
+		{name: "the union of offset scrapes must be rejected", want: offset, got: map[string][]Sample{"": union}},
+		{name: "a lost sample must be rejected", want: offset, got: map[string][]Sample{"": syncA[:19]}},
+		{name: "a duplicated sample must be rejected", want: offset, got: map[string][]Sample{"": duplicated}},
+		{name: "read across windows", want: slow, got: map[string][]Sample{"": across}, wantMatch: true},
+		{name: "read across windows, the querier drops B's samples", want: slow, got: map[string][]Sample{"": perWindow}},
+		{name: "read window by window, it keeps B's first", want: slow, got: map[string][]Sample{"": perWindow}, window: 20 * time.Minute, wantMatch: true},
+		{name: "windows do not excuse alternation", want: slow, got: map[string][]Sample{"": alternating}, window: 20 * time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			diffs := deduplicatedDifferences(t, dump(tc.want), dump(tc.got), replicaLabels, tc.window)
+			if tc.wantMatch {
+				testutil.Equals(t, 0, len(diffs), "unexpected differences: %v", diffs)
+				return
+			}
+			testutil.Assert(t, len(diffs) > 0, "differences expected")
+		})
+	}
 }

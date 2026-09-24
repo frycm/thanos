@@ -7,7 +7,6 @@ import (
 	"cmp"
 	"container/heap"
 	"context"
-	"fmt"
 	"io"
 	"log/slog"
 	"maps"
@@ -117,7 +116,7 @@ func (p DeduplicatingBlockPopulator) validate() error {
 		return nil
 	}
 	if err := p.Partition.Validate(); err != nil {
-		return err
+		return errors.Wrap(err, "validate series partition")
 	}
 	for _, name := range p.ReplicaLabels {
 		if !slices.Contains(p.Partition.Without, name) {
@@ -154,7 +153,7 @@ func (p DeduplicatingBlockPopulator) PopulateBlock(ctx context.Context, metrics 
 	defer func() {
 		errs := tsdb_errors.NewMulti(err)
 		if cerr := tsdb_errors.CloseAll(closers); cerr != nil {
-			errs.Add(fmt.Errorf("close: %w", cerr))
+			errs.Add(errors.Wrap(cerr, "close"))
 		}
 		err = errs.Err()
 		metrics.PopulatingBlocks.Set(0)
@@ -173,32 +172,32 @@ func (p DeduplicatingBlockPopulator) PopulateBlock(ctx context.Context, metrics 
 			if i > 0 && b.Meta().MinTime < globalMaxt {
 				metrics.OverlappingBlocks.Inc()
 				overlapping = true
-				logger.Info("Found overlapping blocks during compaction", "ulid", meta.ULID)
+				logger.Info("found overlapping blocks during compaction", "block", meta.ULID)
 			}
 			if b.Meta().MaxTime > globalMaxt {
 				globalMaxt = b.Meta().MaxTime
 			}
 		}
 
-		indexr, err := b.Index()
-		if err != nil {
-			return fmt.Errorf("open index reader for block %+v: %w", b.Meta(), err)
+		indexr, ierr := b.Index()
+		if ierr != nil {
+			return errors.Wrapf(ierr, "open index reader for block %+v", b.Meta())
 		}
 		closers = append(closers, indexr)
-		chunkr, err := b.Chunks()
-		if err != nil {
-			return fmt.Errorf("open chunk reader for block %+v: %w", b.Meta(), err)
+		chunkr, cerr := b.Chunks()
+		if cerr != nil {
+			return errors.Wrapf(cerr, "open chunk reader for block %+v", b.Meta())
 		}
 		closers = append(closers, chunkr)
-		tombsr, err := b.Tombstones()
-		if err != nil {
-			return fmt.Errorf("open tombstone reader for block %+v: %w", b.Meta(), err)
+		tombsr, terr := b.Tombstones()
+		if terr != nil {
+			return errors.Wrapf(terr, "open tombstone reader for block %+v", b.Meta())
 		}
 		closers = append(closers, tombsr)
 
-		replicas, err := p.replicaPostings(ctx, postingsFunc(ctx, indexr), indexr, symbols)
-		if err != nil {
-			return fmt.Errorf("group postings of block %+v by replica: %w", b.Meta(), err)
+		replicas, rerr := p.replicaPostings(ctx, postingsFunc(ctx, indexr), indexr, symbols)
+		if rerr != nil {
+			return errors.Wrapf(rerr, "group postings of block %+v by replica", b.Meta())
 		}
 		for _, refs := range replicas {
 			// Blocks meta is half open: [min, max), so subtract 1 to ensure we don't hold samples with exact meta.MaxTime timestamp.
@@ -209,7 +208,7 @@ func (p DeduplicatingBlockPopulator) PopulateBlock(ctx context.Context, metrics 
 
 	for _, s := range slices.Sorted(maps.Keys(symbols)) {
 		if err := indexw.AddSymbol(s); err != nil {
-			return fmt.Errorf("add symbol: %w", err)
+			return errors.Wrap(err, "add symbol")
 		}
 	}
 
@@ -243,16 +242,16 @@ func (p DeduplicatingBlockPopulator) PopulateBlock(ctx context.Context, metrics 
 			chks = append(chks, chksIter.At())
 		}
 		if err := chksIter.Err(); err != nil {
-			return fmt.Errorf("chunk iter: %w", err)
+			return errors.Wrap(err, "chunk iter")
 		}
 		if len(chks) == 0 {
 			continue
 		}
 		if err := chunkw.WriteChunks(chks...); err != nil {
-			return fmt.Errorf("write chunks: %w", err)
+			return errors.Wrap(err, "write chunks")
 		}
 		if err := indexw.AddSeries(ref, lset, chks...); err != nil {
-			return fmt.Errorf("add series: %w", err)
+			return errors.Wrap(err, "add series")
 		}
 		if p.Stats != nil {
 			p.Stats.Output++
@@ -272,13 +271,13 @@ func (p DeduplicatingBlockPopulator) PopulateBlock(ctx context.Context, metrics 
 		}
 		for _, chk := range chks {
 			if err := chunkPool.Put(chk.Chunk); err != nil {
-				return fmt.Errorf("put chunk: %w", err)
+				return errors.Wrap(err, "put chunk")
 			}
 		}
 		ref++
 	}
 	if err := set.Err(); err != nil {
-		return fmt.Errorf("iterate compaction set: %w", err)
+		return errors.Wrap(err, "iterate compaction set")
 	}
 	return nil
 }
@@ -309,11 +308,11 @@ func (p DeduplicatingBlockPopulator) replicaPostings(ctx context.Context, all in
 		n++
 		if n%4096 == 0 {
 			if err := ctx.Err(); err != nil {
-				return nil, err
+				return nil, errors.Wrap(err, "walk postings")
 			}
 		}
 		if err := indexr.Series(all.At(), &builder, nil); err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "read series")
 		}
 		if p.PartitionStats != nil {
 			p.PartitionStats.Walked++
@@ -362,7 +361,7 @@ func (p DeduplicatingBlockPopulator) replicaPostings(ctx context.Context, all in
 		groups[k] = append(groups[k], all.At())
 	}
 	if err := all.Err(); err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "iterate postings")
 	}
 
 	byReplica := map[string][][]storage.SeriesRef{}
@@ -375,7 +374,7 @@ func (p DeduplicatingBlockPopulator) replicaPostings(ctx context.Context, all in
 	for _, r := range order {
 		merged, err := p.mergeGroups(byReplica[r], indexr)
 		if err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "merge postings groups")
 		}
 		out = append(out, merged)
 	}
@@ -395,7 +394,7 @@ func (p DeduplicatingBlockPopulator) mergeGroups(lists [][]storage.SeriesRef, in
 	var builder labels.ScratchBuilder
 	stripped := func(ref storage.SeriesRef) (labels.Labels, error) {
 		if err := indexr.Series(ref, &builder, nil); err != nil {
-			return labels.EmptyLabels(), err
+			return labels.EmptyLabels(), errors.Wrap(err, "read series")
 		}
 		return labels.NewBuilder(builder.Labels()).Del(p.ReplicaLabels...).Labels(), nil
 	}
@@ -403,7 +402,7 @@ func (p DeduplicatingBlockPopulator) mergeGroups(lists [][]storage.SeriesRef, in
 	for _, l := range lists {
 		lset, err := stripped(l[0])
 		if err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "read first series of postings group")
 		}
 		h = append(h, &refCursor{refs: l, lset: lset})
 	}
@@ -419,7 +418,7 @@ func (p DeduplicatingBlockPopulator) mergeGroups(lists [][]storage.SeriesRef, in
 		}
 		lset, err := stripped(c.refs[c.pos])
 		if err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "read next series of postings group")
 		}
 		if labels.Compare(c.lset, lset) >= 0 {
 			return nil, errors.Errorf("postings of series %s are not in label order", lset)
@@ -502,29 +501,34 @@ func (m *orderedMergeChunkSeriesSet) Next() bool {
 	if m.err != nil {
 		return false
 	}
-	if !m.started {
-		m.started = true
-		for i, s := range m.sets {
-			if s.Next() {
-				m.h = append(m.h, setCursor{index: i, set: s})
-			} else if err := s.Err(); err != nil {
-				m.err = err
-				return false
-			}
-		}
-		heap.Init(&m.h)
-	} else {
+	if m.started {
 		// The sets whose series make up the current one advance only now:
 		// the caller was done with it when it asked for the next.
 		for _, i := range m.current {
 			s := m.sets[i]
 			if s.Next() {
 				heap.Push(&m.h, setCursor{index: i, set: s})
-			} else if err := s.Err(); err != nil {
+				continue
+			}
+			if err := s.Err(); err != nil {
 				m.err = err
 				return false
 			}
 		}
+	}
+	if !m.started {
+		m.started = true
+		for i, s := range m.sets {
+			if s.Next() {
+				m.h = append(m.h, setCursor{index: i, set: s})
+				continue
+			}
+			if err := s.Err(); err != nil {
+				m.err = err
+				return false
+			}
+		}
+		heap.Init(&m.h)
 	}
 	m.current = m.current[:0]
 	if len(m.h) == 0 {
@@ -540,9 +544,8 @@ func (m *orderedMergeChunkSeriesSet) Next() bool {
 		m.current = append(m.current, c.index)
 		series = append(series, c.set.At())
 	}
-	if len(series) == 1 {
-		m.cur = series[0]
-	} else {
+	m.cur = series[0]
+	if len(series) > 1 {
 		m.cur = m.mergeFunc(series...)
 	}
 	return true
