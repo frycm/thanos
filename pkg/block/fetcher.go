@@ -82,11 +82,10 @@ const (
 	FailedMeta    = "failed"
 
 	// Synced label values.
-	labelExcludedMeta      = "label-excluded"
-	timeExcludedMeta       = "time-excluded"
-	resolutionExcludedMeta = "resolution-excluded"
-	tooFreshMeta           = "too-fresh"
-	duplicateMeta          = "duplicate"
+	labelExcludedMeta = "label-excluded"
+	timeExcludedMeta  = "time-excluded"
+	tooFreshMeta      = "too-fresh"
+	duplicateMeta     = "duplicate"
 	// Blocks that are marked for deletion can be loaded as well. This is done to make sure that we load blocks that are meant to be deleted,
 	// but don't have a replacement block yet.
 	MarkedForDeletionMeta = "marked-for-deletion"
@@ -767,6 +766,10 @@ func (f *TimePartitionMetaFilter) Filter(_ context.Context, metas map[ulid.ULID]
 	}
 	return nil
 }
+
+// resolutionExcludedMeta is the synced label value of the blocks
+// ResolutionMetaFilter hides.
+const resolutionExcludedMeta = "resolution-excluded"
 
 var _ MetadataFilter = &ResolutionMetaFilter{}
 
