@@ -862,13 +862,19 @@ func TestDownsampleProgressCountsStuckBlocks(t *testing.T) {
 		stuck: {ID: stuck, Version: metadata.NoCompactMarkVersion1, Reason: metadata.IndexSizeExceedingNoCompactReason},
 	}
 	for _, enabled := range []bool{false, true} {
-		marked := NewDownsampleProgressCalculatorWithMarks(prometheus.NewRegistry(),
-			func() map[ulid.ULID]*metadata.NoCompactMark { return marks }, nil, enabled)
-		testutil.Ok(t, marked.ProgressCalculate(t.Context(), groups))
-		want := 0.0
-		if enabled {
-			want = 1.0
-		}
-		testutil.Equals(t, want, promtestutil.ToFloat64(marked.NumberOfBlocksDownsampled))
+		t.Run(fmt.Sprintf("enabled=%t", enabled), func(t *testing.T) {
+			marked := NewDownsampleProgressCalculatorWithMarks(
+				prometheus.NewRegistry(),
+				func() map[ulid.ULID]*metadata.NoCompactMark { return marks },
+				nil,
+				enabled,
+			)
+			testutil.Ok(t, marked.ProgressCalculate(t.Context(), groups))
+			want := 0.0
+			if enabled {
+				want = 1.0
+			}
+			testutil.Equals(t, want, promtestutil.ToFloat64(marked.NumberOfBlocksDownsampled))
+		})
 	}
 }

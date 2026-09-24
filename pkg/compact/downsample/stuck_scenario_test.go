@@ -19,7 +19,7 @@ import (
 // the compactor can never grow are downsampled although they are below the
 // downsampling span, and nothing else is.
 func stuckScenarios() []compacttest.Scenario {
-	var cases []compacttest.Scenario
+	cases := make([]compacttest.Scenario, 0, 2)
 	for _, enabled := range []bool{false, true} {
 		cases = append(cases, compacttest.Scenario{
 			Name: fmt.Sprintf("stuck_blocks_enabled_%t", enabled),
@@ -47,12 +47,12 @@ func stuckScenarios() []compacttest.Scenario {
 					}
 				}
 				slices.SortFunc(spans, func(a, b [2]int64) int { return int(a[0] - b[0]) })
-				var downsampled []string
+				downsampled := make([]string, 0, len(spans))
 				for _, s := range spans {
 					downsampled = append(downsampled, fmt.Sprintf("[%d,%d)", s[0], s[1]))
 				}
 				window := compacttest.Window.Milliseconds()
-				var expected []string
+				expected := []string{}
 				if enabled {
 					expected = []string{
 						fmt.Sprintf("[%d,%d)", 1*window, 2*window),

@@ -180,7 +180,19 @@ func RunDownsample(
 					metrics.downsamples.WithLabelValues(resolutionLabel)
 					metrics.downsampleFailures.WithLabelValues(resolutionLabel)
 				}
-				if err := downsampleBucket(ctx, logger, metrics, insBkt, metas, downsample.PlanOptions{NoDownsampleMarked: noDownsampleMarkerFilter.NoDownsampleMarkedBlocks(), NoCompactMarked: noCompactMarkerFilter.NoCompactMarkedBlocks(), EnableStuckBlocks: enableStuckBlocks}, dataDir, downsampleConcurrency, blockFilesConcurrency, hashFunc, false); err != nil {
+				if err := downsampleBucket(
+					ctx,
+					logger,
+					metrics,
+					insBkt,
+					metas,
+					downsample.PlanOptions{NoDownsampleMarked: noDownsampleMarkerFilter.NoDownsampleMarkedBlocks(), NoCompactMarked: noCompactMarkerFilter.NoCompactMarkedBlocks(), EnableStuckBlocks: enableStuckBlocks},
+					dataDir,
+					downsampleConcurrency,
+					blockFilesConcurrency,
+					hashFunc,
+					false,
+				); err != nil {
 					return errors.Wrap(err, "downsampling failed")
 				}
 
@@ -189,7 +201,19 @@ func RunDownsample(
 				if err != nil {
 					return errors.Wrap(err, "sync before second pass of downsampling")
 				}
-				if err := downsampleBucket(ctx, logger, metrics, insBkt, metas, downsample.PlanOptions{NoDownsampleMarked: noDownsampleMarkerFilter.NoDownsampleMarkedBlocks(), NoCompactMarked: noCompactMarkerFilter.NoCompactMarkedBlocks(), EnableStuckBlocks: enableStuckBlocks}, dataDir, downsampleConcurrency, blockFilesConcurrency, hashFunc, false); err != nil {
+				if err := downsampleBucket(
+					ctx,
+					logger,
+					metrics,
+					insBkt,
+					metas,
+					downsample.PlanOptions{NoDownsampleMarked: noDownsampleMarkerFilter.NoDownsampleMarkedBlocks(), NoCompactMarked: noCompactMarkerFilter.NoCompactMarkedBlocks(), EnableStuckBlocks: enableStuckBlocks},
+					dataDir,
+					downsampleConcurrency,
+					blockFilesConcurrency,
+					hashFunc,
+					false,
+				); err != nil {
 					return errors.Wrap(err, "downsampling failed")
 				}
 				return nil

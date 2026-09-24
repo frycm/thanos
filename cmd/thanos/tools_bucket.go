@@ -838,9 +838,23 @@ func registerBucketDownsample(app extkingpin.AppClause, objStoreConfig *extflag.
 	tbc.registerBucketDownsampleFlag(cmd)
 
 	cmd.Setup(func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ <-chan struct{}, _ bool) error {
-		return RunDownsample(g, logger, reg, *httpAddr, *httpTLSConfig, time.Duration(*httpGracePeriod), tbc.dataDir,
-			tbc.waitInterval, tbc.downsampleConcurrency, tbc.blockFilesConcurrency, objStoreConfig, component.Downsample, metadata.HashFunc(tbc.hashFunc),
-			strutil.ParseFlagLabels(tbc.dedupReplicaLabels), tbc.enableStuckBlockDownsampling)
+		return RunDownsample(
+			g,
+			logger,
+			reg,
+			*httpAddr,
+			*httpTLSConfig,
+			time.Duration(*httpGracePeriod),
+			tbc.dataDir,
+			tbc.waitInterval,
+			tbc.downsampleConcurrency,
+			tbc.blockFilesConcurrency,
+			objStoreConfig,
+			component.Downsample,
+			metadata.HashFunc(tbc.hashFunc),
+			strutil.ParseFlagLabels(tbc.dedupReplicaLabels),
+			tbc.enableStuckBlockDownsampling,
+		)
 	})
 }
 

@@ -657,8 +657,12 @@ func runCompact(
 				rs := compact.NewRetentionProgressCalculator(reg, retentionByResolution)
 				var ds *compact.DownsampleProgressCalculator
 				if !conf.disableDownsampling {
-					ds = compact.NewDownsampleProgressCalculatorWithMarks(reg,
-						noCompactMarkerFilter.NoCompactMarkedBlocks, noDownsampleMarkerFilter.NoDownsampleMarkedBlocks, conf.enableStuckBlockDownsampling)
+					ds = compact.NewDownsampleProgressCalculatorWithMarks(
+						reg,
+						noCompactMarkerFilter.NoCompactMarkedBlocks,
+						noDownsampleMarkerFilter.NoDownsampleMarkedBlocks,
+						conf.enableStuckBlockDownsampling,
+					)
 				}
 
 				return runutil.Repeat(conf.progressCalculateInterval, ctx.Done(), func() error {

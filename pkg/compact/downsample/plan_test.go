@@ -146,17 +146,19 @@ func TestPlanStuckBlocksRequireOptIn(t *testing.T) {
 			// Both index-size marked and fenced short blocks must wait with
 			// the feature off. Normal downsampling remains enabled.
 			for _, enabled := range []bool{false, true, false} {
-				got, err := Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: enabled})
-				testutil.Ok(t, err)
-				want := []ulid.ULID{normal}
-				if enabled {
-					want = []ulid.ULID{left, mid, right, normal}
-				}
-				var ids []ulid.ULID
-				for _, c := range got {
-					ids = append(ids, c.Meta.ULID)
-				}
-				testutil.Equals(t, want, ids)
+				t.Run(fmt.Sprintf("enabled=%t", enabled), func(t *testing.T) {
+					got, err := Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: enabled})
+					testutil.Ok(t, err)
+					want := []ulid.ULID{normal}
+					if enabled {
+						want = []ulid.ULID{left, mid, right, normal}
+					}
+					ids := make([]ulid.ULID, 0, len(got))
+					for _, c := range got {
+						ids = append(ids, c.Meta.ULID)
+					}
+					testutil.Equals(t, want, ids)
+				})
 			}
 		})
 	}
@@ -188,135 +190,161 @@ func TestPlanDisabledPreservesNoDownsampleFilteredCoverage(t *testing.T) {
 			// A no-downsample mark still excludes the source with either policy.
 			marks[source] = &metadata.NoDownsampleMark{ID: source}
 			for _, enabled := range []bool{false, true} {
-				got, err = Plan(metas, PlanOptions{NoDownsampleMarked: marks, EnableStuckBlocks: enabled})
-				testutil.Ok(t, err)
-				testutil.Equals(t, 0, len(got))
+				t.Run(fmt.Sprintf("enabled=%t", enabled), func(t *testing.T) {
+					got, err := Plan(metas, PlanOptions{NoDownsampleMarked: marks, EnableStuckBlocks: enabled})
+					testutil.Ok(t, err)
+					testutil.Equals(t, 0, len(got))
+				})
 			}
 		})
 	}
 }
 
-func TestPlanDownsamplesShortBlockMarkedForIndexSize(t *testing.T) {
-	raw := ulid.MustNew(1, nil)
-	metas := map[ulid.ULID]*metadata.Meta{
-		// Too short on its own, but marked: it will never grow.
-		raw: planMeta(raw, ResLevel0, 0, ResLevel1DownsampleRange-1),
+// TestPlanStuckBlockWaiver covers which blocks below the downsample range
+// the opt-in waiver downsamples because the compactor can never grow them.
+func TestPlanStuckBlockWaiver(t *testing.T) {
+	left, mid, right, raw := ulid.MustNew(1, nil), ulid.MustNew(2, nil), ulid.MustNew(3, nil), ulid.MustNew(4, nil)
+	otherStream := func(m *metadata.Meta) *metadata.Meta {
+		m.Thanos.Labels = map[string]string{"tenant": "other"}
+		return m
 	}
-	marks := map[ulid.ULID]*metadata.NoCompactMark{
-		raw: noCompactMark(raw, metadata.IndexSizeExceedingNoCompactReason),
-	}
-
-	got, err := Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
-	testutil.Ok(t, err)
-	testutil.Equals(t, 1, len(got))
-	testutil.Equals(t, raw, got[0].Meta.ULID)
-	testutil.Equals(t, ResLevel1, got[0].TargetResolution)
-}
-
-func TestPlanLeavesShortBlocksMarkedForOtherReasonsAlone(t *testing.T) {
-	raw := ulid.MustNew(1, nil)
-	metas := map[ulid.ULID]*metadata.Meta{
-		raw: planMeta(raw, ResLevel0, 0, ResLevel1DownsampleRange-1),
-	}
-	marks := map[ulid.ULID]*metadata.NoCompactMark{
-		raw: noCompactMark(raw, metadata.OutOfOrderChunksNoCompactReason),
-	}
-
-	got, err := Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
-	testutil.Ok(t, err)
-	testutil.Equals(t, 0, len(got))
-}
-
-func TestPlanDownsamplesShortBlockFencedInByMarkedBlocks(t *testing.T) {
-	left := ulid.MustNew(1, nil)
-	mid := ulid.MustNew(2, nil)
-	right := ulid.MustNew(3, nil)
-	// The window between the marked neighbors is below the downsample range, so
-	// mid can never be compacted into a block that spans enough time.
-	metas := map[ulid.ULID]*metadata.Meta{
-		left:  planMeta(left, ResLevel0, 0, 100),
-		mid:   planMeta(mid, ResLevel0, 200, 300),
-		right: planMeta(right, ResLevel0, 400, 500),
-	}
-	marks := map[ulid.ULID]*metadata.NoCompactMark{
-		left:  noCompactMark(left, metadata.IndexSizeExceedingNoCompactReason),
-		right: noCompactMark(right, metadata.IndexSizeExceedingNoCompactReason),
-	}
-
-	got, err := Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
-	testutil.Ok(t, err)
-	// left and right for being marked, mid for being fenced in.
-	testutil.Equals(t, 3, len(got))
-}
-
-func TestPlanWaitsWhenFencedWindowIsStillLargeEnough(t *testing.T) {
-	left := ulid.MustNew(1, nil)
-	mid := ulid.MustNew(2, nil)
-	right := ulid.MustNew(3, nil)
-	metas := map[ulid.ULID]*metadata.Meta{
-		left:  planMeta(left, ResLevel0, 0, 100),
-		mid:   planMeta(mid, ResLevel0, 200, 300),
-		right: planMeta(right, ResLevel0, 100+ResLevel1DownsampleRange, 200+ResLevel1DownsampleRange),
-	}
-	marks := map[ulid.ULID]*metadata.NoCompactMark{
-		left:  noCompactMark(left, metadata.IndexSizeExceedingNoCompactReason),
-		right: noCompactMark(right, metadata.IndexSizeExceedingNoCompactReason),
-	}
-
-	got, err := Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
-	testutil.Ok(t, err)
-	// The marked fences are candidates themselves, but mid can still grow to
-	// the full window between them, which reaches the downsample range, so it
-	// keeps waiting.
-	testutil.Equals(t, 2, len(got))
-	for _, c := range got {
-		testutil.Assert(t, c.Meta.ULID != mid, "mid must keep waiting")
-	}
-}
-
-func TestPlanWaitsWhenOnlyOneSideIsFenced(t *testing.T) {
-	left := ulid.MustNew(1, nil)
-	mid := ulid.MustNew(2, nil)
-	metas := map[ulid.ULID]*metadata.Meta{
-		left: planMeta(left, ResLevel0, 0, 100),
-		mid:  planMeta(mid, ResLevel0, 200, 300),
-	}
-	marks := map[ulid.ULID]*metadata.NoCompactMark{
-		left: noCompactMark(left, metadata.IndexSizeExceedingNoCompactReason),
-	}
-
-	got, err := Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
-	testutil.Ok(t, err)
-	// Only the marked block itself is a candidate; mid is open towards new data.
-	testutil.Equals(t, 1, len(got))
-	testutil.Equals(t, left, got[0].Meta.ULID)
-}
-
-func TestPlanIgnoresMarkedBlocksFromOtherCompactionGroups(t *testing.T) {
-	left := ulid.MustNew(1, nil)
-	mid := ulid.MustNew(2, nil)
-	right := ulid.MustNew(3, nil)
-	metas := map[ulid.ULID]*metadata.Meta{
-		left:  planMeta(left, ResLevel0, 0, 100),
-		mid:   planMeta(mid, ResLevel0, 200, 300),
-		right: planMeta(right, ResLevel0, 400, 500),
-	}
-	// The fence blocks belong to a different stream, so they say nothing about
-	// how far mid can grow.
-	metas[left].Thanos.Labels = map[string]string{"tenant": "other"}
-	metas[right].Thanos.Labels = map[string]string{"tenant": "other"}
-	marks := map[ulid.ULID]*metadata.NoCompactMark{
-		left:  noCompactMark(left, metadata.IndexSizeExceedingNoCompactReason),
-		right: noCompactMark(right, metadata.IndexSizeExceedingNoCompactReason),
-	}
-
-	got, err := Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
-	testutil.Ok(t, err)
-	// The marked blocks of the other stream are candidates in their own right,
-	// but they say nothing about how far mid can grow.
-	testutil.Equals(t, 2, len(got))
-	for _, c := range got {
-		testutil.Assert(t, c.Meta.ULID != mid, "mid must keep waiting")
+	for _, tc := range []struct {
+		name         string
+		metas        map[ulid.ULID]*metadata.Meta
+		noCompact    map[ulid.ULID]*metadata.NoCompactMark
+		noDownsample map[ulid.ULID]*metadata.NoDownsampleMark
+		wantIDs      []ulid.ULID
+	}{
+		{
+			// Too short on its own, but marked: it will never grow.
+			name: "short block marked for index size",
+			metas: map[ulid.ULID]*metadata.Meta{
+				raw: planMeta(raw, ResLevel0, 0, ResLevel1DownsampleRange-1),
+			},
+			noCompact: map[ulid.ULID]*metadata.NoCompactMark{
+				raw: noCompactMark(raw, metadata.IndexSizeExceedingNoCompactReason),
+			},
+			wantIDs: []ulid.ULID{raw},
+		},
+		{
+			name: "short block marked for other reasons",
+			metas: map[ulid.ULID]*metadata.Meta{
+				raw: planMeta(raw, ResLevel0, 0, ResLevel1DownsampleRange-1),
+			},
+			noCompact: map[ulid.ULID]*metadata.NoCompactMark{
+				raw: noCompactMark(raw, metadata.OutOfOrderChunksNoCompactReason),
+			},
+		},
+		{
+			// The window between the marked neighbors is below the downsample
+			// range, so mid can never be compacted into a block that spans
+			// enough time: left and right for being marked, mid for being
+			// fenced in.
+			name: "short block fenced in by marked blocks",
+			metas: map[ulid.ULID]*metadata.Meta{
+				left:  planMeta(left, ResLevel0, 0, 100),
+				mid:   planMeta(mid, ResLevel0, 200, 300),
+				right: planMeta(right, ResLevel0, 400, 500),
+			},
+			noCompact: map[ulid.ULID]*metadata.NoCompactMark{
+				left:  noCompactMark(left, metadata.IndexSizeExceedingNoCompactReason),
+				right: noCompactMark(right, metadata.IndexSizeExceedingNoCompactReason),
+			},
+			wantIDs: []ulid.ULID{left, mid, right},
+		},
+		{
+			// The marked fences are candidates themselves, but mid can still
+			// grow to the full window between them, which reaches the
+			// downsample range, so it keeps waiting.
+			name: "fenced window still large enough",
+			metas: map[ulid.ULID]*metadata.Meta{
+				left:  planMeta(left, ResLevel0, 0, 100),
+				mid:   planMeta(mid, ResLevel0, 200, 300),
+				right: planMeta(right, ResLevel0, 100+ResLevel1DownsampleRange, 200+ResLevel1DownsampleRange),
+			},
+			noCompact: map[ulid.ULID]*metadata.NoCompactMark{
+				left:  noCompactMark(left, metadata.IndexSizeExceedingNoCompactReason),
+				right: noCompactMark(right, metadata.IndexSizeExceedingNoCompactReason),
+			},
+			wantIDs: []ulid.ULID{left, right},
+		},
+		{
+			// Only the marked block itself is a candidate; mid is open towards
+			// new data.
+			name: "only one side fenced",
+			metas: map[ulid.ULID]*metadata.Meta{
+				left: planMeta(left, ResLevel0, 0, 100),
+				mid:  planMeta(mid, ResLevel0, 200, 300),
+			},
+			noCompact: map[ulid.ULID]*metadata.NoCompactMark{
+				left: noCompactMark(left, metadata.IndexSizeExceedingNoCompactReason),
+			},
+			wantIDs: []ulid.ULID{left},
+		},
+		{
+			// The fence blocks belong to a different stream: they are
+			// candidates in their own right, but they say nothing about how
+			// far mid can grow.
+			name: "marked blocks from other compaction groups",
+			metas: map[ulid.ULID]*metadata.Meta{
+				left:  otherStream(planMeta(left, ResLevel0, 0, 100)),
+				mid:   planMeta(mid, ResLevel0, 200, 300),
+				right: otherStream(planMeta(right, ResLevel0, 400, 500)),
+			},
+			noCompact: map[ulid.ULID]*metadata.NoCompactMark{
+				left:  noCompactMark(left, metadata.IndexSizeExceedingNoCompactReason),
+				right: noCompactMark(right, metadata.IndexSizeExceedingNoCompactReason),
+			},
+			wantIDs: []ulid.ULID{left, right},
+		},
+		{
+			// Removable no-compact marks (manual, out-of-order chunks) never
+			// act as fences: the mark can be lifted, the fenced block then
+			// grows, and its early downsample would overlap the grown block's.
+			name: "fences only on index-size marks",
+			metas: map[ulid.ULID]*metadata.Meta{
+				left:  planMeta(left, ResLevel0, 0, 100),
+				mid:   planMeta(mid, ResLevel0, 200, 300),
+				right: planMeta(right, ResLevel0, 400, 500),
+			},
+			noCompact: map[ulid.ULID]*metadata.NoCompactMark{
+				left:  noCompactMark(left, metadata.ManualNoCompactReason),
+				right: noCompactMark(right, metadata.OutOfOrderChunksNoCompactReason),
+			},
+		},
+		{
+			// The no-downsample exclusion lives in Plan itself: a block marked
+			// both no-compact(index-size) and no-downsample is never a
+			// candidate, yet still fences its neighbors and still counts as
+			// coverage - deleting it from the caller's meta view used to erase
+			// the fence and silently revert the starvation this waiver exists
+			// to fix.
+			name: "no-downsample marked fences still fence",
+			metas: map[ulid.ULID]*metadata.Meta{
+				left:  planMeta(left, ResLevel0, 0, 100),
+				mid:   planMeta(mid, ResLevel0, 200, 300),
+				right: planMeta(right, ResLevel0, 400, 500),
+			},
+			noCompact: map[ulid.ULID]*metadata.NoCompactMark{
+				left:  noCompactMark(left, metadata.IndexSizeExceedingNoCompactReason),
+				right: noCompactMark(right, metadata.IndexSizeExceedingNoCompactReason),
+			},
+			noDownsample: map[ulid.ULID]*metadata.NoDownsampleMark{
+				left:  {ID: left, Version: metadata.NoDownsampleMarkVersion1, Reason: metadata.ManualNoDownsampleReason},
+				right: {ID: right, Version: metadata.NoDownsampleMarkVersion1, Reason: metadata.ManualNoDownsampleReason},
+			},
+			wantIDs: []ulid.ULID{mid},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := Plan(tc.metas, PlanOptions{NoCompactMarked: tc.noCompact, NoDownsampleMarked: tc.noDownsample, EnableStuckBlocks: true})
+			testutil.Ok(t, err)
+			testutil.Equals(t, len(tc.wantIDs), len(got))
+			for i, c := range got {
+				testutil.Equals(t, tc.wantIDs[i], c.Meta.ULID)
+				testutil.Equals(t, ResLevel1, c.TargetResolution)
+			}
+		})
 	}
 }
 
@@ -413,67 +441,13 @@ func TestPlanWaitsWhileAnOverlappingSiblingCanStillGrow(t *testing.T) {
 		testutil.Assert(t, c.Meta.ULID != mid, "a fenced block with an overlapping compactable sibling must keep waiting")
 	}
 
-	// The same guard protects a index-size marked block itself.
+	// The same guard protects an index-size marked block itself.
 	marks[mid] = noCompactMark(mid, metadata.IndexSizeExceedingNoCompactReason)
 	got, err = Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
 	testutil.Ok(t, err)
 	for _, c := range got {
 		testutil.Assert(t, c.Meta.ULID != mid, "a marked block with an overlapping compactable sibling must keep waiting")
 	}
-}
-
-// TestPlanFencesOnlyOnIndexSizeMarks pins down that removable no-compact marks
-// (manual, out-of-order chunks) never act as fences: the mark can be lifted,
-// the fenced block then grows, and its early downsample would overlap the
-// grown block's.
-func TestPlanFencesOnlyOnIndexSizeMarks(t *testing.T) {
-	left := ulid.MustNew(1, nil)
-	mid := ulid.MustNew(2, nil)
-	right := ulid.MustNew(3, nil)
-	metas := map[ulid.ULID]*metadata.Meta{
-		left:  planMeta(left, ResLevel0, 0, 100),
-		mid:   planMeta(mid, ResLevel0, 200, 300),
-		right: planMeta(right, ResLevel0, 400, 500),
-	}
-	marks := map[ulid.ULID]*metadata.NoCompactMark{
-		left:  noCompactMark(left, metadata.ManualNoCompactReason),
-		right: noCompactMark(right, metadata.OutOfOrderChunksNoCompactReason),
-	}
-
-	got, err := Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
-	testutil.Ok(t, err)
-	testutil.Equals(t, 0, len(got))
-}
-
-// TestPlanExcludesNoDownsampleMarkedBlocksButKeepsTheirFences pins down that
-// the no-downsample exclusion lives in Plan itself: a block marked both
-// no-compact(index-size) and no-downsample is never a candidate, yet still
-// fences its neighbors and still counts as coverage - deleting it from the
-// caller's meta view used to erase the fence and silently revert the
-// starvation this waiver exists to fix.
-func TestPlanExcludesNoDownsampleMarkedBlocksButKeepsTheirFences(t *testing.T) {
-	left := ulid.MustNew(1, nil)
-	mid := ulid.MustNew(2, nil)
-	right := ulid.MustNew(3, nil)
-	metas := map[ulid.ULID]*metadata.Meta{
-		left:  planMeta(left, ResLevel0, 0, 100),
-		mid:   planMeta(mid, ResLevel0, 200, 300),
-		right: planMeta(right, ResLevel0, 400, 500),
-	}
-	marks := map[ulid.ULID]*metadata.NoCompactMark{
-		left:  noCompactMark(left, metadata.IndexSizeExceedingNoCompactReason),
-		right: noCompactMark(right, metadata.IndexSizeExceedingNoCompactReason),
-	}
-	noDownsample := map[ulid.ULID]*metadata.NoDownsampleMark{
-		left:  {ID: left, Version: metadata.NoDownsampleMarkVersion1, Reason: metadata.ManualNoDownsampleReason},
-		right: {ID: right, Version: metadata.NoDownsampleMarkVersion1, Reason: metadata.ManualNoDownsampleReason},
-	}
-
-	got, err := Plan(metas, PlanOptions{NoCompactMarked: marks, NoDownsampleMarked: noDownsample, EnableStuckBlocks: true})
-	testutil.Ok(t, err)
-	// The fences are excluded as candidates, but mid is still fenced by them.
-	testutil.Equals(t, 1, len(got))
-	testutil.Equals(t, mid, got[0].Meta.ULID)
 }
 
 // TestPlanClampsFenceWindowToCompactionAlignment pins down that a fence gap is
@@ -499,13 +473,7 @@ func TestPlanClampsFenceWindowToCompactionAlignment(t *testing.T) {
 
 	got, err := Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
 	testutil.Ok(t, err)
-	found := false
-	for _, c := range got {
-		if c.Meta.ULID == mid {
-			found = true
-		}
-	}
-	testutil.Assert(t, found, "a block whose reachable span is clipped by the compaction alignment must be stuck")
+	testutil.Assert(t, planned(got, mid), "a block whose reachable span is clipped by the compaction alignment must be stuck")
 }
 
 // planned reports whether the block is among the candidates.
@@ -677,35 +645,33 @@ func TestPlanWaitsForSiblingNestedInsideThePreviousFence(t *testing.T) {
 
 func TestPlanFencedBlockWaiverRespectsNoCompactReason(t *testing.T) {
 	for _, resolution := range []int64{ResLevel0, ResLevel1} {
-		for _, reason := range []metadata.NoCompactReason{"", metadata.IndexSizeExceedingNoCompactReason, metadata.OutOfOrderChunksNoCompactReason, metadata.ManualNoCompactReason} {
-			left, mid, right := ulid.MustNew(1, nil), ulid.MustNew(2, nil), ulid.MustNew(3, nil)
-			metas := map[ulid.ULID]*metadata.Meta{
-				left:  planMeta(left, resolution, 0, 100),
-				mid:   planMeta(mid, resolution, 100, 200),
-				right: planMeta(right, resolution, 200, 300),
+		t.Run(fmt.Sprint(resolution), func(t *testing.T) {
+			for _, reason := range []metadata.NoCompactReason{"", metadata.IndexSizeExceedingNoCompactReason, metadata.OutOfOrderChunksNoCompactReason, metadata.ManualNoCompactReason} {
+				t.Run(fmt.Sprintf("reason=%q", reason), func(t *testing.T) {
+					left, mid, right := ulid.MustNew(1, nil), ulid.MustNew(2, nil), ulid.MustNew(3, nil)
+					metas := map[ulid.ULID]*metadata.Meta{
+						left:  planMeta(left, resolution, 0, 100),
+						mid:   planMeta(mid, resolution, 100, 200),
+						right: planMeta(right, resolution, 200, 300),
+					}
+					marks := map[ulid.ULID]*metadata.NoCompactMark{
+						left:  noCompactMark(left, metadata.IndexSizeExceedingNoCompactReason),
+						right: noCompactMark(right, metadata.IndexSizeExceedingNoCompactReason),
+					}
+					if reason != "" {
+						marks[mid] = noCompactMark(mid, reason)
+					}
+					candidates, err := Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
+					testutil.Ok(t, err)
+					testutil.Equals(t, reason == "" || reason == metadata.IndexSizeExceedingNoCompactReason, planned(candidates, mid))
+				})
 			}
-			marks := map[ulid.ULID]*metadata.NoCompactMark{
-				left:  noCompactMark(left, metadata.IndexSizeExceedingNoCompactReason),
-				right: noCompactMark(right, metadata.IndexSizeExceedingNoCompactReason),
-			}
-			if reason != "" {
-				marks[mid] = noCompactMark(mid, reason)
-			}
-			candidates, err := Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
-			testutil.Ok(t, err)
-			selected := false
-			for _, c := range candidates {
-				if c.Meta.ULID == mid {
-					selected = true
-				}
-			}
-			testutil.Equals(t, reason == "" || reason == metadata.IndexSizeExceedingNoCompactReason, selected)
-		}
+		})
 	}
 }
 
-// A late block may arrive after a short fenced block was downsampled. Wait
-// while that raw/5m range can still merge, then downsample the merged genealogy
+// TestPlanStuckBlockLateArrival: a late block may arrive after a short fenced
+// block was downsampled. Wait while that raw/5m range can still merge, then downsample the merged genealogy
 // so the late source is represented too. Existing coverage must not hide it.
 func TestPlanStuckBlockLateArrival(t *testing.T) {
 	for _, res := range []int64{ResLevel0, ResLevel1} {

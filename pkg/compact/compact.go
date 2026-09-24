@@ -749,7 +749,11 @@ func NewDownsampleProgressCalculatorWithMarks(
 // from what the downsampling pass will actually do - including the waiver for
 // blocks stuck below the downsample range.
 func (ds *DownsampleProgressCalculator) ProgressCalculate(ctx context.Context, groups []*Group) error {
-	metas := map[ulid.ULID]*metadata.Meta{}
+	var total int
+	for _, group := range groups {
+		total += len(group.metasByMinTime)
+	}
+	metas := make(map[ulid.ULID]*metadata.Meta, total)
 	for _, group := range groups {
 		for _, m := range group.metasByMinTime {
 			metas[m.ULID] = m
