@@ -480,6 +480,9 @@ func runCompact(
 				return errors.Wrap(err, "sync before first pass of downsampling")
 			}
 
+			// No-downsample-marked blocks are not deleted from the view: the
+			// downsample planner excludes them itself, and still needs their
+			// metadata for fences and coverage.
 			filteredMetas := sy.Metas()
 
 			for _, meta := range filteredMetas {
@@ -490,6 +493,8 @@ func runCompact(
 
 			if err := downsampleBlocks(ctx, filteredMetas, downsample.PlanOptions{
 				NoDownsampleMarked: noDownsampleMarkerFilter.NoDownsampleMarkedBlocks(),
+				NoCompactMarked:    noCompactMarkerFilter.NoCompactMarkedBlocks(),
+				EnableStuckBlocks:  conf.enableStuckBlockDownsampling,
 			}); err != nil {
 				return errors.Wrap(err, "first pass of downsampling failed")
 			}
@@ -505,6 +510,8 @@ func runCompact(
 
 			if err := downsampleBlocks(ctx, filteredMetas, downsample.PlanOptions{
 				NoDownsampleMarked: noDownsampleMarkerFilter.NoDownsampleMarkedBlocks(),
+				NoCompactMarked:    noCompactMarkerFilter.NoCompactMarkedBlocks(),
+				EnableStuckBlocks:  conf.enableStuckBlockDownsampling,
 			}); err != nil {
 				return errors.Wrap(err, "second pass of downsampling failed")
 			}
@@ -650,7 +657,12 @@ func runCompact(
 				rs := compact.NewRetentionProgressCalculator(reg, retentionByResolution)
 				var ds *compact.DownsampleProgressCalculator
 				if !conf.disableDownsampling {
-					ds = compact.NewDownsampleProgressCalculator(reg)
+					ds = compact.NewDownsampleProgressCalculatorWithMarks(
+						reg,
+						noCompactMarkerFilter.NoCompactMarkedBlocks,
+						noDownsampleMarkerFilter.NoDownsampleMarkedBlocks,
+						conf.enableStuckBlockDownsampling,
+					)
 				}
 
 				return runutil.Repeat(conf.progressCalculateInterval, ctx.Done(), func() error {
@@ -722,6 +734,7 @@ type compactConfig struct {
 	wait                                           bool
 	waitInterval                                   time.Duration
 	disableDownsampling                            bool
+	enableStuckBlockDownsampling                   bool
 	blockListStrategy                              string
 	blockMetaFetchConcurrency                      int
 	blockFilesConcurrency                          int
@@ -783,6 +796,8 @@ func (cc *compactConfig) registerFlag(cmd extkingpin.FlagClause) {
 	cmd.Flag("downsampling.disable", "Disables downsampling. This is not recommended "+
 		"as querying long time ranges without non-downsampled data is not efficient and useful e.g it is not possible to render all samples for a human eye anyway").
 		Default("false").BoolVar(&cc.disableDownsampling)
+	cmd.Flag("downsampling.enable-stuck-blocks", "Experimental. Allow downsampling below the normal minimum block span when index-size no-compact marks prove that blocks cannot grow.").
+		Default("false").BoolVar(&cc.enableStuckBlockDownsampling)
 
 	strategies := strings.Join([]string{string(concurrentDiscovery), string(recursiveDiscovery)}, ", ")
 	cmd.Flag("block-discovery-strategy", "One of "+strategies+". When set to concurrent, stores will concurrently issue one call per directory to discover active blocks in the bucket. The recursive strategy iterates through all objects in the bucket, recursively traversing into each directory. This avoids N+1 calls at the expense of having slower bucket iterations.").
