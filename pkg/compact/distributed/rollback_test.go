@@ -6,6 +6,7 @@ package distributed
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"path"
 	"strings"
 	"testing"
@@ -27,14 +28,23 @@ import (
 type rollbackFixture struct {
 	bkt objstore.InstrumentedBucket
 
-	producedA ulid.ULID // made by a worker of journal A from consumedA and sourceA
-	producedB ulid.ULID // made by a worker of journal B from sourceB
-	sourceA   ulid.ULID // marked for deletion by manager A
-	sourceB   ulid.ULID // marked for deletion by manager B
-	retention ulid.ULID // marked for deletion by retention, not ours
-	untouched ulid.ULID // an ordinary block
-	consumedA ulid.ULID // made by a worker of A from rawA, later consumed by another A task and marked by A
-	rawA      ulid.ULID // the source of consumedA, marked for deletion by manager A
+	// producedA is made by a worker of journal A from consumedA and sourceA.
+	producedA ulid.ULID
+	// producedB is made by a worker of journal B from sourceB.
+	producedB ulid.ULID
+	// sourceA is marked for deletion by manager A.
+	sourceA ulid.ULID
+	// sourceB is marked for deletion by manager B.
+	sourceB ulid.ULID
+	// retention is marked for deletion by retention, not by a manager.
+	retention ulid.ULID
+	// untouched is an ordinary block.
+	untouched ulid.ULID
+	// consumedA is made by a worker of A from rawA, later consumed by another
+	// task of A and marked for deletion by A.
+	consumedA ulid.ULID
+	// rawA is the source of consumedA, marked for deletion by manager A.
+	rawA ulid.ULID
 
 	next uint64
 }
@@ -106,8 +116,7 @@ func (f *rollbackFixture) writeMeta(t *testing.T, m metadata.Meta) {
 
 func (f *rollbackFixture) mark(t *testing.T, id ulid.ULID, details string) {
 	t.Helper()
-	testutil.Ok(t, block.MarkForDeletion(t.Context(), log.NewNopLogger(), f.bkt, id, details,
-		promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"})))
+	testutil.Ok(t, block.MarkForDeletion(t.Context(), log.NewNopLogger(), f.bkt, id, details, promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"})))
 }
 
 func (f *rollbackFixture) remove(t *testing.T, id ulid.ULID) {
@@ -256,7 +265,8 @@ func TestRollbackDetectsRunningManager(t *testing.T) {
 	s, err := NewScheduler(ctx, log.NewNopLogger(), f.bkt, prometheus.NewRegistry(), ManagerConfig{JournalID: "A", LeaseTTL: 10 * time.Millisecond})
 	testutil.Ok(t, err)
 	time.Sleep(20 * time.Millisecond)
-	testutil.Ok(t, s.Maintain()) // idle, but alive
+	// The manager is idle, but alive.
+	testutil.Ok(t, s.Maintain())
 
 	r, err := PlanRollback(ctx, log.NewNopLogger(), f.bkt, RollbackOptions{JournalID: "A"})
 	testutil.Ok(t, err)
@@ -273,8 +283,7 @@ func TestRollbackRestoresSourcesGarbageCollectionMarked(t *testing.T) {
 	f := newRollbackFixture(t)
 	ctx := t.Context()
 
-	testutil.Ok(t, block.RemoveMark(ctx, log.NewNopLogger(), f.bkt, f.sourceA,
-		promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"}), metadata.DeletionMarkFilename))
+	testutil.Ok(t, block.RemoveMark(ctx, log.NewNopLogger(), f.bkt, f.sourceA, promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"}), metadata.DeletionMarkFilename))
 	f.mark(t, f.sourceA, outdatedBlockDetails)
 
 	r, err := PlanRollback(ctx, log.NewNopLogger(), f.bkt, RollbackOptions{JournalID: "A"})
@@ -353,22 +362,24 @@ func (b *rollbackDeleteFailureBucket) Delete(ctx context.Context, name string) e
 // output deletion, including GC marks that carry no journal information.
 func TestRollbackCanResumeAfterInterruption(t *testing.T) {
 	for failAt := 1; failAt <= 8; failAt++ {
-		f := newRollbackFixture(t)
-		testutil.Ok(t, block.RemoveMark(t.Context(), log.NewNopLogger(), f.bkt, f.sourceA, promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"}), metadata.DeletionMarkFilename))
-		f.mark(t, f.sourceA, outdatedBlockDetails)
-		r, err := PlanRollback(t.Context(), log.NewNopLogger(), f.bkt, RollbackOptions{JournalID: "A"})
-		testutil.Ok(t, err)
-		failing := &rollbackDeleteFailureBucket{Bucket: f.bkt, failAt: failAt}
-		_ = r.Apply(t.Context(), log.NewNopLogger(), failing)
-		// A block whose metadata was deleted but whose index remains is an
-		// explicitly allowed remnant of this interrupted offline rollback.
-		again, err := PlanRollback(t.Context(), log.NewNopLogger(), f.bkt, RollbackOptions{JournalID: "A", AllowUnreadableBlocks: true})
-		testutil.Ok(t, err)
-		testutil.Ok(t, again.Apply(t.Context(), log.NewNopLogger(), f.bkt))
-		for _, id := range []ulid.ULID{f.sourceA, f.rawA} {
-			testutil.Equals(t, true, exists(t, f.bkt, path.Join(id.String(), block.MetaFilename)))
-			testutil.Equals(t, false, exists(t, f.bkt, path.Join(id.String(), metadata.DeletionMarkFilename)))
-		}
+		t.Run(fmt.Sprintf("interrupted at delete %d", failAt), func(t *testing.T) {
+			f := newRollbackFixture(t)
+			testutil.Ok(t, block.RemoveMark(t.Context(), log.NewNopLogger(), f.bkt, f.sourceA, promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"}), metadata.DeletionMarkFilename))
+			f.mark(t, f.sourceA, outdatedBlockDetails)
+			r, err := PlanRollback(t.Context(), log.NewNopLogger(), f.bkt, RollbackOptions{JournalID: "A"})
+			testutil.Ok(t, err)
+			failing := &rollbackDeleteFailureBucket{Bucket: f.bkt, failAt: failAt}
+			_ = r.Apply(t.Context(), log.NewNopLogger(), failing)
+			// A block whose metadata was deleted but whose index remains is an
+			// explicitly allowed remnant of this interrupted offline rollback.
+			again, err := PlanRollback(t.Context(), log.NewNopLogger(), f.bkt, RollbackOptions{JournalID: "A", AllowUnreadableBlocks: true})
+			testutil.Ok(t, err)
+			testutil.Ok(t, again.Apply(t.Context(), log.NewNopLogger(), f.bkt))
+			for _, id := range []ulid.ULID{f.sourceA, f.rawA} {
+				testutil.Equals(t, true, exists(t, f.bkt, path.Join(id.String(), block.MetaFilename)))
+				testutil.Equals(t, false, exists(t, f.bkt, path.Join(id.String(), metadata.DeletionMarkFilename)))
+			}
+		})
 	}
 }
 
@@ -395,50 +406,29 @@ func TestRollbackRestoresSourcesAfterManagerCrashAndGC(t *testing.T) {
 	out.Compaction.Sources = []ulid.ULID{sourceID, source2.ULID}
 	var err error
 	out.Thanos.Extensions, err = (Provenance{TaskID: "task", TaskType: TaskCompaction, JournalID: "review"}).For(outID, []string{sourceID.String(), source2.ULID.String()}).Stamp(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Ok(t, err)
 	for _, m := range []metadata.Meta{source, source2, out} {
-		raw, err := json.Marshal(m)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := bkt.Upload(ctx, path.Join(m.ULID.String(), block.MetaFilename), strings.NewReader(string(raw))); err != nil {
-			t.Fatal(err)
-		}
+		raw, marshalErr := json.Marshal(m)
+		testutil.Ok(t, marshalErr)
+		testutil.Ok(t, bkt.Upload(ctx, path.Join(m.ULID.String(), block.MetaFilename), strings.NewReader(string(raw))))
 	}
 	dedupFilter := block.NewDeduplicateFilter(1)
 	ignoreFilter := block.NewIgnoreDeletionMarkFilter(logger, bkt, 0, 1)
 	fetcher, err := block.NewMetaFetcher(logger, 1, bkt, block.NewConcurrentLister(logger, bkt), "", prometheus.NewRegistry(), []block.MetadataFilter{ignoreFilter, dedupFilter})
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.Ok(t, err)
 	counter := func() prometheus.Counter {
 		return promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "review"})
 	}
 	syncer, err := compact.NewMetaSyncer(logger, prometheus.NewRegistry(), bkt, fetcher, dedupFilter, ignoreFilter, counter(), counter(), 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := syncer.SyncMetas(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if err := syncer.GarbageCollect(ctx, nil); err != nil {
-		t.Fatal(err)
-	}
+	testutil.Ok(t, err)
+	testutil.Ok(t, syncer.SyncMetas(ctx))
+	testutil.Ok(t, syncer.GarbageCollect(ctx, nil))
 	var before metadata.DeletionMark
-	if err := metadata.ReadMarker(ctx, logger, bkt, sourceID.String(), &before); err != nil {
-		t.Fatalf("expected GC source mark: %v", err)
-	}
+	testutil.Ok(t, metadata.ReadMarker(ctx, logger, bkt, sourceID.String(), &before), "expected GC source mark")
 	r, err := PlanRollback(ctx, logger, bkt, RollbackOptions{JournalID: "review"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := r.Apply(ctx, logger, bkt); err != nil {
-		t.Fatal(err)
-	}
+	testutil.Ok(t, err)
+	testutil.Ok(t, r.Apply(ctx, logger, bkt))
 	var mark metadata.DeletionMark
-	if err := metadata.ReadMarker(ctx, logger, bkt, sourceID.String(), &mark); err == nil {
-		t.Fatalf("rollback deleted output but left only source marked for deletion: %q; restore=%v", mark.Details, r.Restore)
-	}
+	err = metadata.ReadMarker(ctx, logger, bkt, sourceID.String(), &mark)
+	testutil.NotOk(t, err, "rollback deleted output but left only source marked for deletion: %q; restore=%v", mark.Details, r.Restore)
 }

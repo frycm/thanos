@@ -54,8 +54,7 @@ import (
 //
 // or with THANOS_DISTRIBUTED_SCENARIOS set in the environment.
 
-var runScenarios = flag.Bool("distributed.scenarios", false,
-	"Run the in-process fault scenario suite for the distributed compactor. Slow; off by default.")
+var runScenarios = flag.Bool("distributed.scenarios", false, "Run the in-process fault scenario suite for the distributed compactor. Slow; off by default.")
 
 func skipUnlessScenarios(t *testing.T) {
 	t.Helper()
@@ -65,8 +64,8 @@ func skipUnlessScenarios(t *testing.T) {
 	compacttest.SkipUnlessScenarios(t)
 }
 
-// --- one compactor process ------------------------------------------------------
-
+// modeStandalone and modeManager are the modes one compactor process of a
+// scenario runs in.
 const (
 	modeStandalone = "standalone"
 	modeManager    = "manager"
@@ -150,7 +149,7 @@ func newNode(t *testing.T, shared objstore.Bucket, handler *switchableHandler, c
 						return nil
 					}
 					if !compact.IsHaltError(err) {
-						level.Warn(cn.Logger).Log("msg", "maintenance", "err", err)
+						level.Warn(cn.Logger).Log("msg", "maintenance tick failed; retrying on the next tick", "err", err)
 						return nil
 					}
 					cn.Halted.Store(true)
@@ -165,8 +164,6 @@ func newNode(t *testing.T, shared objstore.Bucket, handler *switchableHandler, c
 	n.Node = compacttest.NewNode(t, shared, conf.NodeConfig, hooks)
 	return n
 }
-
-// --- a scenario run ---------------------------------------------------------------
 
 // scenarioRun is one bucket, one manager behind a stable URL, and the workers
 // a scenario starts against it.
@@ -199,10 +196,10 @@ func newScenarioRun(t *testing.T, c *compacttest.Corpus, conf nodeConfig) *scena
 	s.Run = compacttest.NewRun(t, c, s.conf.NodeConfig)
 	s.NewNode = func(base compacttest.NodeConfig) *compacttest.Node {
 		s.mtx.Lock()
-		conf := s.next
+		nodeConf := s.next
 		s.mtx.Unlock()
-		conf.NodeConfig = base
-		n := newNode(t, s.Shared, s.handler, conf)
+		nodeConf.NodeConfig = base
+		n := newNode(t, s.Shared, s.handler, nodeConf)
 		s.mtx.Lock()
 		s.manager = n
 		s.mtx.Unlock()
@@ -285,8 +282,12 @@ func (s *scenarioRun) startWorker(id string, opts ...workerOpts) *scnWorker {
 	comp, err := tsdb.NewLeveledCompactor(context.Background(), w.reg, logutil.GoKitLogToSlog(logger), compacttest.Levels, downsample.NewPool(), compacttest.MergeFuncFor(o.dedupFunc))
 	testutil.Ok(s.t, err)
 
-	client := NewHTTPClient(logger, dns.NewProvider(logger, prometheus.NewRegistry(), dns.GolangResolverType),
-		strings.TrimPrefix(s.srv.URL, "http://"), 5*time.Second)
+	client := NewHTTPClient(
+		logger,
+		dns.NewProvider(logger, prometheus.NewRegistry(), dns.GolangResolverType),
+		strings.TrimPrefix(s.srv.URL, "http://"),
+		5*time.Second,
+	)
 	worker, err := NewWorker(logger, w.bkt, crashableClient{TaskClient: client, dead: w.dead}, comp, w.reg, WorkerConfig{
 		WorkerID:           id,
 		JournalID:          o.journalID,
@@ -346,7 +347,7 @@ func (s *scenarioRun) tasksInState(state TaskState) []*TaskEntry {
 	return out
 }
 
-// waitLeasedBy waits until the worker holds a lease and returns the task.
+// waitLeasedBy waits until the worker holds a lease.
 func (s *scenarioRun) waitLeasedBy(workerID string) {
 	s.t.Helper()
 	s.WaitFor(workerID+" to lease a task", func() bool {

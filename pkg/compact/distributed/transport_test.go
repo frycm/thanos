@@ -4,7 +4,6 @@
 package distributed
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -16,6 +15,7 @@ import (
 	"github.com/thanos-io/objstore"
 
 	"github.com/thanos-io/thanos/pkg/discovery/dns"
+	"github.com/thanos-io/thanos/pkg/runutil"
 )
 
 // TestHTTPTransportRoundTrip drives a worker's whole conversation with a manager
@@ -67,11 +67,9 @@ func TestHTTPTransportRoundTrip(t *testing.T) {
 	}
 }
 
-// TestHTTPTransportRejectsTaskTypeWorkerDoesNotAccept asserts a worker is never
-// handed a kind of task it did not ask for.
-// TestHTTPTransportAcceptsOnlyPost: the task API takes a POST on every
-// endpoint and answers any other method with 405 and an Allow header,
-// before a handler reads anything.
+// TestHTTPTransportAcceptsOnlyPost asserts the task API takes a POST on every
+// endpoint and answers any other method with 405 and an Allow header, before
+// a handler reads anything.
 func TestHTTPTransportAcceptsOnlyPost(t *testing.T) {
 	mux := http.NewServeMux()
 	RegisterServer(mux, log.NewNopLogger(), testScheduler(t, objstore.NewInMemBucket(), ManagerConfig{}))
@@ -83,14 +81,18 @@ func TestHTTPTransportAcceptsOnlyPost(t *testing.T) {
 		testutil.Ok(t, err)
 		resp, err := srv.Client().Do(req)
 		testutil.Ok(t, err)
-		testutil.Ok(t, resp.Body.Close())
+		var closeErr error
+		runutil.ExhaustCloseWithErrCapture(&closeErr, resp.Body, "close response body")
+		testutil.Ok(t, closeErr)
 		testutil.Equals(t, http.StatusMethodNotAllowed, resp.StatusCode, path)
 		testutil.Equals(t, http.MethodPost, resp.Header.Get("Allow"), path)
 	}
 }
 
+// TestHTTPTransportRejectsTaskTypeWorkerDoesNotAccept asserts a worker is never
+// handed a kind of task it did not ask for.
 func TestHTTPTransportRejectsTaskTypeWorkerDoesNotAccept(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	sched := testScheduler(t, objstore.NewInMemBucket(), ManagerConfig{})
 
 	_, err := sched.Submit(ctx, Task{ID: "d1", Type: TaskDownsample})

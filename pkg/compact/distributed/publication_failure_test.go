@@ -6,7 +6,6 @@ package distributed
 import (
 	"bytes"
 	"context"
-	"errors"
 	"io"
 	"path"
 	"strings"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/efficientgo/core/testutil"
 	"github.com/oklog/ulid/v2"
+	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/tsdb"
@@ -26,6 +26,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/compact/compacttest"
 	"github.com/thanos-io/thanos/pkg/compact/downsample"
 	"github.com/thanos-io/thanos/pkg/logutil"
+	"github.com/thanos-io/thanos/pkg/runutil"
 )
 
 // publicationFault can lose the acknowledgement after a successful write,
@@ -54,10 +55,12 @@ func sourceObjects(t *testing.T, bkt objstore.Bucket, sources []string) map[stri
 	t.Helper()
 	objects := map[string][]byte{}
 	for _, id := range sources {
-		testutil.Ok(t, bkt.Iter(t.Context(), id+"/", func(name string) error {
+		testutil.Ok(t, bkt.Iter(t.Context(), id+"/", func(name string) (err error) {
 			r, err := bkt.Get(t.Context(), name)
-			testutil.Ok(t, err)
-			defer r.Close()
+			if err != nil {
+				return err
+			}
+			defer runutil.CloseWithErrCapture(&err, r, "close %s", name)
 			objects[name], err = io.ReadAll(r)
 			return err
 		}, objstore.WithRecursiveIter()))
@@ -82,6 +85,9 @@ func resultContent(t *testing.T, bkt objstore.Bucket, result Result) *compacttes
 // must leave the sources byte-for-byte intact, and retrying must produce the
 // same samples and aggregates as a clean execution of the task.
 func TestWorkerPublicationFailuresPreserveData(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs real TSDB compactions and downsamplings")
+	}
 	for _, kind := range []string{"compaction", "raw-to-5m", "5m-to-1h"} {
 		for _, stage := range []string{"chunks", "index", "meta.json"} {
 			for _, after := range []bool{false, true} {
@@ -98,10 +104,10 @@ func TestWorkerPublicationFailuresPreserveData(t *testing.T) {
 					w, err := NewWorker(c.logger, c.shared, nil, comp, prometheus.NewRegistry(), WorkerConfig{JournalID: journalID, DataDir: t.TempDir()})
 					testutil.Ok(t, err)
 					lease := func(task Task) Task {
-						_, err := c.sched.Submit(t.Context(), task)
-						testutil.Ok(t, err)
-						leased, err := c.sched.Lease(t.Context(), LeaseRequest{WorkerID: "w"})
-						testutil.Ok(t, err)
+						_, submitErr := c.sched.Submit(t.Context(), task)
+						testutil.Ok(t, submitErr)
+						leased, leaseErr := c.sched.Lease(t.Context(), LeaseRequest{WorkerID: "w"})
+						testutil.Ok(t, leaseErr)
 						testutil.Assert(t, leased != nil, "task must be leased")
 						return *leased
 					}
@@ -113,8 +119,8 @@ func TestWorkerPublicationFailuresPreserveData(t *testing.T) {
 							prepared := w.execute(t.Context(), lease(DownsampleTask(m, downsample.ResLevel1, metadata.NoneFunc, 1, false, nil)), testAtomicBool(true))
 							testutil.Equals(t, OutcomeCompleted, prepared.Outcome)
 							testutil.Ok(t, c.sched.Report(t.Context(), prepared))
-							meta, err := block.DownloadMeta(t.Context(), c.logger, c.shared, ulid.MustParse(prepared.OutputBlocks[0]))
-							testutil.Ok(t, err)
+							meta, downloadErr := block.DownloadMeta(t.Context(), c.logger, c.shared, ulid.MustParse(prepared.OutputBlocks[0]))
+							testutil.Ok(t, downloadErr)
 							m = &meta
 						}
 						target := downsample.ResLevel1
@@ -147,8 +153,8 @@ func TestWorkerPublicationFailuresPreserveData(t *testing.T) {
 					testutil.Assert(t, failed.Outcome != OutcomeCompleted, "failed publication was accepted")
 					testutil.Equals(t, before, sourceObjects(t, c.shared, task.SourceBlocks))
 					for _, id := range task.SourceBlocks {
-						exists, err := c.shared.Exists(t.Context(), path.Join(id, metadata.DeletionMarkFilename))
-						testutil.Ok(t, err)
+						exists, existsErr := c.shared.Exists(t.Context(), path.Join(id, metadata.DeletionMarkFilename))
+						testutil.Ok(t, existsErr)
 						testutil.Assert(t, !exists, "worker must never delete a source")
 					}
 					w.bkt = c.shared
@@ -163,6 +169,9 @@ func TestWorkerPublicationFailuresPreserveData(t *testing.T) {
 }
 
 func TestSourceDeletionFailureCanBeRetried(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs real TSDB compactions")
+	}
 	for _, after := range []bool{false, true} {
 		t.Run(map[bool]string{false: "before write", true: "lost acknowledgement"}[after], func(t *testing.T) {
 			// These tests execute directly, without the worker heartbeat loop.

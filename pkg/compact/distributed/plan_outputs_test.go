@@ -23,6 +23,9 @@ import (
 // which produces exactly those blocks, and the manager verifies each result
 // block against one of the plan's outputs before it retires the sources.
 func TestInteractionPlanOutputsAreProducedAsPlanned(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs a real manager and workers in real time")
+	}
 	c := newTestCluster(t)
 	c.startWorker("w1")
 

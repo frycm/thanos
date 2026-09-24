@@ -31,57 +31,87 @@ func TestVerifyDownsampledBlock(t *testing.T) {
 	candidate := downsample.Candidate{Meta: sourceMeta, TargetResolution: downsample.ResLevel1}
 	want := Provenance{TaskID: "d1", TaskType: TaskDownsample, JournalID: "shard-a", Generation: 2}
 
-	valid := func() metadata.Meta {
+	stamp := func(t *testing.T, m *metadata.Meta, p Provenance) {
+		ext, err := p.For(m.ULID, []string{sourceMeta.ULID.String()}).Stamp(nil)
+		testutil.Ok(t, err)
+		m.Thanos.Extensions = ext
+	}
+	valid := func(t *testing.T) metadata.Meta {
 		m := metadata.Meta{}
 		m.ULID = ulid.MustNew(9, nil)
 		m.MinTime, m.MaxTime = sourceMeta.MinTime, sourceMeta.MaxTime
 		m.Compaction.Sources = []ulid.ULID{src1, src2}
 		m.Thanos.Labels = map[string]string{"ext": "1"}
 		m.Thanos.Downsample.Resolution = downsample.ResLevel1
-		ext, err := want.For(m.ULID, []string{sourceMeta.ULID.String()}).Stamp(nil)
-		testutil.Ok(t, err)
-		m.Thanos.Extensions = ext
+		stamp(t, &m, want)
 		return m
 	}
 
-	ok := valid()
-	testutil.Ok(t, verifyDownsampledBlock(&ok, candidate, want))
-
-	wrongRes := valid()
-	wrongRes.Thanos.Downsample.Resolution = downsample.ResLevel2
-	testutil.NotOk(t, verifyDownsampledBlock(&wrongRes, candidate, want))
-
-	wrongLabels := valid()
-	wrongLabels.Thanos.Labels = map[string]string{"ext": "other"}
-	testutil.NotOk(t, verifyDownsampledBlock(&wrongLabels, candidate, want))
-
-	wrongSpan := valid()
-	wrongSpan.MaxTime++
-	testutil.NotOk(t, verifyDownsampledBlock(&wrongSpan, candidate, want))
-
-	wrongSources := valid()
-	wrongSources.Compaction.Sources = []ulid.ULID{src1, ulid.MustNew(42, nil)}
-	testutil.NotOk(t, verifyDownsampledBlock(&wrongSources, candidate, want))
-
-	fewerSources := valid()
-	fewerSources.Compaction.Sources = []ulid.ULID{src1}
-	testutil.NotOk(t, verifyDownsampledBlock(&fewerSources, candidate, want))
-
-	// The block has to record exactly the task it is reported for: the
-	// rollback finds downsampled blocks by that record.
-	noProvenance := valid()
-	noProvenance.Thanos.Extensions = nil
-	testutil.NotOk(t, verifyDownsampledBlock(&noProvenance, candidate, want))
-
-	otherTask := valid()
-	ext, err := Provenance{TaskID: "d2", TaskType: TaskDownsample, JournalID: "shard-a", Generation: 2}.For(ulid.MustNew(9, nil), []string{sourceMeta.ULID.String()}).Stamp(nil)
-	testutil.Ok(t, err)
-	otherTask.Thanos.Extensions = ext
-	testutil.NotOk(t, verifyDownsampledBlock(&otherTask, candidate, want))
-
-	compactionTask := valid()
-	ext, err = Provenance{TaskID: "d1", TaskType: TaskCompaction, JournalID: "shard-a", Generation: 2}.For(ulid.MustNew(9, nil), []string{sourceMeta.ULID.String()}).Stamp(nil)
-	testutil.Ok(t, err)
-	compactionTask.Thanos.Extensions = ext
-	testutil.NotOk(t, verifyDownsampledBlock(&compactionTask, candidate, want))
+	for _, tcase := range []struct {
+		name    string
+		mutate  func(t *testing.T, m *metadata.Meta)
+		wantErr bool
+	}{
+		{
+			name:   "valid downsample",
+			mutate: func(*testing.T, *metadata.Meta) {},
+		},
+		{
+			name:    "wrong resolution",
+			mutate:  func(_ *testing.T, m *metadata.Meta) { m.Thanos.Downsample.Resolution = downsample.ResLevel2 },
+			wantErr: true,
+		},
+		{
+			name:    "wrong labels",
+			mutate:  func(_ *testing.T, m *metadata.Meta) { m.Thanos.Labels = map[string]string{"ext": "other"} },
+			wantErr: true,
+		},
+		{
+			name:    "wrong time range",
+			mutate:  func(_ *testing.T, m *metadata.Meta) { m.MaxTime++ },
+			wantErr: true,
+		},
+		{
+			name:    "wrong sources",
+			mutate:  func(_ *testing.T, m *metadata.Meta) { m.Compaction.Sources = []ulid.ULID{src1, ulid.MustNew(42, nil)} },
+			wantErr: true,
+		},
+		{
+			name:    "fewer sources",
+			mutate:  func(_ *testing.T, m *metadata.Meta) { m.Compaction.Sources = []ulid.ULID{src1} },
+			wantErr: true,
+		},
+		// The block has to record exactly the task it is reported for: the
+		// rollback finds downsampled blocks by that record.
+		{
+			name:    "no provenance",
+			mutate:  func(_ *testing.T, m *metadata.Meta) { m.Thanos.Extensions = nil },
+			wantErr: true,
+		},
+		{
+			name: "provenance of another task",
+			mutate: func(t *testing.T, m *metadata.Meta) {
+				stamp(t, m, Provenance{TaskID: "d2", TaskType: TaskDownsample, JournalID: "shard-a", Generation: 2})
+			},
+			wantErr: true,
+		},
+		{
+			name: "provenance of a compaction task",
+			mutate: func(t *testing.T, m *metadata.Meta) {
+				stamp(t, m, Provenance{TaskID: "d1", TaskType: TaskCompaction, JournalID: "shard-a", Generation: 2})
+			},
+			wantErr: true,
+		},
+	} {
+		t.Run(tcase.name, func(t *testing.T) {
+			m := valid(t)
+			tcase.mutate(t, &m)
+			err := verifyDownsampledBlock(&m, candidate, want)
+			if tcase.wantErr {
+				testutil.NotOk(t, err)
+				return
+			}
+			testutil.Ok(t, err)
+		})
+	}
 }

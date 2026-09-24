@@ -197,7 +197,8 @@ func TestSchedulerTakeoverVoidsOldLeases(t *testing.T) {
 	testutil.Assert(t, again == nil, "nothing is handed out again")
 
 	// The worker of the previous manager can no longer prove it owns the task.
-	got, _ := CheckOwnership(ctx, bkt, "shard-a", "t1", leased.LeaseToken, leased.Generation, 0)
+	got, err := CheckOwnership(ctx, bkt, "shard-a", "t1", leased.LeaseToken, leased.Generation, 0)
+	testutil.NotOk(t, err)
 	testutil.Equals(t, OwnershipLost, got)
 }
 
@@ -208,7 +209,8 @@ func TestSchedulerHaltsWhenAnotherManagerTakesOver(t *testing.T) {
 	bkt := objstore.NewInMemBucket()
 
 	first := testScheduler(t, bkt, ManagerConfig{})
-	_ = testScheduler(t, bkt, ManagerConfig{}) // takes over
+	// A second manager takes over the journal.
+	_ = testScheduler(t, bkt, ManagerConfig{})
 
 	_, err := first.Submit(ctx, Task{ID: "t2", Type: TaskCompaction})
 	testutil.NotOk(t, err)
@@ -221,26 +223,54 @@ func TestSchedulerHaltsWhenAnotherManagerTakesOver(t *testing.T) {
 func TestErrorClassSurvivesTheWire(t *testing.T) {
 	block := "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 
-	halt := ReconstructError(Result{Outcome: OutcomeFailedHalt, ErrorMessage: "boom"})
-	testutil.Equals(t, true, compact.IsHaltError(halt))
-
-	retry := ReconstructError(Result{Outcome: OutcomeFailedRetryable, ErrorMessage: "boom"})
-	testutil.Equals(t, true, compact.IsRetryError(retry))
-
-	i347 := ReconstructError(Result{Outcome: OutcomeFailedIssue347, OffendingBlock: block, ErrorMessage: "boom"})
-	testutil.Equals(t, true, compact.IsIssue347Error(i347))
-
-	ooo := ReconstructError(Result{Outcome: OutcomeFailedOOOChunks, OffendingBlock: block, ErrorMessage: "boom"})
-	testutil.Equals(t, true, compact.IsOutOfOrderChunkError(ooo))
-
-	// A malformed block ID degrades to a retry rather than losing the failure.
-	testutil.Equals(t, true, compact.IsRetryError(ReconstructError(Result{Outcome: OutcomeFailedIssue347, OffendingBlock: "nope"})))
-
-	// Aborted work is not a compaction failure.
-	testutil.Ok(t, ReconstructError(Result{Outcome: OutcomeAbortedOwnershipLost}))
-	testutil.Ok(t, ReconstructError(Result{Outcome: OutcomeAbortedStoreUnreachable}))
-	testutil.Ok(t, ReconstructError(Result{Outcome: OutcomeCompleted}))
-	testutil.Ok(t, ReconstructError(Result{Outcome: OutcomeAbortedWorkerShutdown}))
+	for _, tcase := range []struct {
+		name   string
+		result Result
+		// is reports whether the rebuilt error is of the expected class; nil
+		// means no error is expected.
+		is func(error) bool
+	}{
+		{
+			name:   "halt",
+			result: Result{Outcome: OutcomeFailedHalt, ErrorMessage: "boom"},
+			is:     compact.IsHaltError,
+		},
+		{
+			name:   "retryable",
+			result: Result{Outcome: OutcomeFailedRetryable, ErrorMessage: "boom"},
+			is:     compact.IsRetryError,
+		},
+		{
+			name:   "issue 347",
+			result: Result{Outcome: OutcomeFailedIssue347, OffendingBlock: block, ErrorMessage: "boom"},
+			is:     compact.IsIssue347Error,
+		},
+		{
+			name:   "out of order chunks",
+			result: Result{Outcome: OutcomeFailedOOOChunks, OffendingBlock: block, ErrorMessage: "boom"},
+			is:     compact.IsOutOfOrderChunkError,
+		},
+		// A malformed block ID degrades to a retry rather than losing the failure.
+		{
+			name:   "malformed offending block",
+			result: Result{Outcome: OutcomeFailedIssue347, OffendingBlock: "nope"},
+			is:     compact.IsRetryError,
+		},
+		// Aborted work is not a compaction failure.
+		{name: "aborted ownership lost", result: Result{Outcome: OutcomeAbortedOwnershipLost}},
+		{name: "aborted store unreachable", result: Result{Outcome: OutcomeAbortedStoreUnreachable}},
+		{name: "completed", result: Result{Outcome: OutcomeCompleted}},
+		{name: "aborted worker shutdown", result: Result{Outcome: OutcomeAbortedWorkerShutdown}},
+	} {
+		t.Run(tcase.name, func(t *testing.T) {
+			err := ReconstructError(tcase.result)
+			if tcase.is == nil {
+				testutil.Ok(t, err)
+				return
+			}
+			testutil.Equals(t, true, tcase.is(err))
+		})
+	}
 }
 
 // countingBucket counts uploads, to observe journal writes.

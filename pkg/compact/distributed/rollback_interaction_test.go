@@ -24,15 +24,16 @@ import (
 // leave the bucket exactly as the standalone compactor left it - the produced
 // block gone, the sources back without their marks - and nothing else touched.
 func TestInteractionRollbackRestoresBucket(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs a real manager and workers in real time")
+	}
 	c := newTestCluster(t)
 	c.startWorker("w1")
 
 	// A block the distributed compactor never touched, with a mark it did not
 	// write, must survive the rollback untouched.
-	bystander, bystanderMetas := c.makeGroup(labels.FromStrings("ext", "bystander"))
-	_ = bystander
-	testutil.Ok(t, block.MarkForDeletion(t.Context(), c.logger, c.shared, bystanderMetas[0].ULID, "retention",
-		promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"})))
+	_, bystanderMetas := c.makeGroup(labels.FromStrings("ext", "bystander"))
+	testutil.Ok(t, block.MarkForDeletion(t.Context(), c.logger, c.shared, bystanderMetas[0].ULID, "retention", promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"})))
 
 	cg, toCompact := c.makeGroup(labels.FromStrings("ext", "1"))
 	var got executeOutcome

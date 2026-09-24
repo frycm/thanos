@@ -5,7 +5,6 @@ package distributed
 
 import (
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +15,7 @@ import (
 	"github.com/efficientgo/core/testutil"
 	"github.com/go-kit/log"
 	"github.com/oklog/ulid/v2"
+	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/tsdb"
@@ -47,6 +47,9 @@ func (c *heartbeatFailureClient) Heartbeat(ctx context.Context, _ HeartbeatReque
 }
 
 func TestWorkerStopsAfterUnacknowledgedLeaseTTL(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits out real lease TTLs")
+	}
 	for _, blocked := range []bool{false, true} {
 		t.Run(map[bool]string{false: "failed requests", true: "blocked request"}[blocked], func(t *testing.T) {
 			client := &heartbeatFailureClient{block: blocked}
@@ -77,13 +80,25 @@ func TestWorkerRejectsTaskPathBeforeTouchingDisk(t *testing.T) {
 	testutil.Ok(t, os.MkdirAll(filepath.Dir(victim), 0750))
 	testutil.Ok(t, os.WriteFile(victim, []byte("keep"), 0600))
 	w := &Worker{conf: WorkerConfig{DataDir: filepath.Join(root, "worker")}}
-	for _, id := range []string{"../victim", "..", filepath.Dir(victim), "", "not-a-ulid", strings.ToLower(ulid.Make().String())} {
-		res := w.execute(t.Context(), Task{ID: id, Type: TaskCompaction}, testAtomicBool(true))
-		testutil.Equals(t, OutcomeFailedRetryable, res.Outcome)
-		testutil.Assert(t, strings.Contains(res.ErrorMessage, "ULID"), "must reject the ID before executing: %s", res.ErrorMessage)
-		b, err := os.ReadFile(victim)
-		testutil.Ok(t, err)
-		testutil.Equals(t, "keep", string(b))
+	for _, tc := range []struct {
+		name string
+		id   string
+	}{
+		{name: "relative path to a sibling", id: "../victim"},
+		{name: "parent directory", id: ".."},
+		{name: "absolute path", id: filepath.Dir(victim)},
+		{name: "empty", id: ""},
+		{name: "not a ULID", id: "not-a-ulid"},
+		{name: "lowercase ULID", id: strings.ToLower(ulid.Make().String())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res := w.execute(t.Context(), Task{ID: tc.id, Type: TaskCompaction}, testAtomicBool(true))
+			testutil.Equals(t, OutcomeFailedRetryable, res.Outcome)
+			testutil.Assert(t, strings.Contains(res.ErrorMessage, "ULID"), "must reject the ID before executing: %s", res.ErrorMessage)
+			b, err := os.ReadFile(victim)
+			testutil.Ok(t, err)
+			testutil.Equals(t, "keep", string(b))
+		})
 	}
 	_, err := os.Stat(w.conf.DataDir)
 	testutil.Assert(t, os.IsNotExist(err), "invalid tasks must not create directories")
@@ -114,24 +129,27 @@ func TestWorkerStartupCleansAbandonedTaskDirectories(t *testing.T) {
 }
 
 func TestWorkerResourceErrorsDoNotHaltManager(t *testing.T) {
-	for _, err := range []error{syscall.ENOSPC, syscall.EMFILE, &os.PathError{Op: "write", Path: "chunks", Err: syscall.ENOSPC}} {
-		outcome, _ := ClassifyError(compact.NewHaltError(err))
-		testutil.Equals(t, OutcomeFailedRetryable, outcome)
-	}
-	outcome, _ := ClassifyError(compact.NewHaltError(errors.New("invalid index")))
-	testutil.Equals(t, OutcomeFailedHalt, outcome)
-
-	// A path error is not evidence of a sick worker: a source block whose
-	// index object is missing or truncated fails with ENOENT or EINVAL from
-	// the bucket's side, and that has to stay the halt the compactor raised,
-	// or the group is silently replanned every pass instead of being seen.
-	for _, err := range []error{
-		&os.PathError{Op: "open", Path: "index", Err: syscall.ENOENT},
-		syscall.EINVAL,
-		&os.PathError{Op: "mmap", Path: "index", Err: syscall.EINVAL},
+	for _, tc := range []struct {
+		name string
+		err  error
+		want Outcome
+	}{
+		{name: "no space left", err: syscall.ENOSPC, want: OutcomeFailedRetryable},
+		{name: "too many open files", err: syscall.EMFILE, want: OutcomeFailedRetryable},
+		{name: "no space left writing chunks", err: &os.PathError{Op: "write", Path: "chunks", Err: syscall.ENOSPC}, want: OutcomeFailedRetryable},
+		{name: "invalid index", err: errors.New("invalid index"), want: OutcomeFailedHalt},
+		// A path error is not evidence of a sick worker: a source block whose
+		// index object is missing or truncated fails with ENOENT or EINVAL from
+		// the bucket's side, and that has to stay the halt the compactor raised,
+		// or the group is silently replanned every pass instead of being seen.
+		{name: "missing index", err: &os.PathError{Op: "open", Path: "index", Err: syscall.ENOENT}, want: OutcomeFailedHalt},
+		{name: "invalid argument", err: syscall.EINVAL, want: OutcomeFailedHalt},
+		{name: "truncated index", err: &os.PathError{Op: "mmap", Path: "index", Err: syscall.EINVAL}, want: OutcomeFailedHalt},
 	} {
-		outcome, _ := ClassifyError(compact.NewHaltError(err))
-		testutil.Equals(t, OutcomeFailedHalt, outcome)
+		t.Run(tc.name, func(t *testing.T) {
+			outcome, _ := ClassifyError(compact.NewHaltError(tc.err))
+			testutil.Equals(t, tc.want, outcome)
+		})
 	}
 }
 
@@ -166,8 +184,8 @@ func TestLeaseExpiredDuringPersistLeavesNoDuplicateQueueEntry(t *testing.T) {
 
 	leased := make(chan error, 1)
 	go func() {
-		_, err := sched.Lease(t.Context(), LeaseRequest{WorkerID: "w1", Accepts: []TaskType{TaskCompaction}})
-		leased <- err
+		_, leaseErr := sched.Lease(t.Context(), LeaseRequest{WorkerID: "w1", Accepts: []TaskType{TaskCompaction}})
+		leased <- leaseErr
 	}()
 	<-uploadStarted
 
@@ -206,8 +224,8 @@ func TestWorkerShutdownAbortsAreNotChargedOrBackedOff(t *testing.T) {
 	testutil.Ok(t, err)
 
 	for range abortCapFor(3) + 1 {
-		task, err := sched.Lease(t.Context(), LeaseRequest{WorkerID: "w1", Accepts: []TaskType{TaskCompaction}})
-		testutil.Ok(t, err)
+		task, leaseErr := sched.Lease(t.Context(), LeaseRequest{WorkerID: "w1", Accepts: []TaskType{TaskCompaction}})
+		testutil.Ok(t, leaseErr)
 		testutil.Assert(t, task != nil, "the task must be leaseable again immediately after a shutdown abort")
 		testutil.Ok(t, sched.Report(t.Context(), Result{
 			TaskID: task.ID, LeaseToken: task.LeaseToken, Generation: task.Generation,
@@ -250,6 +268,9 @@ func TestParkedSourcesRemainParkedWhenPlanGrows(t *testing.T) {
 }
 
 func TestFinalizeRetriesTransientMetadataReads(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs real TSDB compactions")
+	}
 	for _, persistent := range []bool{false, true} {
 		t.Run(map[bool]string{false: "recovers", true: "bounded failure"}[persistent], func(t *testing.T) {
 			// Nothing renews the lease here, so it must outlast the task on a
@@ -290,8 +311,8 @@ func TestFinalizeRetriesTransientMetadataReads(t *testing.T) {
 				testutil.Equals(t, 1, len(ids))
 			}
 			for _, m := range metas {
-				marked, err := c.shared.Exists(t.Context(), m.ULID.String()+"/deletion-mark.json")
-				testutil.Ok(t, err)
+				marked, existsErr := c.shared.Exists(t.Context(), m.ULID.String()+"/deletion-mark.json")
+				testutil.Ok(t, existsErr)
 				testutil.Equals(t, !persistent, marked)
 			}
 		})
@@ -387,7 +408,8 @@ func TestHaltFreezesTheFleet(t *testing.T) {
 
 	// The worker holding the lease is cut off, in memory and in the journal.
 	testutil.Equals(t, false, sched.Heartbeat(HeartbeatRequest{TaskID: leased.ID, LeaseToken: leased.LeaseToken, Generation: leased.Generation}).Acknowledged)
-	status, _ := CheckOwnership(ctx, bkt, "shard-halt", leased.ID, leased.LeaseToken, leased.Generation, sched.conf.LeaseTTL)
+	status, err := CheckOwnership(ctx, bkt, "shard-halt", leased.ID, leased.LeaseToken, leased.Generation, sched.conf.LeaseTTL)
+	testutil.NotOk(t, err)
 	testutil.Equals(t, OwnershipLost, status)
 	testutil.Ok(t, sched.Report(ctx, Result{TaskID: leased.ID, LeaseToken: leased.LeaseToken, Generation: leased.Generation, Outcome: OutcomeCompleted}))
 

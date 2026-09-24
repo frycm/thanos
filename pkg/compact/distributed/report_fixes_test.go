@@ -169,7 +169,7 @@ func TestSchedulerTakeoverEndsUnfinishedTasks(t *testing.T) {
 	// A block the old worker uploads after the takeover is not published, and
 	// maintenance deletes it once the deduplication filter comes across it.
 	id := ulid.MustNew(7, nil)
-	m := resultMeta(id, 200, 0, map[string]string{"ext": "1"})
+	m := resultMeta(t, id, 200, 0, map[string]string{"ext": "1"})
 	m.Version, m.Thanos.Version = metadata.TSDBVersion1, metadata.ThanosVersion1
 	ext, err := (Provenance{TaskID: "leased", TaskType: TaskCompaction, JournalID: "shard-a", Generation: 4}).For(id, nil).Stamp(nil)
 	testutil.Ok(t, err)
@@ -183,9 +183,9 @@ func TestSchedulerTakeoverEndsUnfinishedTasks(t *testing.T) {
 
 	// The tombstones age out like any other finished task.
 	sched.journal.Prune(time.Minute, time.Now().Add(time.Hour))
-	for _, id := range []string{"leased", "pending"} {
-		_, kept := sched.journal.Tasks[id]
-		testutil.Assert(t, !kept, "tombstone %s must age out", id)
+	for _, taskID := range []string{"leased", "pending"} {
+		_, kept := sched.journal.Tasks[taskID]
+		testutil.Assert(t, !kept, "tombstone %s must age out", taskID)
 	}
 }
 
@@ -212,15 +212,33 @@ func TestTakeoverKeepsUnverifiedOutputsPastTheRetention(t *testing.T) {
 	testutil.Equals(t, true, sched.OutputPublished("verified", "b2"))
 }
 
-// --- verifyAndFinalize provenance ---
-
+// provenanceFixture returns an executor, its bucket, a group and the sources
+// of a plan, shared by the tests of verifyAndFinalize's provenance checks.
 func provenanceFixture(t *testing.T) (*RemotePlanExecutor, objstore.Bucket, *compact.Group, []*metadata.Meta) {
 	t.Helper()
 	bkt := objstore.NewInMemBucket()
 
 	cnt := func() prometheus.Counter { return promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"}) }
-	cg, err := compact.NewGroup(log.NewNopLogger(), bkt, "0@test", labels.FromStrings("ext", "1"), 0,
-		false, false, cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), metadata.NoneFunc, 1, 1)
+	cg, err := compact.NewGroup(
+		log.NewNopLogger(),
+		bkt,
+		"0@test",
+		labels.FromStrings("ext", "1"),
+		0,
+		false,
+		false,
+		cnt(),
+		cnt(),
+		cnt(),
+		cnt(),
+		cnt(),
+		cnt(),
+		cnt(),
+		cnt(),
+		metadata.NoneFunc,
+		1,
+		1,
+	)
 	testutil.Ok(t, err)
 
 	src := func(i uint64, mint, maxt int64, samples uint64) *metadata.Meta {
@@ -238,9 +256,11 @@ func provenanceFixture(t *testing.T) (*RemotePlanExecutor, objstore.Bucket, *com
 	return &RemotePlanExecutor{logger: log.NewNopLogger(), bkt: bkt, journalID: "shard-test"}, bkt, cg, toCompact
 }
 
-// fixtureProvenance is what a worker of the fixture's manager stamps on a
-// result of task t1; tests that want a mismatch override fields.
-var fixtureProvenance = Provenance{TaskID: "t1", TaskType: TaskCompaction, WorkerID: "w1", JournalID: "shard-test", Generation: 0}
+// fixtureProvenance returns what a worker of the fixture's manager stamps on
+// a result of task t1; tests that want a mismatch override fields.
+func fixtureProvenance() Provenance {
+	return Provenance{TaskID: "t1", TaskType: TaskCompaction, WorkerID: "w1", JournalID: "shard-test", Generation: 0}
+}
 
 func uploadResultMeta(t *testing.T, bkt objstore.Bucket, m metadata.Meta) (string, string) {
 	t.Helper()
@@ -250,7 +270,8 @@ func uploadResultMeta(t *testing.T, bkt objstore.Bucket, m metadata.Meta) (strin
 	return m.ULID.String(), checksumOf(raw)
 }
 
-func resultMeta(id ulid.ULID, maxt int64, resolution int64, lbls map[string]string, sources ...ulid.ULID) metadata.Meta {
+func resultMeta(t *testing.T, id ulid.ULID, maxt int64, resolution int64, lbls map[string]string, sources ...ulid.ULID) metadata.Meta {
+	t.Helper()
 	m := metadata.Meta{}
 	m.ULID = id
 	m.MinTime, m.MaxTime = 0, maxt
@@ -258,10 +279,8 @@ func resultMeta(id ulid.ULID, maxt int64, resolution int64, lbls map[string]stri
 	m.Compaction.Sources = sources
 	m.Thanos.Labels = lbls
 	m.Thanos.Downsample.Resolution = resolution
-	ext, err := fixtureProvenance.For(id, nil).Stamp(nil)
-	if err != nil {
-		panic(err)
-	}
+	ext, err := fixtureProvenance().For(id, nil).Stamp(nil)
+	testutil.Ok(t, err)
 	m.Thanos.Extensions = ext
 	return m
 }
@@ -279,8 +298,7 @@ func deletionMarked(t *testing.T, bkt objstore.Bucket, id ulid.ULID) bool {
 func TestVerifyAndFinalizeAcceptsTheRealResult(t *testing.T) {
 	e, bkt, cg, toCompact := provenanceFixture(t)
 
-	out := resultMeta(ulid.MustNew(99, nil), 200, 0, map[string]string{"ext": "1"},
-		toCompact[0].ULID, toCompact[1].ULID)
+	out := resultMeta(t, ulid.MustNew(99, nil), 200, 0, map[string]string{"ext": "1"}, toCompact[0].ULID, toCompact[1].ULID)
 	id, sum := uploadResultMeta(t, bkt, out)
 
 	compIDs, err := e.verifyAndFinalize(t.Context(), cg, compact.Plan{Sources: toCompact}, Result{
@@ -301,33 +319,33 @@ func TestVerifyAndFinalizeRefusesForeignBlocks(t *testing.T) {
 
 	for _, tc := range []struct {
 		name string
-		out  func(toCompact []*metadata.Meta) metadata.Meta
+		out  func(t *testing.T, toCompact []*metadata.Meta) metadata.Meta
 	}{
-		{"unrelated sources", func(tc []*metadata.Meta) metadata.Meta {
-			return resultMeta(ulid.MustNew(99, nil), 200, 0, map[string]string{"ext": "1"}, stranger)
+		{"unrelated sources", func(t *testing.T, _ []*metadata.Meta) metadata.Meta {
+			return resultMeta(t, ulid.MustNew(99, nil), 200, 0, map[string]string{"ext": "1"}, stranger)
 		}},
-		{"foreign labels", func(tc []*metadata.Meta) metadata.Meta {
-			return resultMeta(ulid.MustNew(99, nil), 200, 0, map[string]string{"ext": "other"}, tc[0].ULID, tc[1].ULID)
+		{"foreign labels", func(t *testing.T, toCompact []*metadata.Meta) metadata.Meta {
+			return resultMeta(t, ulid.MustNew(99, nil), 200, 0, map[string]string{"ext": "other"}, toCompact[0].ULID, toCompact[1].ULID)
 		}},
-		{"wrong resolution", func(tc []*metadata.Meta) metadata.Meta {
-			return resultMeta(ulid.MustNew(99, nil), 200, 300000, map[string]string{"ext": "1"}, tc[0].ULID, tc[1].ULID)
+		{"wrong resolution", func(t *testing.T, toCompact []*metadata.Meta) metadata.Meta {
+			return resultMeta(t, ulid.MustNew(99, nil), 200, 300000, map[string]string{"ext": "1"}, toCompact[0].ULID, toCompact[1].ULID)
 		}},
-		{"outside the plan's time range", func(tc []*metadata.Meta) metadata.Meta {
-			return resultMeta(ulid.MustNew(99, nil), 5000, 0, map[string]string{"ext": "1"}, tc[0].ULID, tc[1].ULID)
+		{"outside the plan's time range", func(t *testing.T, toCompact []*metadata.Meta) metadata.Meta {
+			return resultMeta(t, ulid.MustNew(99, nil), 5000, 0, map[string]string{"ext": "1"}, toCompact[0].ULID, toCompact[1].ULID)
 		}},
-		{"covers only part of the plan", func(tc []*metadata.Meta) metadata.Meta {
-			return resultMeta(ulid.MustNew(99, nil), 100, 0, map[string]string{"ext": "1"}, tc[0].ULID)
+		{"covers only part of the plan", func(t *testing.T, toCompact []*metadata.Meta) metadata.Meta {
+			return resultMeta(t, ulid.MustNew(99, nil), 100, 0, map[string]string{"ext": "1"}, toCompact[0].ULID)
 		}},
-		{"claims every source but spans less time", func(tc []*metadata.Meta) metadata.Meta {
+		{"claims every source but spans less time", func(t *testing.T, toCompact []*metadata.Meta) metadata.Meta {
 			// The block sits inside the plan's range and accounts for every
 			// source, but half the planned range is missing: accepting it would
 			// delete that half with the sources.
-			return resultMeta(ulid.MustNew(99, nil), 100, 0, map[string]string{"ext": "1"}, tc[0].ULID, tc[1].ULID)
+			return resultMeta(t, ulid.MustNew(99, nil), 100, 0, map[string]string{"ext": "1"}, toCompact[0].ULID, toCompact[1].ULID)
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e, bkt, cg, toCompact := provenanceFixture(t)
-			id, sum := uploadResultMeta(t, bkt, tc.out(toCompact))
+			id, sum := uploadResultMeta(t, bkt, tc.out(t, toCompact))
 
 			_, err := e.verifyAndFinalize(t.Context(), cg, compact.Plan{Sources: toCompact}, Result{
 				TaskID: "t1", Outcome: OutcomeCompleted,
@@ -341,21 +359,42 @@ func TestVerifyAndFinalizeRefusesForeignBlocks(t *testing.T) {
 	}
 }
 
-// TestVerifyAndFinalizeRefusesChecksumMismatch asserts a result whose metadata
-// does not match what the worker reported uploading is not trusted.
-func TestVerifyAndFinalizeRefusesChecksumMismatch(t *testing.T) {
-	e, bkt, cg, toCompact := provenanceFixture(t)
+// TestVerifyAndFinalizeRefusesUntrustedChecksums asserts a result is not
+// trusted unless its metadata matches the checksum the worker reported for
+// it. The checksum is what binds the report to the metadata the worker
+// observed after upload, and workers always send it.
+func TestVerifyAndFinalizeRefusesUntrustedChecksums(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		checksums func(id string) map[string]string
+	}{
+		{
+			name:      "checksum mismatch",
+			checksums: func(id string) map[string]string { return map[string]string{id: "sha256:not-what-was-uploaded"} },
+		},
+		{
+			name:      "missing checksum",
+			checksums: func(string) map[string]string { return nil },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e, bkt, cg, toCompact := provenanceFixture(t)
 
-	out := resultMeta(ulid.MustNew(99, nil), 200, 0, map[string]string{"ext": "1"},
-		toCompact[0].ULID, toCompact[1].ULID)
-	id, _ := uploadResultMeta(t, bkt, out)
+			out := resultMeta(t, ulid.MustNew(99, nil), 200, 0, map[string]string{"ext": "1"}, toCompact[0].ULID, toCompact[1].ULID)
+			id, _ := uploadResultMeta(t, bkt, out)
 
-	_, err := e.verifyAndFinalize(t.Context(), cg, compact.Plan{Sources: toCompact}, Result{
-		TaskID: "t1", Outcome: OutcomeCompleted,
-		OutputBlocks: []string{id}, OutputChecksums: map[string]string{id: "sha256:not-what-was-uploaded"},
-	})
-	testutil.NotOk(t, err)
-	testutil.Equals(t, false, deletionMarked(t, bkt, toCompact[0].ULID))
+			_, err := e.verifyAndFinalize(t.Context(), cg, compact.Plan{Sources: toCompact}, Result{
+				TaskID:          "t1",
+				Outcome:         OutcomeCompleted,
+				OutputBlocks:    []string{id},
+				OutputChecksums: tc.checksums(id),
+			})
+			testutil.NotOk(t, err)
+			testutil.Equals(t, true, compact.IsRetryError(err))
+			testutil.Equals(t, false, deletionMarked(t, bkt, toCompact[0].ULID))
+			testutil.Equals(t, false, deletionMarked(t, bkt, toCompact[1].ULID))
+		})
+	}
 }
 
 // TestVerifyAndFinalizeEmptyResult asserts a task that legitimately produced
@@ -429,26 +468,6 @@ func TestReportWithRetryGivesUpOnContext(t *testing.T) {
 	testutil.Equals(t, 0, len(c.reported))
 }
 
-// TestVerifyAndFinalizeRefusesMissingChecksum asserts a result reported without
-// its metadata checksum is not trusted: the checksum is what binds the report
-// to the metadata the worker observed after upload, and workers always send it.
-func TestVerifyAndFinalizeRefusesMissingChecksum(t *testing.T) {
-	e, bkt, cg, toCompact := provenanceFixture(t)
-
-	out := resultMeta(ulid.MustNew(99, nil), 200, 0, map[string]string{"ext": "1"},
-		toCompact[0].ULID, toCompact[1].ULID)
-	id, _ := uploadResultMeta(t, bkt, out)
-
-	_, err := e.verifyAndFinalize(t.Context(), cg, compact.Plan{Sources: toCompact}, Result{
-		TaskID: "t1", Outcome: OutcomeCompleted,
-		OutputBlocks: []string{id},
-	})
-	testutil.NotOk(t, err)
-	testutil.Equals(t, true, compact.IsRetryError(err))
-	testutil.Equals(t, false, deletionMarked(t, bkt, toCompact[0].ULID))
-	testutil.Equals(t, false, deletionMarked(t, bkt, toCompact[1].ULID))
-}
-
 // TestSchedulerTakeoverHaltReachesSubmitter asserts that when recording a
 // result reveals another manager owns the journal, the halt is what reaches the
 // submitter - not the worker's outcome. Otherwise the old manager's control
@@ -492,7 +511,8 @@ func TestSchedulerTakeoverHaltReachesSubmitter(t *testing.T) {
 func TestVerifyAndFinalizeRequiresProvenance(t *testing.T) {
 	for _, tc := range []struct {
 		name string
-		prov *Provenance // nil = none at all
+		// prov is the provenance stamped on the result; nil stamps none at all.
+		prov *Provenance
 	}{
 		{"no provenance", nil},
 		{"another task", &Provenance{TaskID: "t2", TaskType: TaskCompaction, JournalID: "shard-test"}},
@@ -503,7 +523,7 @@ func TestVerifyAndFinalizeRequiresProvenance(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			e, bkt, cg, toCompact := provenanceFixture(t)
 
-			out := resultMeta(ulid.MustNew(99, nil), 200, 0, map[string]string{"ext": "1"}, toCompact[0].ULID, toCompact[1].ULID)
+			out := resultMeta(t, ulid.MustNew(99, nil), 200, 0, map[string]string{"ext": "1"}, toCompact[0].ULID, toCompact[1].ULID)
 			out.Thanos.Extensions = nil
 			if tc.prov != nil {
 				ext, err := tc.prov.For(out.ULID, nil).Stamp(nil)
@@ -555,40 +575,105 @@ func TestVerifyTimeCoverage(t *testing.T) {
 
 // TestSchedulerRefusesMismatchedWorkers asserts a worker whose configuration
 // would produce wrong or unverifiable blocks is never handed work, and the
-// refusal names the flag to fix. A worker on another journal would abort every
-// task at its ownership check; a worker with another merge configuration would
-// produce blocks that carry no trace of the difference.
+// refusal names the worker and the flag to fix. A worker on another journal
+// would abort every task at its ownership check, forever; a worker with
+// another merge configuration would merge the sources differently than the
+// manager planned for, and the merge function and replica labels are baked
+// into the worker's compactor and leave no trace in the blocks, so nothing
+// downstream would catch it.
 func TestSchedulerRefusesMismatchedWorkers(t *testing.T) {
-	ctx := t.Context()
-	s := testScheduler(t, objstore.NewInMemBucket(), ManagerConfig{
-		DedupFunc:          "penalty",
-		DedupReplicaLabels: []string{"replica"},
-	})
-	submitTask(t, s)
-
-	ok := LeaseRequest{WorkerID: "w", JournalID: "shard-a", DedupFunc: "penalty", DedupReplicaLabels: []string{"replica"}}
+	plain := ManagerConfig{}
+	dedup := ManagerConfig{DedupFunc: "penalty", DedupReplicaLabels: []string{"replica", "rule_replica"}}
 
 	for _, tc := range []struct {
-		name   string
-		mutate func(r LeaseRequest) LeaseRequest
-		flag   string
+		name string
+		conf ManagerConfig
+		req  LeaseRequest
+		// wantErr lists what the refusal must name; nil means the worker is served.
+		wantErr []string
 	}{
-		{"another journal", func(r LeaseRequest) LeaseRequest { r.JournalID = "other-shard"; return r }, "--compact.manager.journal-id"},
-		{"another merge function", func(r LeaseRequest) LeaseRequest { r.DedupFunc = ""; return r }, "--deduplication.func"},
-		{"other replica labels", func(r LeaseRequest) LeaseRequest { r.DedupReplicaLabels = nil; return r }, "--deduplication.replica-label"},
+		{
+			name:    "another journal",
+			conf:    plain,
+			req:     LeaseRequest{WorkerID: "w1", JournalID: "shard-b"},
+			wantErr: []string{"--compact.manager.journal-id", "shard-b", "w1"},
+		},
+		{
+			name:    "no dedup func",
+			conf:    dedup,
+			req:     LeaseRequest{WorkerID: "w1", DedupReplicaLabels: []string{"replica", "rule_replica"}},
+			wantErr: []string{"--deduplication.func", "w1"},
+		},
+		{
+			name:    "other dedup func",
+			conf:    dedup,
+			req:     LeaseRequest{WorkerID: "w1", DedupFunc: "other", DedupReplicaLabels: []string{"replica", "rule_replica"}},
+			wantErr: []string{"--deduplication.func", "w1"},
+		},
+		{
+			name:    "no replica labels",
+			conf:    dedup,
+			req:     LeaseRequest{WorkerID: "w1", DedupFunc: "penalty"},
+			wantErr: []string{"--deduplication.replica-label", "w1"},
+		},
+		{
+			name:    "fewer replica labels",
+			conf:    dedup,
+			req:     LeaseRequest{WorkerID: "w1", DedupFunc: "penalty", DedupReplicaLabels: []string{"replica"}},
+			wantErr: []string{"--deduplication.replica-label", "w1"},
+		},
+		{
+			name:    "deduplicating worker on a manager on the defaults",
+			conf:    plain,
+			req:     LeaseRequest{WorkerID: "w1", DedupFunc: "penalty", DedupReplicaLabels: []string{"replica"}},
+			wantErr: []string{"--deduplication.func", "w1"},
+		},
+		{
+			name: "matching worker",
+			conf: dedup,
+			req:  LeaseRequest{WorkerID: "w1", JournalID: "shard-a", DedupFunc: "penalty", DedupReplicaLabels: []string{"replica", "rule_replica"}},
+		},
+		// An empty journal ID is tolerated for compatibility with workers that
+		// do not state one.
+		{
+			name: "no journal ID",
+			conf: dedup,
+			req:  LeaseRequest{WorkerID: "w1", DedupFunc: "penalty", DedupReplicaLabels: []string{"replica", "rule_replica"}},
+		},
+		{
+			name: "replica labels in another order",
+			conf: dedup,
+			req:  LeaseRequest{WorkerID: "w1", DedupFunc: "penalty", DedupReplicaLabels: []string{"rule_replica", "replica"}},
+		},
+		{
+			name: "worker on the manager's journal",
+			conf: plain,
+			req:  LeaseRequest{WorkerID: "w1", JournalID: "shard-a"},
+		},
+		// A manager on the defaults accepts a worker on the defaults, which is
+		// what every existing deployment sends.
+		{
+			name: "worker and manager on the defaults",
+			conf: plain,
+			req:  LeaseRequest{WorkerID: "w1"},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := s.Lease(ctx, tc.mutate(ok))
+			s := testScheduler(t, objstore.NewInMemBucket(), tc.conf)
+			submitTask(t, s)
+
+			task, err := s.Lease(t.Context(), tc.req)
+			if tc.wantErr == nil {
+				testutil.Ok(t, err)
+				testutil.Assert(t, task != nil, "a matching worker must be served")
+				return
+			}
 			testutil.NotOk(t, err)
-			testutil.Assert(t, strings.Contains(err.Error(), tc.flag), "the refusal must name the flag, got: %v", err)
+			for _, want := range tc.wantErr {
+				testutil.Assert(t, strings.Contains(err.Error(), want), "the refusal must name %q, got: %v", want, err)
+			}
 		})
 	}
-
-	// A matching worker gets the task; an empty journal ID is tolerated for
-	// compatibility with workers that do not state one.
-	task, err := s.Lease(ctx, ok)
-	testutil.Ok(t, err)
-	testutil.Assert(t, task != nil, "a matching worker must be served")
 }
 
 // TestSchedulerParksOversizedTasks asserts a plan over the configured worker
@@ -646,11 +731,12 @@ func TestSchedulerAbandonedTaskParksItsSources(t *testing.T) {
 	testutil.Ok(t, err)
 
 	for range 2 {
-		task, err := s.Lease(ctx, LeaseRequest{WorkerID: "crashy", JournalID: "shard-a"})
-		testutil.Ok(t, err)
+		task, leaseErr := s.Lease(ctx, LeaseRequest{WorkerID: "crashy", JournalID: "shard-a"})
+		testutil.Ok(t, leaseErr)
 		testutil.Assert(t, task != nil, "expected a lease")
 		time.Sleep(5 * time.Millisecond)
-		testutil.Ok(t, s.Maintain()) // expire without a report
+		// Expire the lease without a report.
+		testutil.Ok(t, s.Maintain())
 	}
 
 	select {

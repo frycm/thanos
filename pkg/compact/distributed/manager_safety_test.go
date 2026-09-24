@@ -48,7 +48,7 @@ func TestVerificationCountsOnlyOnceRecorded(t *testing.T) {
 	sched := testScheduler(t, jb, ManagerConfig{JournalID: "shard-test", JournalUnavailableTimeout: time.Hour})
 	e.sched = sched
 
-	out := resultMeta(ulid.MustNew(99, nil), 200, 0, map[string]string{"ext": "1"}, toCompact[0].ULID, toCompact[1].ULID)
+	out := resultMeta(t, ulid.MustNew(99, nil), 200, 0, map[string]string{"ext": "1"}, toCompact[0].ULID, toCompact[1].ULID)
 	id, sum := uploadResultMeta(t, bkt, out)
 	sched.journal.Tasks["t1"] = &TaskEntry{Task: Task{ID: "t1", Type: TaskCompaction}, State: StateCompleted, Outputs: []string{id}}
 	res := Result{TaskID: "t1", Outcome: OutcomeCompleted, OutputBlocks: []string{id}, OutputChecksums: map[string]string{id: sum}}
@@ -102,7 +102,7 @@ func TestMaintenanceDeletesWithoutTheStateLock(t *testing.T) {
 	sched := testScheduler(t, bkt, ManagerConfig{})
 
 	id := ulid.MustNew(5, nil)
-	m := resultMeta(id, 200, 0, map[string]string{"ext": "1"})
+	m := resultMeta(t, id, 200, 0, map[string]string{"ext": "1"})
 	m.Version, m.Thanos.Version = metadata.TSDBVersion1, metadata.ThanosVersion1
 	ext, err := (Provenance{TaskID: "t1", TaskType: TaskCompaction, JournalID: sched.conf.JournalID}).For(id, nil).Stamp(nil)
 	testutil.Ok(t, err)
@@ -116,12 +116,12 @@ func TestMaintenanceDeletesWithoutTheStateLock(t *testing.T) {
 
 	leased := make(chan error, 1)
 	go func() {
-		_, err := sched.Lease(ctx, LeaseRequest{WorkerID: "w1"})
-		leased <- err
+		_, leaseErr := sched.Lease(ctx, LeaseRequest{WorkerID: "w1"})
+		leased <- leaseErr
 	}()
 	select {
-	case err := <-leased:
-		testutil.Ok(t, err)
+	case leaseErr := <-leased:
+		testutil.Ok(t, leaseErr)
 	case <-time.After(10 * time.Second):
 		close(bkt.release)
 		t.Fatal("a lease waited for maintenance to finish deleting a block")
@@ -171,7 +171,7 @@ func TestStoppedSchedulerWritesNothing(t *testing.T) {
 func TestClaimOutputsRefusesASetOnAPlainPlan(t *testing.T) {
 	_, _, cg, toCompact := provenanceFixture(t)
 	id := ulid.MustNew(99, nil)
-	m := resultMeta(id, 200, 0, map[string]string{"ext": "1"}, toCompact[0].ULID, toCompact[1].ULID)
+	m := resultMeta(t, id, 200, 0, map[string]string{"ext": "1"}, toCompact[0].ULID, toCompact[1].ULID)
 	outMetas := map[ulid.ULID]metadata.Meta{id: m}
 	testutil.Ok(t, claimOutputs(cg, compact.Plan{Sources: toCompact}, Result{}, outMetas))
 

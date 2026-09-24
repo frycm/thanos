@@ -18,6 +18,9 @@ import (
 // subprocess entry point and the fixture are shared with the standalone
 // process test.
 func TestCompactorManagerWorkerProcesses(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and runs real compactor processes")
+	}
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
 	f := newCompactorProcessFixture(t, ctx, 2)
@@ -29,11 +32,17 @@ func TestCompactorManagerWorkerProcesses(t *testing.T) {
 	testutil.Ok(t, err)
 	address := listener.Addr().String()
 	testutil.Ok(t, listener.Close())
-	managerArgs := append(f.Args(f.Dirs[1], address), "--compact.mode=manager", "--compact.manager.journal-id=process-test")
-	manager := f.Start(managerArgs)
+	manager := f.Start(append(f.Args(f.Dirs[1], address), "--compact.mode=manager", "--compact.manager.journal-id=process-test"))
 	for _, worker := range []string{"one", "two"} {
-		f.Start(append(f.Args(f.Dirs[1], "127.0.0.1:0"), "--compact.mode=worker", "--compact.manager.journal-id=process-test", "--compact.worker.id="+worker,
-			"--compact.worker.manager-address="+address, "--compact.worker.poll-interval=25ms", "--compact.worker.heartbeat-interval=25ms"))
+		f.Start(append(
+			f.Args(f.Dirs[1], "127.0.0.1:0"),
+			"--compact.mode=worker",
+			"--compact.manager.journal-id=process-test",
+			"--compact.worker.id="+worker,
+			"--compact.worker.manager-address="+address,
+			"--compact.worker.poll-interval=25ms",
+			"--compact.worker.heartbeat-interval=25ms",
+		))
 	}
 	f.Wait(manager)
 	want := processBucketSamples(t, f.Buckets[0])

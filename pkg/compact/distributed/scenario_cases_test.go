@@ -46,8 +46,16 @@ func converged(t *testing.T, s *scenarioRun, want *compacttest.BucketDump) *comp
 	if !compacttest.SameContent(t, want, got, "after convergence") {
 		var entries []string
 		for _, e := range s.journal().Tasks {
-			entries = append(entries, fmt.Sprintf("%s %s attempts=%d gen=%d sources=%v outputs=%v err=%v",
-				e.Task.Type, e.State, e.Attempts, e.Task.Generation, e.Task.SourceBlocks, e.Outputs, e.LastError))
+			entries = append(entries, fmt.Sprintf(
+				"%s %s attempts=%d gen=%d sources=%v outputs=%v err=%v",
+				e.Task.Type,
+				e.State,
+				e.Attempts,
+				e.Task.Generation,
+				e.Task.SourceBlocks,
+				e.Outputs,
+				e.LastError,
+			))
 		}
 		t.Fatalf("journal after %d passes:\n  %s", res.Iterations, strings.Join(entries, "\n  "))
 	}
@@ -140,7 +148,6 @@ func scenarios() []scenario {
 			run: func(t *testing.T, s *scenarioRun, want, _ *compacttest.BucketDump) {
 				w1 := s.startWorker("w1")
 				release := gateChunks(w1.testWorker)
-				first := s.currentManager()
 				done := make(chan compacttest.ConvergeResult, 1)
 				go func() { done <- s.Converge(90 * time.Second) }()
 
@@ -152,7 +159,6 @@ func scenarios() []scenario {
 
 				res := <-done
 				testutil.Assert(t, res.Halted, "the first manager must halt when another takes its journal: %v", res.LastErr)
-				_ = first
 
 				s.install(second)
 				s.startWorker("w2")

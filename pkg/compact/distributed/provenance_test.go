@@ -113,7 +113,7 @@ func TestDeletionDetailsRoundTrip(t *testing.T) {
 		"manual cleanup by operator",
 		"",
 	} {
-		_, _, ok := ParseDeletionDetails(other)
-		testutil.Equals(t, false, ok)
+		_, _, ours := ParseDeletionDetails(other)
+		testutil.Equals(t, false, ours)
 	}
 }

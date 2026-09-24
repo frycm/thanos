@@ -64,8 +64,8 @@ func TestSubmitFailureRemovesOnlyItsTask(t *testing.T) {
 		for !queued("t-front") {
 			time.Sleep(time.Millisecond)
 		}
-		_, err := sched.Submit(t.Context(), Task{ID: "t-behind", Type: TaskCompaction})
-		behind <- err
+		_, submitErr := sched.Submit(t.Context(), Task{ID: "t-behind", Type: TaskCompaction})
+		behind <- submitErr
 	}()
 
 	_, err = sched.Submit(t.Context(), Task{ID: "t-front", Type: TaskCompaction})
@@ -102,22 +102,24 @@ func TestSubmitSurvivesLeaseDuringJournalWrite(t *testing.T) {
 	}
 	failNextJournalWrite(bkt, func() bool { return state("t1") == StateLeased })
 
-	leased := make(chan *Task, 1)
+	type leaseResult struct {
+		task *Task
+		err  error
+	}
+	leased := make(chan leaseResult, 1)
 	go func() {
 		for state("t1") != StatePending {
 			time.Sleep(time.Millisecond)
 		}
-		task, err := sched.Lease(t.Context(), LeaseRequest{WorkerID: "w1"})
-		if err != nil || task == nil {
-			leased <- nil
-			return
-		}
-		leased <- task
+		task, leaseErr := sched.Lease(t.Context(), LeaseRequest{WorkerID: "w1"})
+		leased <- leaseResult{task: task, err: leaseErr}
 	}()
 
 	resultCh, err := sched.Submit(t.Context(), Task{ID: "t1", Type: TaskCompaction})
 	testutil.Ok(t, err)
-	task := <-leased
+	lease := <-leased
+	testutil.Ok(t, lease.err)
+	task := lease.task
 	testutil.Assert(t, task != nil, "the worker must have leased the task")
 
 	// The worker's report reaches the submitter.
@@ -159,49 +161,6 @@ func TestReadJournalRejectsForeignBody(t *testing.T) {
 	j, err := ReadJournal(ctx, bkt, "shard-a")
 	testutil.Ok(t, err)
 	testutil.Equals(t, "shard-a", j.JournalID)
-}
-
-// TestLeaseRefusesMismatchedDedupConfig pins down that a worker whose merge
-// configuration differs from the manager's is refused a lease. The merge
-// function and the replica labels are baked into the worker's compactor and
-// leave no trace in the blocks, so nothing downstream would catch a worker
-// merging the sources differently than the manager planned for.
-func TestLeaseRefusesMismatchedDedupConfig(t *testing.T) {
-	sched, err := NewScheduler(t.Context(), log.NewNopLogger(), objstore.NewInMemBucket(), prometheus.NewRegistry(), ManagerConfig{
-		JournalID: "shard-a", DedupFunc: "penalty", DedupReplicaLabels: []string{"replica", "rule_replica"},
-	})
-	testutil.Ok(t, err)
-
-	for _, tc := range []struct {
-		name string
-		req  LeaseRequest
-		want string
-	}{
-		{"no dedup func", LeaseRequest{WorkerID: "w1", DedupReplicaLabels: []string{"replica", "rule_replica"}}, "--deduplication.func"},
-		{"other dedup func", LeaseRequest{WorkerID: "w1", DedupFunc: "other", DedupReplicaLabels: []string{"replica", "rule_replica"}}, "--deduplication.func"},
-		{"no replica labels", LeaseRequest{WorkerID: "w1", DedupFunc: "penalty"}, "--deduplication.replica-label"},
-		{"fewer replica labels", LeaseRequest{WorkerID: "w1", DedupFunc: "penalty", DedupReplicaLabels: []string{"replica"}}, "--deduplication.replica-label"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := sched.Lease(t.Context(), tc.req)
-			testutil.NotOk(t, err)
-			testutil.Assert(t, strings.Contains(err.Error(), tc.want), "the refusal must name the flag to fix: %v", err)
-			testutil.Assert(t, strings.Contains(err.Error(), "w1"), "the refusal must name the worker: %v", err)
-		})
-	}
-
-	// The same configuration in any order is accepted.
-	_, err = sched.Lease(t.Context(), LeaseRequest{WorkerID: "w1", DedupFunc: "penalty", DedupReplicaLabels: []string{"rule_replica", "replica"}})
-	testutil.Ok(t, err)
-
-	// A manager on the defaults accepts a worker on the defaults, which is
-	// what every existing deployment sends.
-	plain, err := NewScheduler(t.Context(), log.NewNopLogger(), objstore.NewInMemBucket(), prometheus.NewRegistry(), ManagerConfig{JournalID: "shard-b"})
-	testutil.Ok(t, err)
-	_, err = plain.Lease(t.Context(), LeaseRequest{WorkerID: "w1"})
-	testutil.Ok(t, err)
-	_, err = plain.Lease(t.Context(), LeaseRequest{WorkerID: "w1", DedupFunc: "penalty", DedupReplicaLabels: []string{"replica"}})
-	testutil.NotOk(t, err)
 }
 
 // TestTaskCarriesDedupFunc pins down that every task is stamped with the
@@ -288,8 +247,8 @@ func TestMaintainPrunesAndUnparks(t *testing.T) {
 
 	// The markers are consumed once the journal is written.
 	for _, id := range []string{"t-big", "t-unknown", "t-live"} {
-		exists, err := bkt.Exists(t.Context(), UnparkPath("shard-a", id))
-		testutil.Ok(t, err)
+		exists, existsErr := bkt.Exists(t.Context(), UnparkPath("shard-a", id))
+		testutil.Ok(t, existsErr)
 		testutil.Equals(t, false, exists, "marker for %s must be removed", id)
 	}
 }

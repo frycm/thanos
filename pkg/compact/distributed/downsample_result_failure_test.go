@@ -23,6 +23,9 @@ import (
 func TestDispatchDownsamplingRejectsInvalidResults(t *testing.T) {
 	for _, bad := range []string{"empty result", "duplicate result", "wrong block ID", "wrong labels", "wrong sources", "wrong time range", "wrong resolution", "wrong provenance", "missing checksum", "wrong checksum", "missing metadata"} {
 		t.Run(bad, func(t *testing.T) {
+			if bad == "missing metadata" && testing.Short() {
+				t.Skip("waits out the retries of the metadata read")
+			}
 			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 			defer cancel()
 			bkt := objstore.NewInMemBucket()
@@ -36,9 +39,11 @@ func TestDispatchDownsamplingRejectsInvalidResults(t *testing.T) {
 			go func() {
 				done <- DispatchDownsampling(ctx, log.NewNopLogger(), bkt, s, map[ulid.ULID]*metadata.Meta{source.ULID: source}, downsample.PlanOptions{}, 1, metadata.NoneFunc, 1, false, nil, nil)
 			}()
-			var task *Task
+			var (
+				task *Task
+				err  error
+			)
 			for task == nil && ctx.Err() == nil {
-				var err error
 				task, err = s.Lease(ctx, LeaseRequest{WorkerID: "w"})
 				testutil.Ok(t, err)
 				if task == nil {
@@ -51,7 +56,6 @@ func TestDispatchDownsamplingRejectsInvalidResults(t *testing.T) {
 			out.ULID = id
 			out.Thanos.Downsample.Resolution = downsample.ResLevel1
 			prov := Provenance{TaskID: task.ID, TaskType: TaskDownsample, JournalID: s.conf.JournalID, Generation: task.Generation, WorkerID: "w"}.For(id, task.SourceBlocks)
-			var err error
 			out.Thanos.Extensions, err = prov.Stamp(nil)
 			testutil.Ok(t, err)
 			result := Result{TaskID: task.ID, Generation: task.Generation, LeaseToken: task.LeaseToken, Outcome: OutcomeCompleted, OutputBlocks: []string{id.String()}}
@@ -89,8 +93,8 @@ func TestDispatchDownsamplingRejectsInvalidResults(t *testing.T) {
 			}
 			testutil.Ok(t, s.Report(ctx, result))
 			select {
-			case err := <-done:
-				testutil.NotOk(t, err)
+			case execErr := <-done:
+				testutil.NotOk(t, execErr)
 			case <-ctx.Done():
 				t.Fatal("manager did not return the verification failure")
 			}

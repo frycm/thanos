@@ -79,7 +79,7 @@ func TestRejectedOutputsNeverRetireTheSources(t *testing.T) {
 		t.Helper()
 		// Correct labels, both sources, provenance and checksum, but half the
 		// plan's time range: the second half would be deleted with the sources.
-		return uploadResultMeta(t, bkt, versioned(resultMeta(ulid.MustNew(99, nil), 100, 0, map[string]string{"ext": "1"}, toCompact[0].ULID, toCompact[1].ULID)))
+		return uploadResultMeta(t, bkt, versioned(resultMeta(t, ulid.MustNew(99, nil), 100, 0, map[string]string{"ext": "1"}, toCompact[0].ULID, toCompact[1].ULID)))
 	}
 	uploadSources := func(t *testing.T, bkt objstore.Bucket, toCompact []*metadata.Meta) {
 		t.Helper()
@@ -204,20 +204,20 @@ func TestMaintenanceRejectsUnverifiedOutputs(t *testing.T) {
 	bkt := objstore.NewInMemBucket()
 	sched := testScheduler(t, bkt, ManagerConfig{})
 	id, source := ulid.MustNew(5, nil), ulid.MustNew(6, nil)
-	m := resultMeta(id, 200, 0, map[string]string{"ext": "1"})
+	m := resultMeta(t, id, 200, 0, map[string]string{"ext": "1"})
 	m.Version, m.Thanos.Version = metadata.TSDBVersion1, metadata.ThanosVersion1
 	ext, err := (Provenance{TaskID: "t1", TaskType: TaskCompaction, JournalID: sched.conf.JournalID}).For(id, nil).Stamp(nil)
 	testutil.Ok(t, err)
 	m.Thanos.Extensions = ext
 	uploadResultMeta(t, bkt, m)
-	src := resultMeta(source, 200, 0, map[string]string{"ext": "1"})
+	src := resultMeta(t, source, 200, 0, map[string]string{"ext": "1"})
 	src.Version, src.Thanos.Version = metadata.TSDBVersion1, metadata.ThanosVersion1
 	uploadResultMeta(t, bkt, src)
 	sched.journal.Tasks["t1"] = &TaskEntry{State: StateCompleted, Outputs: []string{id.String(), source.String()}}
 
-	exists := func(id ulid.ULID) bool {
-		ok, err := bkt.Exists(ctx, path.Join(id.String(), block.MetaFilename))
-		testutil.Ok(t, err)
+	exists := func(blockID ulid.ULID) bool {
+		ok, existsErr := bkt.Exists(ctx, path.Join(blockID.String(), block.MetaFilename))
+		testutil.Ok(t, existsErr)
 		return ok
 	}
 

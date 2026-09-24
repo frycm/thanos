@@ -33,6 +33,9 @@ func (c shutdownCompactor) CompactWithBlockPopulator(dest string, dirs []string,
 }
 
 func TestWorkerShutdownAtExecutionStages(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs real TSDB compactions and downsamplings")
+	}
 	for _, taskType := range []TaskType{TaskCompaction, TaskDownsample} {
 		for _, stage := range []string{"metadata", "download", "compaction", "ownership check", "upload", "checksum"} {
 			if taskType == TaskDownsample && stage == "compaction" {
@@ -105,6 +108,9 @@ func TestWorkerShutdownAtExecutionStages(t *testing.T) {
 // canceled compaction in a halt error, and before the shutdown triage that
 // halt traveled to the manager and stopped the whole shard.
 func TestWorkerShutdownReportsAbortNotHalt(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs a real manager and workers in real time")
+	}
 	c := newTestCluster(t)
 
 	w1 := c.startWorker("w1")

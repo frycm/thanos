@@ -156,13 +156,15 @@ func (c *testCluster) startWorkerMerge(id string, mergeFunc storage.VerticalChun
 		dead: &atomic.Bool{},
 	}
 
-	comp, err := tsdb.NewLeveledCompactor(context.Background(), w.reg, logutil.GoKitLogToSlog(c.logger),
-		[]int64{1000, 3000}, nil, mergeFunc)
+	comp, err := tsdb.NewLeveledCompactor(context.Background(), w.reg, logutil.GoKitLogToSlog(c.logger), []int64{1000, 3000}, nil, mergeFunc)
 	testutil.Ok(c.t, err)
 
-	client := NewHTTPClient(c.logger,
+	client := NewHTTPClient(
+		c.logger,
 		dns.NewProvider(c.logger, prometheus.NewRegistry(), dns.GolangResolverType),
-		strings.TrimPrefix(c.srv.URL, "http://"), 5*time.Second)
+		strings.TrimPrefix(c.srv.URL, "http://"),
+		5*time.Second,
+	)
 
 	worker, err := NewWorker(c.logger, w.bkt, crashableClient{TaskClient: client, dead: w.dead}, comp, w.reg, WorkerConfig{
 		WorkerID:           id,
@@ -208,8 +210,26 @@ func (c *testCluster) makeGroup(ext labels.Labels) (*compact.Group, []*metadata.
 	}
 
 	cnt := func() prometheus.Counter { return promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"}) }
-	cg, err := compact.NewGroup(c.logger, c.manager, metas[0].Thanos.GroupKey(), ext, 0, false, false,
-		cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), metadata.NoneFunc, 1, 1)
+	cg, err := compact.NewGroup(
+		c.logger,
+		c.manager,
+		metas[0].Thanos.GroupKey(),
+		ext,
+		0,
+		false,
+		false,
+		cnt(),
+		cnt(),
+		cnt(),
+		cnt(),
+		cnt(),
+		cnt(),
+		cnt(),
+		cnt(),
+		metadata.NoneFunc,
+		1,
+		1,
+	)
 	testutil.Ok(c.t, err)
 	for _, m := range metas {
 		testutil.Ok(c.t, cg.AppendMeta(m))
@@ -325,6 +345,9 @@ func gateChunks(w *testWorker) (release func()) {
 // executor -> scheduler -> HTTP -> worker -> bucket -> verification -> source
 // deletion marks.
 func TestInteractionGoldenPath(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs a real manager and workers in real time")
+	}
 	c := newTestCluster(t)
 	c.startWorker("w1")
 
@@ -364,8 +387,8 @@ func TestInteractionGoldenPath(t *testing.T) {
 	for _, m := range toCompact {
 		var mark metadata.DeletionMark
 		testutil.Ok(t, metadata.ReadMarker(t.Context(), c.logger, objstore.WithNoopInstr(c.shared), m.ULID.String(), &mark))
-		markJournal, markTask, ok := ParseDeletionDetails(mark.Details)
-		testutil.Equals(t, true, ok)
+		markJournal, markTask, parsed := ParseDeletionDetails(mark.Details)
+		testutil.Equals(t, true, parsed)
 		testutil.Equals(t, journalID, markJournal)
 		testutil.Equals(t, entry.Task.ID, markTask)
 	}
@@ -375,6 +398,9 @@ func TestInteractionGoldenPath(t *testing.T) {
 // the lease expires, the task is handed to another worker, and the result is
 // correct.
 func TestInteractionWorkerCrashIsReassigned(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs a real manager and workers in real time")
+	}
 	c := newTestCluster(t)
 
 	w1 := c.startWorker("w1")
@@ -405,11 +431,8 @@ func TestInteractionWorkerCrashIsReassigned(t *testing.T) {
 
 	entry := c.journalTask(StateCompleted)
 	testutil.Assert(t, entry != nil, "the journal must record the completed task")
+	// The completing lease is gone; the attempt count carries the story.
 	testutil.Equals(t, 2, entry.Attempts)
-	testutil.Equals(t, "w2", func() string {
-		// The completing lease is gone; the attempt count carries the story.
-		return "w2"
-	}())
 }
 
 // TestInteractionJournalOutageFailsClosed cuts a worker off from the journal,
@@ -417,6 +440,9 @@ func TestInteractionWorkerCrashIsReassigned(t *testing.T) {
 // finished work, reports the outage as its own distinct outcome, and that the
 // task succeeds once the journal is reachable again.
 func TestInteractionJournalOutageFailsClosed(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs a real manager and workers in real time")
+	}
 	c := newTestCluster(t)
 
 	w1 := c.startWorker("w1")
@@ -476,6 +502,9 @@ func TestInteractionJournalOutageFailsClosed(t *testing.T) {
 // worker is mid task and asserts the worker notices - its heartbeat is no
 // longer acknowledged - and discards the work instead of uploading.
 func TestInteractionManagerTakeoverStopsOldWork(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs a real manager and workers in real time")
+	}
 	c := newTestCluster(t)
 
 	w1 := c.startWorker("w1")
@@ -514,6 +543,9 @@ func TestInteractionManagerTakeoverStopsOldWork(t *testing.T) {
 // workers and asserts both finish; the queue, not any assignment, decides who
 // does what.
 func TestInteractionTwoWorkersTwoGroups(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs a real manager and workers in real time")
+	}
 	c := newTestCluster(t)
 	c.startWorker("w1")
 	c.startWorker("w2")
@@ -576,8 +608,27 @@ func (c *testCluster) makeDedupGroup() (*compact.Group, []*metadata.Meta, []*met
 	}
 
 	cnt := func() prometheus.Counter { return promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"}) }
-	cg, err := compact.NewGroup(c.logger, c.manager, stripped[0].Thanos.GroupKey(), labels.FromStrings("tenant", "t1"), 0,
-		false, true /* vertical compaction, as --deduplication.replica-label enables */, cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), metadata.NoneFunc, 1, 1)
+	// Vertical compaction is enabled, as --deduplication.replica-label does.
+	cg, err := compact.NewGroup(
+		c.logger,
+		c.manager,
+		stripped[0].Thanos.GroupKey(),
+		labels.FromStrings("tenant", "t1"),
+		0,
+		false,
+		true,
+		cnt(),
+		cnt(),
+		cnt(),
+		cnt(),
+		cnt(),
+		cnt(),
+		cnt(),
+		cnt(),
+		metadata.NoneFunc,
+		1,
+		1,
+	)
 	testutil.Ok(c.t, err)
 	for _, m := range stripped {
 		testutil.Ok(c.t, cg.AppendMeta(m))
@@ -598,6 +649,9 @@ func (c *testCluster) makeDedupGroup() (*compact.Group, []*metadata.Meta, []*met
 // algorithms themselves are covered upstream by TestGroupCompactE2E and
 // TestGroupCompactPenaltyDedupE2E.
 func TestInteractionPenaltyDedup(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs a real manager and workers in real time")
+	}
 	c := newTestClusterConf(t, ManagerConfig{DedupFunc: compact.DedupAlgorithmPenalty, DedupReplicaLabels: []string{"receiver_replica"}})
 	c.startWorkerMerge("w1", dedup.NewChunkSeriesMerger())
 
@@ -633,9 +687,9 @@ func TestInteractionPenaltyDedup(t *testing.T) {
 
 	// All four sources were marked for deletion by the manager.
 	for _, m := range toCompact {
-		ok, err := c.shared.Exists(t.Context(), filepath.Join(m.ULID.String(), metadata.DeletionMarkFilename))
-		testutil.Ok(t, err)
-		testutil.Equals(t, true, ok)
+		marked, existsErr := c.shared.Exists(t.Context(), filepath.Join(m.ULID.String(), metadata.DeletionMarkFilename))
+		testutil.Ok(t, existsErr)
+		testutil.Equals(t, true, marked)
 	}
 }
 
@@ -644,6 +698,9 @@ func TestInteractionPenaltyDedup(t *testing.T) {
 // the error class delivered to the manager, while the bucket is left exactly
 // as it was: no sources marked for deletion, nothing uploaded.
 func TestInteractionCorruptedBlockFailsWithoutDamage(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs a real manager and workers in real time")
+	}
 	c := newTestCluster(t)
 	c.startWorker("w1")
 
@@ -651,8 +708,7 @@ func TestInteractionCorruptedBlockFailsWithoutDamage(t *testing.T) {
 
 	// Corrupt one source's index after upload, as a partial or damaged upload
 	// would look.
-	testutil.Ok(t, c.shared.Upload(t.Context(),
-		filepath.Join(toCompact[0].ULID.String(), "index"), strings.NewReader("this is not an index")))
+	testutil.Ok(t, c.shared.Upload(t.Context(), filepath.Join(toCompact[0].ULID.String(), "index"), strings.NewReader("this is not an index")))
 
 	outcome := c.execute(cg, toCompact)
 
@@ -688,6 +744,9 @@ func TestInteractionCorruptedBlockFailsWithoutDamage(t *testing.T) {
 // to strip the raw metadata the same way, or the downsampled block would carry
 // the replica label and the manager's verification would reject every result.
 func TestInteractionDownsampleDedup(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs a real manager and workers in real time")
+	}
 	c := newTestClusterConf(t, ManagerConfig{DedupReplicaLabels: []string{"receiver_replica"}})
 	c.startWorker("w1")
 
@@ -710,9 +769,20 @@ func TestInteractionDownsampleDedup(t *testing.T) {
 	stripped := *meta
 	stripped.Thanos.Labels = map[string]string{"tenant": "t1"}
 
-	testutil.Ok(t, DispatchDownsampling(ctx, c.logger, c.manager, c.sched,
+	testutil.Ok(t, DispatchDownsampling(
+		ctx,
+		c.logger,
+		c.manager,
+		c.sched,
 		map[ulid.ULID]*metadata.Meta{stripped.ULID: &stripped},
-		downsample.PlanOptions{}, 1, metadata.NoneFunc, 1, false, nil, nil))
+		downsample.PlanOptions{},
+		1,
+		metadata.NoneFunc,
+		1,
+		false,
+		nil,
+		nil,
+	))
 
 	entry := c.journalTask(StateCompleted)
 	testutil.Assert(t, entry != nil, "the journal must record the completed downsample task")

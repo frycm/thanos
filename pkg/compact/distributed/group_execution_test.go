@@ -30,13 +30,13 @@ func TestRefillWhileOnePlanIsStillRunning(t *testing.T) {
 	var leased []*Task
 	deadline := time.Now().Add(5 * time.Second)
 	for len(leased) < 4 && time.Now().Before(deadline) {
-		task, err := sched.Lease(ctx, LeaseRequest{WorkerID: "review-worker"})
-		testutil.Ok(t, err)
-		if task != nil {
-			leased = append(leased, task)
-		} else {
+		task, leaseErr := sched.Lease(ctx, LeaseRequest{WorkerID: "review-worker"})
+		testutil.Ok(t, leaseErr)
+		if task == nil {
 			time.Sleep(time.Millisecond)
+			continue
 		}
+		leased = append(leased, task)
 	}
 	testutil.Equals(t, 4, len(leased))
 	// Empty-source plans complete without output blocks. Leave one task leased,
@@ -61,8 +61,26 @@ func TestParkedPlanDoesNotStarveDisjointWork(t *testing.T) {
 	logger := log.NewNopLogger()
 	bkt := objstore.NewInMemBucket()
 	cnt := func() prometheus.Counter { return promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"}) }
-	cg, err := compact.NewGroup(logger, bkt, "g", labels.EmptyLabels(), 0, false, false,
-		cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), metadata.NoneFunc, 1, 1)
+	cg, err := compact.NewGroup(
+		logger,
+		bkt,
+		"g",
+		labels.EmptyLabels(),
+		0,
+		false,
+		false,
+		cnt(),
+		cnt(),
+		cnt(),
+		cnt(),
+		cnt(),
+		cnt(),
+		cnt(),
+		cnt(),
+		metadata.NoneFunc,
+		1,
+		1,
+	)
 	testutil.Ok(t, err)
 	h := int64(time.Hour / time.Millisecond)
 	for i, tr := range [][2]int64{{0, 8}, {8, 10}, {10, 12}, {12, 14}, {14, 16}, {16, 24}, {48, 72}, {72, 96}, {400, 402}} {
@@ -93,7 +111,7 @@ func TestParkedPlanDoesNotStarveDisjointWork(t *testing.T) {
 	testutil.Equals(t, 48*h, healthy[0].MinTime)
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
-	go func() { _, err := executor.Execute(ctx, "", cg, first); done <- err }()
+	go func() { _, execErr := executor.Execute(ctx, "", cg, first); done <- execErr }()
 	defer cancel()
 	var leased *Task
 	deadline := time.Now().Add(5 * time.Second)
@@ -118,14 +136,13 @@ func TestParkedPlanDoesNotStarveDisjointWork(t *testing.T) {
 
 // planGroup collects the first slots to inspect the production iterator without
 // dispatching tasks. Execute consumes the same iterator as slots become free.
-func (e *RemotePlanExecutor) planGroup(ctx context.Context, cg *compact.Group, first []*metadata.Meta) [][]*metadata.Meta {
+func (e *RemotePlanExecutor) planGroup(t *testing.T, cg *compact.Group, first []*metadata.Meta) [][]*metadata.Meta {
+	t.Helper()
 	p := groupPlans{executor: e, group: cg, first: compact.Plan{Sources: first}, excluded: map[ulid.ULID]struct{}{}}
 	var plans [][]*metadata.Meta
 	for len(plans) < e.maxInflightPerGroup {
-		plan, err := p.next(ctx)
-		if err != nil {
-			panic(err)
-		}
+		plan, err := p.next(t.Context())
+		testutil.Ok(t, err)
 		if plan.Empty() {
 			break
 		}
@@ -139,8 +156,26 @@ func schedulingFixture(t *testing.T, slots int) (*compact.Group, *Scheduler, *Re
 	logger := log.NewNopLogger()
 	bkt := objstore.NewInMemBucket()
 	cnt := func() prometheus.Counter { return promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"}) }
-	cg, err := compact.NewGroup(logger, bkt, "g", labels.EmptyLabels(), 0, false, false,
-		cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), metadata.NoneFunc, 1, 1)
+	cg, err := compact.NewGroup(
+		logger,
+		bkt,
+		"g",
+		labels.EmptyLabels(),
+		0,
+		false,
+		false,
+		cnt(),
+		cnt(),
+		cnt(),
+		cnt(),
+		cnt(),
+		cnt(),
+		cnt(),
+		cnt(),
+		metadata.NoneFunc,
+		1,
+		1,
+	)
 	testutil.Ok(t, err)
 	for i := range 20 {
 		m := &metadata.Meta{}
@@ -164,17 +199,17 @@ func TestGroupExecutionStopsRefillingOnErrorAndPreservesHalt(t *testing.T) {
 	first, err := cg.Plan(ctx, executor.planner, make(chan error, 1))
 	testutil.Ok(t, err)
 	done := make(chan error, 1)
-	go func() { _, err := executor.Execute(ctx, "", cg, first); done <- err }()
+	go func() { _, execErr := executor.Execute(ctx, "", cg, first); done <- execErr }()
 	var tasks []*Task
 	deadline := time.Now().Add(5 * time.Second)
 	for len(tasks) < 2 && time.Now().Before(deadline) {
-		task, err := sched.Lease(ctx, LeaseRequest{WorkerID: "worker"})
-		testutil.Ok(t, err)
-		if task != nil {
-			tasks = append(tasks, task)
-		} else {
+		task, leaseErr := sched.Lease(ctx, LeaseRequest{WorkerID: "worker"})
+		testutil.Ok(t, leaseErr)
+		if task == nil {
 			time.Sleep(time.Millisecond)
+			continue
 		}
+		tasks = append(tasks, task)
 	}
 	if len(tasks) != 2 {
 		cancel()
