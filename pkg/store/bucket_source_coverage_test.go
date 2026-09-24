@@ -67,30 +67,46 @@ func TestBucketBlockSetSourceCoverage(t *testing.T) {
 }
 
 func TestResolutionFilterAndSelectionPreserveUncoveredRaw(t *testing.T) {
-	for _, partialTime := range []bool{false, true} {
-		raw := &metadata.Meta{}
-		raw.ULID = ulid.MustNew(1, nil)
-		raw.MinTime, raw.MaxTime = 0, 100
-		raw.Compaction.Sources = []ulid.ULID{raw.ULID}
-		coarse := *raw
-		coarse.ULID = ulid.MustNew(2, nil)
-		coarse.Thanos.Downsample.Resolution = 300000
-		if partialTime {
-			coarse.MaxTime = 50
-		} else {
-			coarse.Compaction.Sources = []ulid.ULID{coarse.ULID}
-		}
-		metas := map[ulid.ULID]*metadata.Meta{raw.ULID: raw, coarse.ULID: &coarse}
-		gauge := promauto.With(nil).NewGaugeVec(prometheus.GaugeOpts{Name: "test"}, []string{"state"})
-		testutil.Ok(t, block.NewResolutionMetaFilter(log.NewNopLogger(), 300000, 3600000, nil).Filter(t.Context(), metas, gauge, nil))
-		testutil.Assert(t, metas[raw.ULID] != nil, "filter must retain uncovered raw")
-		set := newBucketBlockSet(labels.EmptyLabels())
-		set.sourceCoverage = true
-		for _, m := range metas {
-			testutil.Ok(t, set.add(&bucketBlock{meta: m}))
-		}
-		got := set.getFor(0, 99, 300000, nil)
-		testutil.Assert(t, slices.ContainsFunc(got, func(b *bucketBlock) bool { return b.meta.ULID == raw.ULID }), "retained raw must be queried")
+	rawID, coarseID := ulid.MustNew(1, nil), ulid.MustNew(2, nil)
+	for _, tcase := range []struct {
+		name string
+
+		coarseMaxTime int64
+		coarseSources []ulid.ULID
+	}{
+		{
+			name:          "coarse block of another lineage",
+			coarseMaxTime: 100,
+			coarseSources: []ulid.ULID{coarseID},
+		},
+		{
+			name:          "coarse block covering part of the time range",
+			coarseMaxTime: 50,
+			coarseSources: []ulid.ULID{rawID},
+		},
+	} {
+		t.Run(tcase.name, func(t *testing.T) {
+			raw := &metadata.Meta{}
+			raw.ULID = rawID
+			raw.MinTime, raw.MaxTime = 0, 100
+			raw.Compaction.Sources = []ulid.ULID{raw.ULID}
+			coarse := *raw
+			coarse.ULID = coarseID
+			coarse.MaxTime = tcase.coarseMaxTime
+			coarse.Compaction.Sources = tcase.coarseSources
+			coarse.Thanos.Downsample.Resolution = 300000
+			metas := map[ulid.ULID]*metadata.Meta{raw.ULID: raw, coarse.ULID: &coarse}
+			gauge := promauto.With(nil).NewGaugeVec(prometheus.GaugeOpts{Name: "test"}, []string{"state"})
+			testutil.Ok(t, block.NewResolutionMetaFilter(log.NewNopLogger(), 300000, 3600000, nil).Filter(t.Context(), metas, gauge, nil))
+			testutil.Assert(t, metas[raw.ULID] != nil, "filter must retain uncovered raw")
+			set := newBucketBlockSet(labels.EmptyLabels())
+			set.sourceCoverage = true
+			for _, m := range metas {
+				testutil.Ok(t, set.add(&bucketBlock{meta: m}))
+			}
+			got := set.getFor(0, 99, 300000, nil)
+			testutil.Assert(t, slices.ContainsFunc(got, func(b *bucketBlock) bool { return b.meta.ULID == raw.ULID }), "retained raw must be queried")
+		})
 	}
 }
 
@@ -119,7 +135,6 @@ func TestBelowResolutionWarning(t *testing.T) {
 	testutil.Ok(t, f.Filter(t.Context(), metas, synced, nil))
 	testutil.Equals(t, 1, len(f.Hidden()))
 
-	s := &BucketStore{resolutionFilter: f, blocks: map[ulid.ULID]*bucketBlock{}}
 	tenant := func(v string) []*labels.Matcher {
 		return []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "tenant", v)}
 	}
@@ -127,17 +142,67 @@ func TestBelowResolutionWarning(t *testing.T) {
 		return &storepb.SeriesRequest{MinTime: mint, MaxTime: maxt, MaxResolutionWindow: res}
 	}
 
-	err := s.belowResolutionWarning(req(0, 5000, 0), tenant("a"), nil)
-	testutil.NotOk(t, err)
-	testutil.Assert(t, strings.Contains(err.Error(), "1 block(s)"), "the warning names the gap: %v", err)
+	for _, tcase := range []struct {
+		name string
 
-	testutil.Ok(t, s.belowResolutionWarning(req(0, 5000, res5m), tenant("a"), nil))
-	testutil.Ok(t, s.belowResolutionWarning(req(2000, 5000, 0), tenant("a"), nil), "the hidden block ends where the range starts")
-	testutil.Ok(t, s.belowResolutionWarning(req(0, 999, 0), tenant("a"), nil))
-	testutil.Ok(t, s.belowResolutionWarning(req(0, 5000, 0), tenant("b"), nil), "another tenant's request misses nothing")
-	testutil.Ok(t, s.belowResolutionWarning(req(0, 5000, 0), nil, tenant("b")), "the block matchers exclude it")
+		req           *storepb.SeriesRequest
+		matchers      []*labels.Matcher
+		blockMatchers []*labels.Matcher
+		// loadedBack marks the hidden block as loaded back as a fallback.
+		loadedBack bool
 
-	// Loaded back as a fallback, the block is served.
-	s.blocks[rawID] = &bucketBlock{}
-	testutil.Ok(t, s.belowResolutionWarning(req(0, 5000, 0), tenant("a"), nil))
+		expectedErr string
+	}{
+		{
+			name:        "finer request reaching the hidden block",
+			req:         req(0, 5000, 0),
+			matchers:    tenant("a"),
+			expectedErr: "1 block(s)",
+		},
+		{
+			name:     "request at the minimum resolution",
+			req:      req(0, 5000, res5m),
+			matchers: tenant("a"),
+		},
+		{
+			name:     "hidden block ends where the range starts",
+			req:      req(2000, 5000, 0),
+			matchers: tenant("a"),
+		},
+		{
+			name:     "range before the hidden block",
+			req:      req(0, 999, 0),
+			matchers: tenant("a"),
+		},
+		{
+			name:     "another tenant's request misses nothing",
+			req:      req(0, 5000, 0),
+			matchers: tenant("b"),
+		},
+		{
+			name:          "block matchers exclude the hidden block",
+			req:           req(0, 5000, 0),
+			blockMatchers: tenant("b"),
+		},
+		{
+			name:       "hidden block loaded back as a fallback is served",
+			req:        req(0, 5000, 0),
+			matchers:   tenant("a"),
+			loadedBack: true,
+		},
+	} {
+		t.Run(tcase.name, func(t *testing.T) {
+			s := &BucketStore{resolutionFilter: f, blocks: map[ulid.ULID]*bucketBlock{}}
+			if tcase.loadedBack {
+				s.blocks[rawID] = &bucketBlock{}
+			}
+			err := s.belowResolutionWarning(tcase.req, tcase.matchers, tcase.blockMatchers)
+			if tcase.expectedErr == "" {
+				testutil.Ok(t, err)
+				return
+			}
+			testutil.NotOk(t, err)
+			testutil.Assert(t, strings.Contains(err.Error(), tcase.expectedErr), "the warning names the gap: %v", err)
+		})
+	}
 }

@@ -72,9 +72,55 @@ func TestSourceCoverageCoveringBlocks(t *testing.T) {
 	raw := block(20, 0, 150, src1, src2)
 	// Every block sharing a source and touching the range, once each, and
 	// nothing from an unrelated lineage.
-	testutil.Equals(t, []ulid.ULID{a.ULID, b.ULID, c.ULID}, coverage.CoveringBlocks(raw, raw.MinTime, raw.MaxTime-1))
-	testutil.Equals(t, []ulid.ULID{a.ULID}, coverage.CoveringBlocks(raw, 0, 49))
-	testutil.Equals(t, []ulid.ULID{b.ULID, c.ULID}, coverage.CoveringBlocks(raw, 50, 149))
-	testutil.Equals(t, 0, len(coverage.CoveringBlocks(raw, 200, 300)))
-	testutil.Equals(t, 0, len(coverage.CoveringBlocks(block(21, 0, 150, ulid.MustNew(4, nil)), 0, 149)))
+	for _, tcase := range []struct {
+		name string
+
+		meta       *Meta
+		mint, maxt int64
+
+		expected []ulid.ULID
+	}{
+		{
+			name:     "full range",
+			meta:     raw,
+			mint:     raw.MinTime,
+			maxt:     raw.MaxTime - 1,
+			expected: []ulid.ULID{a.ULID, b.ULID, c.ULID},
+		},
+		{
+			name:     "first block only",
+			meta:     raw,
+			mint:     0,
+			maxt:     49,
+			expected: []ulid.ULID{a.ULID},
+		},
+		{
+			name:     "second half",
+			meta:     raw,
+			mint:     50,
+			maxt:     149,
+			expected: []ulid.ULID{b.ULID, c.ULID},
+		},
+		{
+			name: "range outside every block",
+			meta: raw,
+			mint: 200,
+			maxt: 300,
+		},
+		{
+			name: "unrelated lineage",
+			meta: block(21, 0, 150, ulid.MustNew(4, nil)),
+			mint: 0,
+			maxt: 149,
+		},
+	} {
+		t.Run(tcase.name, func(t *testing.T) {
+			got := coverage.CoveringBlocks(tcase.meta, tcase.mint, tcase.maxt)
+			if len(tcase.expected) == 0 {
+				testutil.Equals(t, 0, len(got))
+				return
+			}
+			testutil.Equals(t, tcase.expected, got)
+		})
+	}
 }

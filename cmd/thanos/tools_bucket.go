@@ -751,8 +751,7 @@ func registerBucketWeb(app extkingpin.AppClause, objStoreConfig *extflag.PathOrC
 }
 
 // Provide a list of resolution, can not use Enum directly, since string does not implement int64 function.
-// listResLevel lists the downsampling levels as durations: "0s", "5m", "1h".
-// The levels are milliseconds.
+// The levels are milliseconds and are listed as durations: "0s", "5m", "1h".
 func listResLevel() []string {
 	return []string{
 		prommodel.Duration(time.Duration(downsample.ResLevel0) * time.Millisecond).String(),

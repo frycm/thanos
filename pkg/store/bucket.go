@@ -578,13 +578,6 @@ func WithSeriesBatchSize(seriesBatchSize int) BucketStoreOption {
 	}
 }
 
-// WithSourceCoverage enables source-aware query selection for stores using a
-// minimum block resolution. A retained finer block is skipped only when its
-// sources and requested time range are covered by selected coarser blocks.
-func WithSourceCoverage() BucketStoreOption {
-	return func(s *BucketStore) { s.sourceCoverage = true }
-}
-
 // WithResolutionFilter enables source-aware selection and restores finer
 // blocks when their advertised replacement cannot be loaded. Filters following
 // the resolution filter must also constrain the fallback metadata.
@@ -800,8 +793,11 @@ func (s *BucketStore) SyncBlocks(ctx context.Context) error {
 	// Fallbacks whose cover did not load are restored from a partial view
 	// too: restoring only adds blocks, and waiting for a clean sync would
 	// leave their ranges unserved meanwhile.
-	if err := s.syncResolutionFallbacks(ctx, metas); err != nil && metaFetchErr == nil {
-		return err
+	if err := s.syncResolutionFallbacks(ctx, metas); err != nil {
+		if metaFetchErr == nil {
+			return err
+		}
+		level.Warn(s.logger).Log("msg", "restoring resolution fallbacks from a partial metadata view failed; returning the metadata fetch error, the next sync retries both", "err", err)
 	}
 	if metaFetchErr != nil {
 		return metaFetchErr
@@ -937,7 +933,7 @@ func (s *BucketStore) addBlock(ctx context.Context, meta *metadata.Meta) (err er
 	// index header of every block at the minimum resolution.
 	verifiedReplacement := false
 	if s.resolutionFilter != nil && s.resolutionFilter.Replaces(meta.ULID) {
-		if _, err := indexHeaderReader.IndexVersion(); err != nil {
+		if _, err = indexHeaderReader.IndexVersion(); err != nil {
 			return errors.Wrap(err, "load resolution replacement index header")
 		}
 		verifiedReplacement = true

@@ -5,7 +5,6 @@ package query
 
 import (
 	"context"
-	"errors"
 	"io"
 	"math"
 	"path/filepath"
@@ -16,6 +15,7 @@ import (
 	"github.com/efficientgo/core/testutil"
 	"github.com/go-kit/log"
 	"github.com/oklog/ulid/v2"
+	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/tsdb"
@@ -74,7 +74,7 @@ func TestResolutionFilteredStoreRawFallback(t *testing.T) {
 							if replicaLabel == "prometheus_replica" || replicaLabel == "otelcol_replica" {
 								lset = labels.FromStrings("__name__", s.name, replicaLabel, replica)
 							}
-							_, err := app.Append(0, lset, ts, s.value)
+							_, err = app.Append(0, lset, ts, s.value)
 							testutil.Ok(t, err)
 						}
 					}

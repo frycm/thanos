@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"path/filepath"
 	"strings"
@@ -17,6 +16,7 @@ import (
 	"github.com/efficientgo/core/testutil"
 	"github.com/go-kit/log"
 	"github.com/oklog/ulid/v2"
+	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
@@ -57,8 +57,22 @@ func TestResolutionFallbackRespectsTimePartition(t *testing.T) {
 	filter := block.NewResolutionMetaFilter(logger, downsample.ResLevel1, downsample.ResLevel2, nil)
 	fetcher, err := block.NewMetaFetcher(logger, 1, bkt, block.NewConcurrentLister(logger, bkt), "", nil, []block.MetadataFilter{filter, partition})
 	testutil.Ok(t, err)
-	s, err := NewBucketStore(bkt, fetcher, t.TempDir(), NewChunksLimiterFactory(1000), NewSeriesLimiterFactory(0), NewBytesLimiterFactory(0),
-		NewGapBasedPartitioner(PartitionerMaxGapSize), 1, false, DefaultPostingOffsetInMemorySampling, false, false, 0, WithResolutionFilter(filter, partition))
+	s, err := NewBucketStore(
+		bkt,
+		fetcher,
+		t.TempDir(),
+		NewChunksLimiterFactory(1000),
+		NewSeriesLimiterFactory(0),
+		NewBytesLimiterFactory(0),
+		NewGapBasedPartitioner(PartitionerMaxGapSize),
+		1,
+		false,
+		DefaultPostingOffsetInMemorySampling,
+		false,
+		false,
+		0,
+		WithResolutionFilter(filter, partition),
+	)
 	testutil.Ok(t, err)
 	t.Cleanup(func() { testutil.Ok(t, s.Close()) })
 	// Neither block has an index: loading either out-of-partition block is an
@@ -93,8 +107,18 @@ func TestResolutionFallbackSurvivesReplacementLoadFailure(t *testing.T) {
 					fault := &unavailableIndexBucket{Bucket: objstore.NewInMemBucket()}
 					bkt := objstore.WithNoopInstr(fault)
 					dir := t.TempDir()
-					id, err := e2eutil.CreateBlock(ctx, dir, []labels.Labels{labels.FromStrings("__name__", "up")}, 20,
-						0, 3600000, labels.FromStrings("tenant", "one"), 0, metadata.NoneFunc, nil)
+					id, err := e2eutil.CreateBlock(
+						ctx,
+						dir,
+						[]labels.Labels{labels.FromStrings("__name__", "up")},
+						20,
+						0,
+						3600000,
+						labels.FromStrings("tenant", "one"),
+						0,
+						metadata.NoneFunc,
+						nil,
+					)
 					testutil.Ok(t, err)
 					testutil.Ok(t, block.Upload(ctx, logger, bkt, filepath.Join(dir, id.String()), metadata.NoneFunc))
 					m, err := metadata.ReadFromDir(filepath.Join(dir, id.String()))
@@ -109,9 +133,23 @@ func TestResolutionFallbackSurvivesReplacementLoadFailure(t *testing.T) {
 					fetcher, err := block.NewMetaFetcher(logger, 1, bkt, block.NewConcurrentLister(logger, bkt), "", nil, []block.MetadataFilter{filter})
 					testutil.Ok(t, err)
 					fault.prefix, fault.fail = coarseID.String()+"/", true
-					s, err := NewBucketStore(bkt, fetcher, t.TempDir(), NewChunksLimiterFactory(1000), NewSeriesLimiterFactory(0), NewBytesLimiterFactory(0),
-						NewGapBasedPartitioner(PartitionerMaxGapSize), 1, false, DefaultPostingOffsetInMemorySampling, false, reader.lazy, 0,
-						WithIndexHeaderLazyDownloadStrategy(reader.download), WithResolutionFilter(filter))
+					s, err := NewBucketStore(
+						bkt,
+						fetcher,
+						t.TempDir(),
+						NewChunksLimiterFactory(1000),
+						NewSeriesLimiterFactory(0),
+						NewBytesLimiterFactory(0),
+						NewGapBasedPartitioner(PartitionerMaxGapSize),
+						1,
+						false,
+						DefaultPostingOffsetInMemorySampling,
+						false,
+						reader.lazy,
+						0,
+						WithIndexHeaderLazyDownloadStrategy(reader.download),
+						WithResolutionFilter(filter),
+					)
 					testutil.Ok(t, err)
 					t.Cleanup(func() { testutil.Ok(t, s.Close()) })
 					if warm {
@@ -164,8 +202,22 @@ func TestResolutionFallbackLoadFailureDoesNotFailSync(t *testing.T) {
 	filter := block.NewResolutionMetaFilter(logger, downsample.ResLevel1, downsample.ResLevel2, nil)
 	fetcher, err := block.NewMetaFetcher(logger, 1, bkt, block.NewConcurrentLister(logger, bkt), "", nil, []block.MetadataFilter{filter})
 	testutil.Ok(t, err)
-	s, err := NewBucketStore(bkt, fetcher, t.TempDir(), NewChunksLimiterFactory(1000), NewSeriesLimiterFactory(0), NewBytesLimiterFactory(0),
-		NewGapBasedPartitioner(PartitionerMaxGapSize), 1, false, DefaultPostingOffsetInMemorySampling, false, false, 0, WithResolutionFilter(filter))
+	s, err := NewBucketStore(
+		bkt,
+		fetcher,
+		t.TempDir(),
+		NewChunksLimiterFactory(1000),
+		NewSeriesLimiterFactory(0),
+		NewBytesLimiterFactory(0),
+		NewGapBasedPartitioner(PartitionerMaxGapSize),
+		1,
+		false,
+		DefaultPostingOffsetInMemorySampling,
+		false,
+		false,
+		0,
+		WithResolutionFilter(filter),
+	)
 	testutil.Ok(t, err)
 	t.Cleanup(func() { testutil.Ok(t, s.Close()) })
 	// Neither block has an index, so the cover fails to load and so does the
@@ -177,15 +229,26 @@ func TestResolutionFallbackLoadFailureDoesNotFailSync(t *testing.T) {
 // TestResolutionStraddlingFallbackTrustsCoverBeyondPartition pins down the
 // reason the resolution filter runs before the time partition: a raw block
 // straddling the partition boundary, covered on the near side by a loaded
-// block and on the far side by one this store does not serve, stays hidden
-// instead of being loaded and reported as uncovered at every shard boundary.
+// block and on the far side by one this store gateway does not serve, stays
+// hidden instead of being loaded and reported as uncovered at every shard
+// boundary.
 func TestResolutionStraddlingFallbackTrustsCoverBeyondPartition(t *testing.T) {
 	ctx := t.Context()
 	logger := log.NewNopLogger()
 	bkt := objstore.WithNoopInstr(objstore.NewInMemBucket())
 	dir := t.TempDir()
-	rawID, err := e2eutil.CreateBlock(ctx, dir, []labels.Labels{labels.FromStrings("__name__", "up")}, 20,
-		0, 3600000, labels.FromStrings("tenant", "one"), 0, metadata.NoneFunc, nil)
+	rawID, err := e2eutil.CreateBlock(
+		ctx,
+		dir,
+		[]labels.Labels{labels.FromStrings("__name__", "up")},
+		20,
+		0,
+		3600000,
+		labels.FromStrings("tenant", "one"),
+		0,
+		metadata.NoneFunc,
+		nil,
+	)
 	testutil.Ok(t, err)
 	rawMeta, err := metadata.ReadFromDir(filepath.Join(dir, rawID.String()))
 	testutil.Ok(t, err)
@@ -217,8 +280,22 @@ func TestResolutionStraddlingFallbackTrustsCoverBeyondPartition(t *testing.T) {
 	filter := block.NewResolutionMetaFilter(logger, downsample.ResLevel1, downsample.ResLevel2, gauge)
 	fetcher, err := block.NewMetaFetcher(logger, 1, bkt, block.NewConcurrentLister(logger, bkt), "", nil, []block.MetadataFilter{filter, partition})
 	testutil.Ok(t, err)
-	s, err := NewBucketStore(bkt, fetcher, t.TempDir(), NewChunksLimiterFactory(1000), NewSeriesLimiterFactory(0), NewBytesLimiterFactory(0),
-		NewGapBasedPartitioner(PartitionerMaxGapSize), 1, false, DefaultPostingOffsetInMemorySampling, false, false, 0, WithResolutionFilter(filter, partition))
+	s, err := NewBucketStore(
+		bkt,
+		fetcher,
+		t.TempDir(),
+		NewChunksLimiterFactory(1000),
+		NewSeriesLimiterFactory(0),
+		NewBytesLimiterFactory(0),
+		NewGapBasedPartitioner(PartitionerMaxGapSize),
+		1,
+		false,
+		DefaultPostingOffsetInMemorySampling,
+		false,
+		false,
+		0,
+		WithResolutionFilter(filter, partition),
+	)
 	testutil.Ok(t, err)
 	t.Cleanup(func() { testutil.Ok(t, s.Close()) })
 
@@ -247,8 +324,18 @@ func TestResolutionReplacementVerificationIsScopedToCovers(t *testing.T) {
 	fault := &unavailableIndexBucket{Bucket: objstore.NewInMemBucket()}
 	bkt := objstore.WithNoopInstr(fault)
 	dir := t.TempDir()
-	id, err := e2eutil.CreateBlock(ctx, dir, []labels.Labels{labels.FromStrings("__name__", "up")}, 20,
-		0, 3600000, labels.FromStrings("tenant", "one"), 0, metadata.NoneFunc, nil)
+	id, err := e2eutil.CreateBlock(
+		ctx,
+		dir,
+		[]labels.Labels{labels.FromStrings("__name__", "up")},
+		20,
+		0,
+		3600000,
+		labels.FromStrings("tenant", "one"),
+		0,
+		metadata.NoneFunc,
+		nil,
+	)
 	testutil.Ok(t, err)
 	m, err := metadata.ReadFromDir(filepath.Join(dir, id.String()))
 	testutil.Ok(t, err)
@@ -263,9 +350,23 @@ func TestResolutionReplacementVerificationIsScopedToCovers(t *testing.T) {
 	fetcher, err := block.NewMetaFetcher(logger, 1, bkt, block.NewConcurrentLister(logger, bkt), "", nil, []block.MetadataFilter{filter})
 	testutil.Ok(t, err)
 	fault.prefix, fault.fail = coarseID.String()+"/", true
-	s, err := NewBucketStore(bkt, fetcher, t.TempDir(), NewChunksLimiterFactory(1000), NewSeriesLimiterFactory(0), NewBytesLimiterFactory(0),
-		NewGapBasedPartitioner(PartitionerMaxGapSize), 1, false, DefaultPostingOffsetInMemorySampling, false, true, 0,
-		WithIndexHeaderLazyDownloadStrategy(indexheader.AlwaysLazyDownloadIndexHeader), WithResolutionFilter(filter))
+	s, err := NewBucketStore(
+		bkt,
+		fetcher,
+		t.TempDir(),
+		NewChunksLimiterFactory(1000),
+		NewSeriesLimiterFactory(0),
+		NewBytesLimiterFactory(0),
+		NewGapBasedPartitioner(PartitionerMaxGapSize),
+		1,
+		false,
+		DefaultPostingOffsetInMemorySampling,
+		false,
+		true,
+		0,
+		WithIndexHeaderLazyDownloadStrategy(indexheader.AlwaysLazyDownloadIndexHeader),
+		WithResolutionFilter(filter),
+	)
 	testutil.Ok(t, err)
 	t.Cleanup(func() { testutil.Ok(t, s.Close()) })
 

@@ -1700,16 +1700,11 @@ func TestResolutionMetaFilter_UncoveredGaugeAndBoundedLogging(t *testing.T) {
 	testutil.Equals(t, 0.0, promtest.ToFloat64(gauge))
 }
 
-// TestResolutionMetaFilter_CoverageAcrossTheTimePartition pins the store's
-// filter order: the resolution filter runs before the time partition, so a raw
-// block straddling --max-time is still proven covered by the 5m block on the far
-// side of it, and the reporter runs after the partition, so a raw block that is
-// uncovered but not served (out of the window) raises no alarm.
 // TestResolutionMetaFilter_FallbacksTrustCoversBeyondTheView pins down what
 // FallbacksFor counts as coverage: a retained cover only once the store
-// confirms it usable, and a cover a later filter dropped from the view - the
-// far side of the time partition - unconditionally, as another store's to
-// serve. Only the blocks that hid something are covers at all.
+// gateway confirms it usable, and a cover a later filter dropped from the view -
+// the far side of the time partition - unconditionally, as another store
+// gateway's to serve. Only the blocks that hid something are covers at all.
 func TestResolutionMetaFilter_FallbacksTrustCoversBeyondTheView(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 120*time.Second)
 	defer cancel()
@@ -1746,8 +1741,8 @@ func TestResolutionMetaFilter_FallbacksTrustCoversBeyondTheView(t *testing.T) {
 
 	var asked []ulid.ULID
 	usable := func(ok bool) func(*metadata.Meta) bool {
-		return func(m *metadata.Meta) bool {
-			asked = append(asked, m.ULID)
+		return func(meta *metadata.Meta) bool {
+			asked = append(asked, meta.ULID)
 			return ok
 		}
 	}
@@ -1762,6 +1757,11 @@ func TestResolutionMetaFilter_FallbacksTrustCoversBeyondTheView(t *testing.T) {
 	testutil.Equals(t, []ulid.ULID{ULID(2)}, asked)
 }
 
+// TestResolutionMetaFilter_CoverageAcrossTheTimePartition pins the store
+// gateway's filter order: the resolution filter runs before the time partition,
+// so a raw block straddling --max-time is still proven covered by the 5m block
+// on the far side of it, and the reporter runs after the partition, so a raw
+// block that is uncovered but not served (out of the window) raises no alarm.
 func TestResolutionMetaFilter_CoverageAcrossTheTimePartition(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 120*time.Second)
 	defer cancel()

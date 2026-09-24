@@ -4284,7 +4284,7 @@ func (c *mockBlockLifecycleCallback) PreAdd(meta metadata.Meta) error {
 func TestBucketStore_Series_RawFallbackDoesNotWarn(t *testing.T) {
 	t.Parallel()
 
-	tb, store, seriesSet1, seriesSet2, block1, block2, close := setupStoreForHintsTest(t, WithSourceCoverage())
+	tb, store, seriesSet1, seriesSet2, block1, block2, close := setupStoreForHintsTest(t, func(s *BucketStore) { s.sourceCoverage = true })
 	defer close()
 
 	matchers := []storepb.LabelMatcher{{Type: storepb.LabelMatcher_EQ, Name: "foo", Value: "bar"}}

@@ -256,8 +256,7 @@ func validateBlockResolutions(minResolution, maxResolution time.Duration) error 
 		}
 	}
 	if minResolution > maxResolution {
-		return errors.Errorf("invalid argument: --min-block-resolution '%s' can't be greater than --max-block-resolution '%s'",
-			minResolution, maxResolution)
+		return errors.Errorf("invalid argument: --min-block-resolution '%s' can't be greater than --max-block-resolution '%s'", minResolution, maxResolution)
 	}
 	return nil
 }
@@ -436,11 +435,13 @@ func runStore(
 	maxBlockResolution := time.Duration(conf.maxBlockResolution).Milliseconds()
 	var resolutionFilter *block.ResolutionMetaFilter
 	if minBlockResolution > 0 || maxBlockResolution < downsample.ResLevel2 {
-		uncoveredBlocks := promauto.With(reg).NewGauge(prometheus.GaugeOpts{
+		resolutionFilter = block.NewResolutionMetaFilter(logger, minBlockResolution, maxBlockResolution, promauto.With(reg).NewGauge(prometheus.GaugeOpts{
 			Name: "thanos_store_resolution_filter_uncovered_blocks",
 			Help: "Number of blocks below the minimum resolution being served because no retained block at the minimum resolution covers them.",
-		})
-		resolutionFilter = block.NewResolutionMetaFilter(logger, minBlockResolution, maxBlockResolution, uncoveredBlocks)
+		}))
+	}
+	switch {
+	case minBlockResolution > 0:
 		// The resolution filter may only count blocks the other filters retained
 		// as coverage for a finer block it hides: a covering block removed later
 		// (too fresh, marked for deletion, parquet-migrated) would leave neither
@@ -452,13 +453,11 @@ func runStore(
 		// window - one deletion-mark lookup per out-of-window block per sync,
 		// same as the compactor pays. BucketStore reports uncovered blocks after
 		// loading replacements and restoring any fallbacks that are still needed.
+		filters = append(filters, resolutionFilter, timePartitionFilter)
+	case maxBlockResolution < downsample.ResLevel2:
 		// Without a minimum nothing is covered, and the window can go first.
-		if minBlockResolution > 0 {
-			filters = append(filters, resolutionFilter, timePartitionFilter)
-		} else {
-			filters = append(append([]block.MetadataFilter{timePartitionFilter}, filters...), resolutionFilter)
-		}
-	} else {
+		filters = append(append([]block.MetadataFilter{timePartitionFilter}, filters...), resolutionFilter)
+	default:
 		filters = append([]block.MetadataFilter{timePartitionFilter}, filters...)
 	}
 
@@ -521,9 +520,9 @@ func runStore(
 	if conf.debugLogging {
 		options = append(options, store.WithDebugLogging())
 	}
-	if minBlockResolution := time.Duration(conf.minBlockResolution).Milliseconds(); minBlockResolution > 0 {
+	if minBlockResolution > 0 {
 		options = append(options, store.WithResolutionFilter(resolutionFilter, timePartitionFilter))
-		level.Info(logger).Log("msg", "serving blocks by resolution; queries requesting finer data need a store retaining that data", "min-block-resolution", conf.minBlockResolution)
+		level.Info(logger).Log("msg", "serving blocks by resolution; queries requesting finer data need a store retaining that data", "minBlockResolution", conf.minBlockResolution)
 	}
 
 	bs, err := store.NewBucketStore(

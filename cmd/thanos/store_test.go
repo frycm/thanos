@@ -16,7 +16,7 @@ import (
 
 // TestStoreFlags_BlockResolutionDefaults pins the defaults to the resolution
 // levels the compactor produces: with them the resolution filter is a no-op,
-// so a store started without the flags serves every block as before. The
+// so a store gateway started without the flags serves every block as before. The
 // levels are milliseconds, and a millisecond count read as a time.Duration is
 // nanoseconds, which once turned the 1h maximum into 3.6ms and hid every
 // downsampled block by default.
@@ -33,12 +33,53 @@ func TestStoreFlags_BlockResolutionDefaults(t *testing.T) {
 }
 
 func TestStoreFlags_BlockResolutionValidation(t *testing.T) {
-	testutil.Ok(t, validateBlockResolutions(0, time.Hour))
-	testutil.Ok(t, validateBlockResolutions(5*time.Minute, 5*time.Minute))
-	testutil.NotOk(t, validateBlockResolutions(time.Minute, time.Hour), "a minimum that is not a downsampling level hides nothing and must be refused")
-	testutil.NotOk(t, validateBlockResolutions(0, 2*time.Hour), "a maximum that is not a downsampling level must be refused")
-	testutil.NotOk(t, validateBlockResolutions(time.Hour, 5*time.Minute), "min above max must be refused")
+	for _, tcase := range []struct {
+		name string
 
-	err := validateBlockResolutions(time.Minute, time.Hour)
-	testutil.Assert(t, strings.Contains(err.Error(), "use one of 0s, 5m, 1h"), "the error must name the levels as durations: %v", err)
+		minResolution time.Duration
+		maxResolution time.Duration
+
+		expectedErr string
+	}{
+		{
+			name:          "defaults",
+			minResolution: 0,
+			maxResolution: time.Hour,
+		},
+		{
+			name:          "min equal to max",
+			minResolution: 5 * time.Minute,
+			maxResolution: 5 * time.Minute,
+		},
+		{
+			// A minimum that is not a downsampling level hides nothing and must be refused;
+			// the error must name the levels as durations.
+			name:          "min not a downsampling level",
+			minResolution: time.Minute,
+			maxResolution: time.Hour,
+			expectedErr:   "use one of 0s, 5m, 1h",
+		},
+		{
+			name:          "max not a downsampling level",
+			minResolution: 0,
+			maxResolution: 2 * time.Hour,
+			expectedErr:   "is not a downsampling level",
+		},
+		{
+			name:          "min above max",
+			minResolution: time.Hour,
+			maxResolution: 5 * time.Minute,
+			expectedErr:   "can't be greater than",
+		},
+	} {
+		t.Run(tcase.name, func(t *testing.T) {
+			err := validateBlockResolutions(tcase.minResolution, tcase.maxResolution)
+			if tcase.expectedErr == "" {
+				testutil.Ok(t, err)
+				return
+			}
+			testutil.NotOk(t, err)
+			testutil.Assert(t, strings.Contains(err.Error(), tcase.expectedErr), "expected error containing %q, got: %v", tcase.expectedErr, err)
+		})
+	}
 }

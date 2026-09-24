@@ -20,11 +20,6 @@ import (
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 )
 
-// fallbackFilterGauge receives the counts of the filters re-run on fallback
-// metadata. They are not exported: the fetcher's counters describe its
-// metadata pass, and the reporter describes the served fallbacks.
-var fallbackFilterGauge = promauto.With(nil).NewGaugeVec(prometheus.GaugeOpts{Name: "fallback_filter", Help: "Counts of the metadata filters re-run on fallback blocks; unregistered."}, []string{"state"})
-
 // Try replacements first, then load only the fallbacks still needed. This
 // avoids loading all historical raw blocks on every cold start and preserves
 // the old blocks until a replacement was actually added to the store.
@@ -39,8 +34,12 @@ func (s *BucketStore) syncResolutionFallbacks(ctx context.Context, metas map[uli
 	}
 	fallbacks := s.resolutionFilter.FallbacksFor(metas, s.usableReplacement)
 	if len(fallbacks) > 0 {
+		// The counts of the filters re-run on fallback metadata are not exported:
+		// the fetcher's counters describe its metadata pass, and the reporter
+		// describes the served fallbacks.
+		discarded := promauto.With(nil).NewGaugeVec(prometheus.GaugeOpts{Name: "fallback_filter", Help: "Counts of the metadata filters re-run on fallback blocks; unregistered."}, []string{"state"})
 		for _, filter := range s.resolutionFallbackFilters {
-			if err := filter.Filter(ctx, fallbacks, fallbackFilterGauge, fallbackFilterGauge); err != nil {
+			if err := filter.Filter(ctx, fallbacks, discarded, discarded); err != nil {
 				return errors.Wrap(err, "filter resolution fallbacks")
 			}
 		}
@@ -50,7 +49,7 @@ func (s *BucketStore) syncResolutionFallbacks(ctx context.Context, metas map[uli
 				continue
 			}
 			if err := s.blockLifecycleCallback.PreAdd(*m); err != nil {
-				level.Warn(s.logger).Log("msg", "resolution fallback rejected by the block lifecycle callback", "block", id, "err", err)
+				level.Warn(s.logger).Log("msg", "resolution fallback rejected by the block lifecycle callback; its range stays unserved until a later sync admits it", "block", id, "err", err)
 				continue
 			}
 			if err := s.addBlock(ctx, m); err != nil {
@@ -80,8 +79,8 @@ func (s *BucketStore) usableReplacement(m *metadata.Meta) bool {
 	}
 	if _, err := b.indexHeaderReader.IndexVersion(); err != nil {
 		level.Warn(s.logger).Log("msg", "resolution replacement has an unreadable index header; serving the finer blocks instead", "block", m.ULID, "err", err)
-		if err := s.removeBlock(m.ULID); err != nil {
-			level.Warn(s.logger).Log("msg", "drop of unreadable resolution replacement failed", "block", m.ULID, "err", err)
+		if rmErr := s.removeBlock(m.ULID); rmErr != nil {
+			level.Warn(s.logger).Log("msg", "drop of unreadable resolution replacement failed; it is no longer served, the finer blocks are served instead", "block", m.ULID, "err", rmErr)
 		}
 		return false
 	}
@@ -194,7 +193,10 @@ func (s *BucketStore) belowResolutionWarning(req *storepb.SeriesRequest, matcher
 		"this store serves blocks downsampled to %s or coarser (--min-block-resolution), but the request asks for finer data (max_source_resolution=%s); "+
 			"%d block(s) in the requested range are served only at %[1]s, so their ranges are missing from this answer; "+
 			"raise the query's max_source_resolution, enable --query.auto-downsampling on the querier, or route the query to a store serving finer blocks",
-		time.Duration(floor)*time.Millisecond, time.Duration(req.MaxResolutionWindow)*time.Millisecond, missing)
+		time.Duration(floor)*time.Millisecond,
+		time.Duration(req.MaxResolutionWindow)*time.Millisecond,
+		missing,
+	)
 }
 
 // metaMatches reports whether a block the store does not hold could answer

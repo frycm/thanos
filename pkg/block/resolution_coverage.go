@@ -30,8 +30,6 @@ const compactorShardLabel = "__compactor_shard__"
 // unsplit stream is 0 of 1.
 type shardRef struct{ index, count uint64 }
 
-var wholeStream = shardRef{index: 0, count: 1}
-
 // streamShard returns the block's stream - its external labels without the
 // shard label - and its shard. A block whose shard label does not parse is a
 // stream of its own, like any other label set: coverage then falls back to
@@ -39,11 +37,11 @@ var wholeStream = shardRef{index: 0, count: 1}
 func streamShard(lbls map[string]string) (string, shardRef) {
 	v, ok := lbls[compactorShardLabel]
 	if !ok {
-		return labels.FromMap(lbls).String(), wholeStream
+		return labels.FromMap(lbls).String(), shardRef{index: 0, count: 1}
 	}
 	s, ok := parseShard(v)
 	if !ok {
-		return labels.FromMap(lbls).String(), wholeStream
+		return labels.FromMap(lbls).String(), shardRef{index: 0, count: 1}
 	}
 	rest := maps.Clone(lbls)
 	delete(rest, compactorShardLabel)

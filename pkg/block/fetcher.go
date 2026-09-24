@@ -774,8 +774,8 @@ const resolutionExcludedMeta = "resolution-excluded"
 var _ MetadataFilter = &ResolutionMetaFilter{}
 
 // ResolutionMetaFilter is a MetadataFilter that filters out blocks outside a
-// resolution range, so a store can be told to serve only downsampled blocks the
-// same way min-time/max-time partition by time.
+// resolution range, so a store gateway can be told to serve only downsampled
+// blocks the same way min-time/max-time partition by time.
 //
 // Hiding a finer block requires coverage of its sources and full time range.
 // A block below the minimum resolution is hidden only when each source is
@@ -938,14 +938,14 @@ func (f *ResolutionMetaFilter) Replaces(id ulid.ULID) bool {
 
 // FallbacksFor returns the finer blocks hidden by the latest fetch whose
 // coverage cannot be relied on. Metadata alone must not evict a usable finer
-// block: a cover the store retained (present in retained, the metadata that
-// survived every filter) counts only when usable reports it loaded and
+// block: a cover the store gateway retained (present in retained, the metadata
+// that survived every filter) counts only when usable reports it loaded and
 // readable. A cover that a later filter removed from retained - the time
 // partition dropping the far side of a block straddling its boundary - still
-// counts: it is another store's to serve, and this store serves the range in
-// question from the cover it did retain. Callers must apply the filters that
-// follow this filter, in particular the time partition, before loading the
-// fallbacks.
+// counts: it is another store gateway's to serve, and this store gateway serves
+// the range in question from the cover it did retain. Callers must apply the
+// filters that follow this filter, in particular the time partition, before
+// loading the fallbacks.
 func (f *ResolutionMetaFilter) FallbacksFor(retained map[ulid.ULID]*metadata.Meta, usable func(*metadata.Meta) bool) map[ulid.ULID]*metadata.Meta {
 	f.mu.Lock()
 	covers := make([]*metadata.Meta, 0, len(f.covers))
@@ -957,14 +957,14 @@ func (f *ResolutionMetaFilter) FallbacksFor(retained map[ulid.ULID]*metadata.Met
 	f.mu.Unlock()
 
 	// usable may load an index header, so it runs without the filter's lock.
-	trusted := map[ulid.ULID]*metadata.Meta{}
+	trusted := make(map[ulid.ULID]*metadata.Meta, len(covers))
 	for _, m := range covers {
 		if _, inView := retained[m.ULID]; !inView || usable(m) {
 			trusted[m.ULID] = m
 		}
 	}
 	coverage := coverageAtResolution(trusted, f.minResolution)
-	fallbacks := map[ulid.ULID]*metadata.Meta{}
+	fallbacks := make(map[ulid.ULID]*metadata.Meta, len(hidden))
 	for id, m := range hidden {
 		if !coverage.covers(m) {
 			fallbacks[id] = m
