@@ -174,6 +174,8 @@ func (c *testCluster) startWorkerMerge(id string, mergeFunc storage.VerticalChun
 		HeartbeatInterval:  25 * time.Millisecond,
 	})
 	testutil.Ok(c.t, err)
+	// Tests should not wait for real checksum read-back backoffs.
+	worker.checksumRetryBackoff = 10 * time.Millisecond
 
 	ctx, cancel := context.WithCancel(context.Background())
 	w.cancel = cancel

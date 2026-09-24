@@ -49,8 +49,8 @@ func (e *RemotePlanExecutor) Execute(ctx context.Context, _ string, cg *compact.
 			}
 			inflight++
 			go func() {
-				ids, err := e.runPlan(ctx, cg, plan)
-				results <- outcome{ids: ids, err: err}
+				ids, runErr := e.runPlan(ctx, cg, plan)
+				results <- outcome{ids: ids, err: runErr}
 			}()
 		}
 		if inflight == 0 {
@@ -138,7 +138,7 @@ func (p *groupPlans) next(ctx context.Context) (compact.Plan, error) {
 		}
 		p.reserved = append(p.reserved, span)
 		if overlaps {
-			level.Debug(p.executor.logger).Log("msg", "deferring overlapping plan until the next metadata sync", "group", p.group.Key(), "span_min", span.min, "span_max", span.max)
+			level.Debug(p.executor.logger).Log("msg", "deferring overlapping plan until the next metadata sync", "group", p.group.Key(), "spanMin", span.min, "spanMax", span.max)
 			continue
 		}
 		return plan, nil

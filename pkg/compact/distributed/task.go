@@ -107,19 +107,40 @@ type Task struct {
 type Outcome string
 
 const (
+	// OutcomeCompleted means the worker uploaded every block the task produced
+	// and reports each with the checksum of its meta.json.
 	OutcomeCompleted Outcome = "completed"
 
-	// The task failed in a way that maps onto one of the compact package's error
-	// classes. The manager reconstructs the class so its control loop can react
-	// exactly as it would for an in-process failure.
+	// The failed outcomes mean the task failed in a way that maps onto one of
+	// the compact package's error classes. The manager reconstructs the class
+	// so its control loop can react exactly as it would for an in-process
+	// failure.
+
+	// OutcomeFailedRetryable is an error worth another attempt: an
+	// unclassified compaction error, a problem of the worker's own machine
+	// such as a full disk, or a task this worker cannot execute.
 	OutcomeFailedRetryable Outcome = "failed_retryable"
-	OutcomeFailedHalt      Outcome = "failed_halt"
-	OutcomeFailedIssue347  Outcome = "failed_issue347"
+	// OutcomeFailedHalt is a compaction error of the halt class, which the
+	// manager handles as a halt, just as a standalone compactor would.
+	OutcomeFailedHalt Outcome = "failed_halt"
+	// OutcomeFailedIssue347 is the issue 347 error; the result names the
+	// offending block, so the manager can repair it.
+	OutcomeFailedIssue347 Outcome = "failed_issue347"
+	// OutcomeFailedOOOChunks is an out-of-order chunks error; the result names
+	// the offending block.
 	OutcomeFailedOOOChunks Outcome = "failed_out_of_order_chunks"
 
-	// The worker discarded its work before making it visible. None of these is
-	// a compaction failure: the task simply has to be executed again.
-	OutcomeAbortedOwnershipLost    Outcome = "aborted_ownership_lost"
+	// The aborted outcomes mean the worker discarded its work, or never
+	// confirmed that it became visible. None of these is a compaction failure:
+	// the task simply has to be executed again.
+
+	// OutcomeAbortedOwnershipLost means the worker no longer owned the task:
+	// the manager stopped acknowledging its lease, or the journal no longer
+	// records it.
+	OutcomeAbortedOwnershipLost Outcome = "aborted_ownership_lost"
+	// OutcomeAbortedStoreUnreachable means the worker could not read the
+	// bucket where it had to: the journal, to confirm it still owned the task
+	// before an upload, or an uploaded block's meta.json, to checksum it.
 	OutcomeAbortedStoreUnreachable Outcome = "aborted_store_unreachable"
 	// OutcomeAbortedWorkerShutdown means the worker was asked to shut down
 	// (SIGTERM, rolling restart) while executing the task. Reporting it

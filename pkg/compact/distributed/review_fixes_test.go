@@ -76,10 +76,6 @@ func TestReviewWorkerShutdownReportsAbortNotHalt(t *testing.T) {
 // checksums, so the old behavior threw away the whole finished task on one
 // read blip - and on the downsample path even crashed the manager.
 func TestWorkerChecksumReadBackFailureAbortsNotCompletes(t *testing.T) {
-	old := metaChecksumRetryBackoff
-	metaChecksumRetryBackoff = 10 * time.Millisecond
-	t.Cleanup(func() { metaChecksumRetryBackoff = old })
-
 	c := newTestCluster(t)
 	w1 := c.startWorker("w1")
 

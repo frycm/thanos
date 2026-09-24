@@ -33,6 +33,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/compact"
 	"github.com/thanos-io/thanos/pkg/compact/downsample"
+	"github.com/thanos-io/thanos/pkg/runutil"
 )
 
 // ManagerConfig configures the scheduling side of a distributed compactor.
@@ -239,8 +240,8 @@ func NewScheduler(ctx context.Context, logger log.Logger, bkt objstore.Bucket, r
 		// Sharing a journal between differently sharded managers means two
 		// writers, which the journal cannot protect against.
 		level.Warn(logger).Log("msg", "journal was written by a manager with a different selector relabel config; "+
-			"make sure no other compactor manager uses this journal ID",
-			"journal_id", conf.JournalID, "journal_selector", j.SelectorHash, "our_selector", conf.SelectorHash)
+			"make sure no other compact manager uses this journal ID",
+			"journalID", conf.JournalID, "journalSelector", j.SelectorHash, "ourSelector", conf.SelectorHash)
 	}
 	j.SelectorHash = conf.SelectorHash
 
@@ -292,7 +293,7 @@ func NewScheduler(ctx context.Context, logger log.Logger, bkt objstore.Bucket, r
 	}
 	s.m.journalGeneration.Set(float64(j.Generation))
 
-	level.Info(logger).Log("msg", "took ownership of compaction journal", "journal_id", conf.JournalID, "generation", j.Generation)
+	level.Info(logger).Log("msg", "took ownership of compaction journal", "journalID", conf.JournalID, "generation", j.Generation)
 	return s, nil
 }
 
@@ -403,7 +404,7 @@ func (s *Scheduler) Lease(ctx context.Context, req LeaseRequest) (*Task, error) 
 	now := time.Now()
 	s.workerSeen[req.WorkerID] = now
 
-	accepts := map[TaskType]bool{}
+	accepts := make(map[TaskType]bool, len(req.Accepts))
 	for _, t := range req.Accepts {
 		accepts[t] = true
 	}
@@ -424,17 +425,17 @@ func (s *Scheduler) Lease(ctx context.Context, req LeaseRequest) (*Task, error) 
 		if err != nil {
 			return nil, err
 		}
-		now := time.Now()
+		leasedAt := time.Now()
 		p.entry.State = StateLeased
 		p.entry.Attempts++
 		p.entry.Lease = &Lease{
 			WorkerID:   req.WorkerID,
 			Token:      token,
 			Generation: s.journal.Generation,
-			ExpiresAt:  now.Add(s.conf.LeaseTTL),
+			ExpiresAt:  leasedAt.Add(s.conf.LeaseTTL),
 		}
-		p.entry.UpdatedAt = now
-		p.leasedAt = now
+		p.entry.UpdatedAt = leasedAt
+		p.leasedAt = leasedAt
 		s.m.tasksInFlight.WithLabelValues(string(p.entry.Task.Type)).Inc()
 		// Leave the queue before the lock is released: a lease that expires
 		// while the journal is being written is requeued by expireLeasesLocked,
@@ -853,7 +854,7 @@ func (s *Scheduler) Halt(cause error) {
 	s.queue = nil
 	s.updateQueueMetricsLocked()
 	level.Error(s.logger).Log("msg", "manager halted; leases revoked and the queue failed, workers will idle until the manager is restarted",
-		"revoked_leases", revoked, "failed_queued", failed, "cause", cause)
+		"revokedLeases", revoked, "failedQueued", failed, "cause", cause)
 
 	if err := s.persistLocked(context.Background()); err != nil {
 		// Best effort: the leases are void in memory either way, so the
@@ -861,7 +862,7 @@ func (s *Scheduler) Halt(cause error) {
 		// the journal. Only an ownership check racing this write could still
 		// pass, and its output is a same-sources duplicate the dedup filter
 		// reconciles.
-		level.Warn(s.logger).Log("msg", "could not persist the halt to the journal", "err", err)
+		level.Warn(s.logger).Log("msg", "could not persist the halt to the journal; the leases stay revoked in memory", "err", err)
 	}
 }
 
@@ -962,11 +963,11 @@ func (s *Scheduler) updateQueueMetricsLocked() {
 		}
 	}
 	s.m.parkedTasks.Set(float64(parked))
-	if oldest.IsZero() {
-		s.m.oldestPendingSecs.Set(0)
-	} else {
-		s.m.oldestPendingSecs.Set(time.Since(oldest).Seconds())
+	oldestPendingSecs := 0.0
+	if !oldest.IsZero() {
+		oldestPendingSecs = time.Since(oldest).Seconds()
 	}
+	s.m.oldestPendingSecs.Set(oldestPendingSecs)
 
 	active := 0
 	for id, seen := range s.workerSeen {
@@ -1330,7 +1331,7 @@ func (e *RemotePlanExecutor) runPlan(ctx context.Context, cg *compact.Group, pla
 // as unpublished from then on, and deleted. Only blocks known to be ours: one
 // that failed the provenance check could be anybody's.
 func (e *RemotePlanExecutor) verifyAndFinalize(ctx context.Context, cg *compact.Group, plan compact.Plan, res Result) ([]ulid.ULID, error) {
-	toCompact, overlappingBlocks := plan.Sources, plan.OverlappingBlocks
+	toCompact := plan.Sources
 	checker := e.deletableChecker
 	if checker == nil {
 		checker = compact.DefaultBlockDeletableChecker{}
@@ -1357,36 +1358,12 @@ func (e *RemotePlanExecutor) verifyAndFinalize(ctx context.Context, cg *compact.
 	outMetas := make(map[ulid.ULID]metadata.Meta, len(res.OutputBlocks))
 	compIDs := make([]ulid.ULID, 0, len(res.OutputBlocks))
 	for _, raw := range res.OutputBlocks {
-		id, err := ulid.Parse(raw)
+		meta, err := fetchVerifiedMeta(ctx, e.bkt, raw, res.OutputChecksums)
 		if err != nil {
-			return reject(errors.Wrapf(err, "worker reported an unparsable block ID %q", raw))
+			return reject(err)
 		}
-
-		rawMeta, err := readRawMetaWithRetry(ctx, e.bkt, id)
-		if err != nil {
-			return reject(errors.Wrapf(err, "verify result block %s reported by worker", id))
-		}
-		sum, ok := res.OutputChecksums[raw]
-		if !ok || sum == "" {
-			// The checksum is what binds the reported result to the metadata the
-			// worker observed after its upload; without it the block in the
-			// bucket could be anything. Workers always report it, so its absence
-			// is a verification failure, not a matter of degree.
-			return reject(errors.Errorf("worker reported no checksum for result block %s", id))
-		}
-		if got := checksumOf(rawMeta); got != sum {
-			return reject(errors.Errorf(
-				"result block %s metadata does not match the checksum the worker reported: got %s, reported %s", id, got, sum))
-		}
-
-		var meta metadata.Meta
-		if err := json.Unmarshal(rawMeta, &meta); err != nil {
-			return reject(errors.Wrapf(err, "unmarshal metadata of result block %s", id))
-		}
-		if meta.ULID.Compare(id) != 0 {
-			return reject(errors.Errorf("result block %s holds metadata for %s", id, meta.ULID))
-		}
-		if err := verifyProvenance(&meta, Provenance{
+		id := meta.ULID
+		if err := verifyProvenance(meta, Provenance{
 			TaskID: res.TaskID, TaskType: TaskCompaction, JournalID: e.journalID, Generation: res.Generation,
 		}); err != nil {
 			return reject(errors.Wrapf(err, "result block %s", id))
@@ -1403,7 +1380,7 @@ func (e *RemotePlanExecutor) verifyAndFinalize(ctx context.Context, cg *compact.
 				"result block %s spans [%d, %d], outside the plan's [%d, %d]", id, meta.MinTime, meta.MaxTime, planMinTime, planMaxTime))
 		}
 		for _, s := range meta.Compaction.Sources {
-			if _, ok := expected[s]; !ok {
+			if _, isSource := expected[s]; !isSource {
 				return reject(errors.Errorf(
 					"result block %s was compacted from %s, which is not a source of this plan", id, s))
 			}
@@ -1412,7 +1389,7 @@ func (e *RemotePlanExecutor) verifyAndFinalize(ctx context.Context, cg *compact.
 		if _, dup := outMetas[id]; dup {
 			return reject(errors.Errorf("result block %s was reported twice", id))
 		}
-		outMetas[id] = meta
+		outMetas[id] = *meta
 		compIDs = append(compIDs, id)
 	}
 
@@ -1483,7 +1460,7 @@ func (e *RemotePlanExecutor) verifyAndFinalize(ctx context.Context, cg *compact.
 			return nil, compact.NewRetryError(errors.Wrapf(err, "record the verification of task %s", res.TaskID))
 		}
 	}
-	cg.RecordCompaction(overlappingBlocks)
+	cg.RecordCompaction(plan.OverlappingBlocks)
 
 	// Mark the sources for deletion now that the result is known to be in the
 	// bucket, so the next planning cycle does not pick them up again.
@@ -1510,11 +1487,11 @@ func (e *RemotePlanExecutor) rejectOutputs(ctx context.Context, taskID string, o
 	}
 	recorded := false
 	if e.sched != nil {
-		if err := e.sched.RejectOutputs(ctx, taskID, ours); err != nil {
+		err := e.sched.RejectOutputs(ctx, taskID, ours)
+		if err != nil {
 			level.Error(e.logger).Log("msg", "could not record the rejected result blocks of a task in the journal", "task", taskID, "err", err)
-		} else {
-			recorded = true
 		}
+		recorded = err == nil
 	}
 	failed := 0
 	for _, id := range ours {
@@ -1545,7 +1522,7 @@ func (e *RemotePlanExecutor) rejectOutputs(ctx context.Context, taskID string, o
 func claimOutputs(cg *compact.Group, plan compact.Plan, res Result, outMetas map[ulid.ULID]metadata.Meta) error {
 	// The set every result block must record: the uploaded blocks and the
 	// siblings the plan named.
-	wantSet := map[ulid.ULID]struct{}{}
+	wantSet := make(map[ulid.ULID]struct{}, len(outMetas)+len(plan.Siblings))
 	for id := range outMetas {
 		wantSet[id] = struct{}{}
 	}
@@ -1601,12 +1578,8 @@ func claimOutputs(cg *compact.Group, plan compact.Plan, res Result, outMetas map
 	if len(res.Outputs) != len(plan.Outputs) {
 		return errors.Errorf("the report accounts for %d outputs, the plan named %d", len(res.Outputs), len(plan.Outputs))
 	}
-	reported := map[ulid.ULID]struct{}{}
-	for id := range outMetas {
-		reported[id] = struct{}{}
-	}
 	seen := make([]bool, len(plan.Outputs))
-	claimed := map[ulid.ULID]int{}
+	claimed := make(map[ulid.ULID]int, len(res.Outputs))
 	for _, o := range res.Outputs {
 		if o.Index < 0 || o.Index >= len(plan.Outputs) {
 			return errors.Errorf("the report accounts for output %d, which the plan did not name", o.Index)
@@ -1642,19 +1615,19 @@ func claimOutputs(cg *compact.Group, plan compact.Plan, res Result, outMetas map
 			return err
 		}
 	}
-	if len(claimed) != len(reported) {
-		return errors.Errorf("the report uploads %d blocks but accounts for %d of them as outputs", len(reported), len(claimed))
+	if len(claimed) != len(outMetas) {
+		return errors.Errorf("the report uploads %d blocks but accounts for %d of them as outputs", len(outMetas), len(claimed))
 	}
 	return nil
 }
 
 // readRawMeta returns the raw bytes of a block's meta.json in the bucket.
-func readRawMeta(ctx context.Context, bkt objstore.Bucket, id ulid.ULID) ([]byte, error) {
+func readRawMeta(ctx context.Context, bkt objstore.Bucket, id ulid.ULID) (_ []byte, err error) {
 	r, err := bkt.Get(ctx, path.Join(id.String(), block.MetaFilename))
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = r.Close() }()
+	defer runutil.ExhaustCloseWithErrCapture(&err, r, "close meta.json reader")
 	return io.ReadAll(r)
 }
 
@@ -1753,7 +1726,7 @@ func verifyProvenance(m *metadata.Meta, want Provenance) error {
 
 // CompactionTask builds the task that asks a worker to execute a plan.
 func CompactionTask(cg *compact.Group, plan compact.Plan) (Task, error) {
-	toCompact, overlappingBlocks := plan.Sources, plan.OverlappingBlocks
+	toCompact := plan.Sources
 	spec, err := GroupSpecOf(cg)
 	if err != nil {
 		return Task{}, err
@@ -1779,7 +1752,7 @@ func CompactionTask(cg *compact.Group, plan compact.Plan) (Task, error) {
 		SourceBlocks:       sources,
 		ExpectedMinTime:    minTime,
 		ExpectedMaxTime:    maxTime,
-		OverlappingBlocks:  overlappingBlocks,
+		OverlappingBlocks:  plan.OverlappingBlocks,
 		Outputs:            plan.Outputs,
 		Siblings:           plan.Siblings,
 		ExpectedSeries:     series,
@@ -1896,10 +1869,10 @@ func DispatchDownsampling(
 			}
 			resolution := c.Meta.Thanos.ResolutionString()
 
-			resultCh, err := sched.Submit(ctx, task)
-			if err != nil {
+			resultCh, submitErr := sched.Submit(ctx, task)
+			if submitErr != nil {
 				failed.Store(true)
-				return errors.Wrap(err, "submit downsample task")
+				return errors.Wrap(submitErr, "submit downsample task")
 			}
 
 			var res Result
@@ -1933,11 +1906,11 @@ func DispatchDownsampling(
 				return compact.NewRetryError(errors.Errorf("downsample task %s reported %d output blocks; expected exactly one", res.TaskID, len(res.OutputBlocks)))
 			}
 			for _, raw := range res.OutputBlocks {
-				outMeta, err := fetchVerifiedMeta(ctx, bkt, raw, res.OutputChecksums)
-				if err != nil {
+				outMeta, fetchErr := fetchVerifiedMeta(ctx, bkt, raw, res.OutputChecksums)
+				if fetchErr != nil {
 					failed.Store(true)
 					inc(downsampleFailures, resolution)
-					return compact.NewRetryError(errors.Wrapf(err, "downsample of %s", c.Meta.ULID))
+					return compact.NewRetryError(errors.Wrapf(fetchErr, "downsample of %s", c.Meta.ULID))
 				}
 				if err := verifyDownsampledBlock(outMeta, c, Provenance{
 					TaskID: res.TaskID, TaskType: TaskDownsample, JournalID: sched.conf.JournalID, Generation: res.Generation,
@@ -1981,7 +1954,7 @@ func verifyDownsampledBlock(outMeta *metadata.Meta, c downsample.Candidate, want
 		return errors.Errorf("spans [%d, %d], the source spans [%d, %d]",
 			outMeta.MinTime, outMeta.MaxTime, c.Meta.MinTime, c.Meta.MaxTime)
 	}
-	expected := map[ulid.ULID]struct{}{}
+	expected := make(map[ulid.ULID]struct{}, len(c.Meta.Compaction.Sources))
 	for _, s := range c.Meta.Compaction.Sources {
 		expected[s] = struct{}{}
 	}

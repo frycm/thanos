@@ -42,7 +42,7 @@ func RegisterServer(mux *http.ServeMux, logger log.Logger, sched *Scheduler) {
 		}
 		task, err := sched.Lease(r.Context(), req)
 		if err != nil {
-			level.Warn(logger).Log("msg", "could not lease a task to a worker", "worker", req.WorkerID, "err", err)
+			level.Warn(logger).Log("msg", "could not lease a task to a worker; answering with an error so the worker asks again later", "worker", req.WorkerID, "err", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -63,7 +63,7 @@ func RegisterServer(mux *http.ServeMux, logger log.Logger, sched *Scheduler) {
 			return
 		}
 		if err := sched.Report(r.Context(), res); err != nil {
-			level.Warn(logger).Log("msg", "could not record a task result", "task", res.TaskID, "err", err)
+			level.Warn(logger).Log("msg", "could not record a task result; answering with an error so the worker retries the report", "task", res.TaskID, "err", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}

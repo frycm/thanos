@@ -97,11 +97,9 @@ func (w *Worker) executeDownsample(ctx context.Context, task Task, dir string, p
 	}
 
 	begin = time.Now()
-	var pool chunkenc.Pool
+	pool := downsample.NewPool()
 	if m.Thanos.Downsample.Resolution == 0 {
 		pool = chunkenc.NewPool()
-	} else {
-		pool = downsample.NewPool()
 	}
 
 	b, err := tsdb.OpenBlock(logutil.GoKitLogToSlog(w.logger), bdir, pool, nil)
@@ -160,13 +158,13 @@ func (w *Worker) executeDownsample(ctx context.Context, task Task, dir string, p
 		return nil, compact.NewRetryError(errors.Wrapf(err, "upload downsampled block %s", outID))
 	}
 	w.m.stageDuration.WithLabelValues("upload").Observe(time.Since(begin).Seconds())
-	level.Info(w.logger).Log("msg", "uploaded block", "id", outID, "duration", time.Since(begin))
+	level.Info(w.logger).Log("msg", "uploaded block", "block", outID, "duration", time.Since(begin))
 
 	if err := os.RemoveAll(bdir); err != nil {
-		level.Warn(w.logger).Log("msg", "failed to clean directory", "dir", bdir, "err", err)
+		level.Warn(w.logger).Log("msg", "could not clean up the source block directory; it is removed with the task directory", "dir", bdir, "err", err)
 	}
 	if err := os.RemoveAll(resdir); err != nil {
-		level.Warn(w.logger).Log("msg", "failed to clean directory", "dir", resdir, "err", err)
+		level.Warn(w.logger).Log("msg", "could not clean up the result block directory; it is removed with the task directory", "dir", resdir, "err", err)
 	}
 
 	return []ulid.ULID{outID}, nil

@@ -502,7 +502,7 @@ func runCompact(
 		})
 
 		level.Info(logger).Log("msg", "running compact in manager mode; compaction is executed by workers",
-			"journal_id", conf.managerJournalID, "generation", scheduler.Generation())
+			"journalID", conf.managerJournalID, "generation", scheduler.Generation())
 	}
 
 	retentionByResolution := map[compact.ResolutionLevel]time.Duration{

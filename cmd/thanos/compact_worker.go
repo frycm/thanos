@@ -27,6 +27,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/extprom"
 	"github.com/thanos-io/thanos/pkg/logutil"
 	"github.com/thanos-io/thanos/pkg/prober"
+	"github.com/thanos-io/thanos/pkg/runutil"
 	httpserver "github.com/thanos-io/thanos/pkg/server/http"
 	"github.com/thanos-io/thanos/pkg/strutil"
 )
@@ -43,9 +44,9 @@ func runCompactWorker(
 	g *run.Group,
 	logger log.Logger,
 	reg *prometheus.Registry,
-	component component.Component,
+	compType component.Component,
 	conf compactConfig,
-) error {
+) (rerr error) {
 	if conf.workerManagerAddress == "" {
 		return errors.New("--compact.worker.manager-address is required in worker mode")
 	}
@@ -56,10 +57,14 @@ func runCompactWorker(
 	httpProbe := prober.NewHTTP()
 	statusProber := prober.Combine(
 		httpProbe,
-		prober.NewInstrumentation(component, logger, extprom.WrapRegistererWithPrefix("thanos_", reg)),
+		prober.NewInstrumentation(compType, logger, extprom.WrapRegistererWithPrefix("thanos_", reg)),
 	)
 
-	srv := httpserver.New(logger, reg, component, httpProbe,
+	srv := httpserver.New(
+		logger,
+		reg,
+		compType,
+		httpProbe,
 		httpserver.WithListen(conf.http.bindAddress),
 		httpserver.WithGracePeriod(time.Duration(conf.http.gracePeriod)),
 		httpserver.WithTLSConfig(conf.http.tlsConfig),
@@ -77,29 +82,32 @@ func runCompactWorker(
 	if err != nil {
 		return err
 	}
-	bkt, err := client.NewBucket(logger, confContentYaml, component.String(), nil)
+	bkt, err := client.NewBucket(logger, confContentYaml, compType.String(), nil)
 	if err != nil {
 		return err
 	}
 	insBkt := objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(bkt, extprom.WrapRegistererWithPrefix("thanos_", reg), bkt.Name()))
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		if rerr != nil {
+			cancel()
+			runutil.CloseWithLogOnErr(logger, insBkt, "bucket client")
+		}
+	}()
 
 	levels, err := compactions.levels(conf.maxCompactionLevel)
 	if err != nil {
-		cancel()
 		return errors.Wrap(err, "get compaction levels")
 	}
 
 	mergeFunc, err := dedupFuncFor(conf)
 	if err != nil {
-		cancel()
 		return err
 	}
 
 	comp, err := tsdb.NewLeveledCompactor(ctx, reg, logutil.GoKitLogToSlog(logger), levels, downsample.NewPool(), mergeFunc)
 	if err != nil {
-		cancel()
 		return errors.Wrap(err, "create compactor")
 	}
 
@@ -109,7 +117,6 @@ func runCompactWorker(
 	workerID := cmp.Or(conf.workerID, distributed.DefaultWorkerID())
 	workerDir := path.Join(conf.dataDir, "compact-worker", workerID)
 	if err := os.MkdirAll(workerDir, os.ModePerm); err != nil {
-		cancel()
 		return errors.Wrap(err, "create working directory")
 	}
 
@@ -118,9 +125,9 @@ func runCompactWorker(
 		extprom.WrapRegistererWithPrefix("thanos_compact_worker_manager_", reg),
 		dns.ResolverType(conf.dnsSDResolver),
 	)
-	client := distributed.NewHTTPClient(logger, dnsProvider, conf.workerManagerAddress, 0)
+	managerClient := distributed.NewHTTPClient(logger, dnsProvider, conf.workerManagerAddress, 0)
 
-	worker, err := distributed.NewWorker(logger, insBkt, client, comp, reg, distributed.WorkerConfig{
+	worker, err := distributed.NewWorker(logger, insBkt, managerClient, comp, reg, distributed.WorkerConfig{
 		WorkerID:           workerID,
 		JournalID:          conf.managerJournalID,
 		DedupFunc:          conf.dedupFunc,
@@ -130,11 +137,11 @@ func runCompactWorker(
 		HeartbeatInterval:  conf.workerHeartbeatInterval,
 	})
 	if err != nil {
-		cancel()
 		return errors.Wrap(err, "create compaction worker")
 	}
 
 	g.Add(func() error {
+		defer runutil.CloseWithLogOnErr(logger, insBkt, "bucket client")
 		defer func() {
 			if err := os.RemoveAll(workerDir); err != nil {
 				level.Error(logger).Log("msg", "could not clean up the working directory", "dir", workerDir, "err", err)

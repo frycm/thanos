@@ -117,6 +117,7 @@ func PlanRollback(ctx context.Context, logger log.Logger, bkt objstore.Instrumen
 
 	r := &Rollback{Options: opts, JournalsUpdatedAt: map[string]time.Time{}}
 
+	r.Unreadable = make([]ulid.ULID, 0, len(partial))
 	for id := range partial {
 		r.Unreadable = append(r.Unreadable, id)
 	}
@@ -180,9 +181,9 @@ func PlanRollback(ctx context.Context, logger log.Logger, bkt objstore.Instrumen
 			}
 			visiting[id] = true
 			for _, raw := range p.Sources {
-				src, err := ulid.Parse(raw)
-				if err != nil {
-					return errors.Wrapf(err, "invalid source %q of block %s", raw, id)
+				src, parseErr := ulid.Parse(raw)
+				if parseErr != nil {
+					return errors.Wrapf(parseErr, "invalid source %q of block %s", raw, id)
 				}
 				if err := recoverSource(src); err != nil {
 					return err
@@ -205,7 +206,7 @@ func PlanRollback(ctx context.Context, logger log.Logger, bkt objstore.Instrumen
 	slices.SortFunc(r.Produced, func(a, b ulid.ULID) int { return a.Compare(b) })
 	for _, id := range r.Produced {
 		if err := recoverSource(id); err != nil {
-			return nil, errors.Wrapf(err, "cannot restore sources of output %s; refusing rollback", id)
+			return nil, errors.Wrapf(err, "restore sources of output %s; refusing rollback", id)
 		}
 	}
 	slices.Reverse(r.deleteOrder)
@@ -221,6 +222,7 @@ func PlanRollback(ctx context.Context, logger log.Logger, bkt objstore.Instrumen
 			restore[id] = struct{}{}
 		}
 	}
+	r.Restore = make([]ulid.ULID, 0, len(restore))
 	for id := range restore {
 		r.Restore = append(r.Restore, id)
 	}

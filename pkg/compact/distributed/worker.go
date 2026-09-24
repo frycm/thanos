@@ -112,6 +112,10 @@ type Worker struct {
 	comp   compact.Compactor
 	conf   WorkerConfig
 	m      *workerMetrics
+
+	// checksumRetryBackoff is the base delay between checksum read-back
+	// retries.
+	checksumRetryBackoff time.Duration
 }
 
 // NewWorker returns a worker ready to be run.
@@ -130,6 +134,8 @@ func NewWorker(logger log.Logger, bkt objstore.Bucket, client TaskClient, comp c
 		comp:   comp,
 		conf:   conf,
 		m:      newWorkerMetrics(reg),
+
+		checksumRetryBackoff: 2 * time.Second,
 	}, nil
 }
 
@@ -138,7 +144,7 @@ func (w *Worker) Run(ctx context.Context) error {
 	if err := w.cleanTaskDirectories(); err != nil {
 		return errors.Wrap(err, "clean abandoned worker task directories")
 	}
-	level.Info(w.logger).Log("msg", "compaction worker started", "worker_id", w.conf.WorkerID, "journal_id", w.conf.JournalID)
+	level.Info(w.logger).Log("msg", "compaction worker started", "worker", w.conf.WorkerID, "journalID", w.conf.JournalID)
 
 	for ctx.Err() == nil {
 		task, err := w.client.Lease(ctx, LeaseRequest{
@@ -152,7 +158,7 @@ func (w *Worker) Run(ctx context.Context) error {
 			if ctx.Err() != nil {
 				break
 			}
-			level.Warn(w.logger).Log("msg", "could not lease a task", "err", err)
+			level.Warn(w.logger).Log("msg", "could not lease a task; retrying after the poll interval", "err", err)
 			if err := sleep(ctx, w.conf.PollInterval); err != nil {
 				break
 			}
@@ -246,7 +252,7 @@ func (w *Worker) heartbeat(ctx context.Context, task Task, acknowledged *atomic.
 	interval := effectiveHeartbeatInterval(w.conf.HeartbeatInterval, task.LeaseTTL)
 	if interval != w.conf.HeartbeatInterval {
 		level.Warn(w.logger).Log("msg", "heartbeat interval is too long for the lease TTL; heartbeating faster",
-			"configured", w.conf.HeartbeatInterval, "lease_ttl", task.LeaseTTL, "effective", interval)
+			"configured", w.conf.HeartbeatInterval, "leaseTTL", task.LeaseTTL, "effective", interval)
 	}
 	// time.Tick: the ticker lives exactly as long as this goroutine, and since
 	// Go 1.23 an unreferenced ticker is collected without Stop.
@@ -282,15 +288,16 @@ func (w *Worker) heartbeat(ctx context.Context, task Task, acknowledged *atomic.
 			abandon()
 			return
 		}
-		if err != nil {
+		switch {
+		case err != nil:
 			if ctx.Err() == nil {
-				level.Warn(w.logger).Log("msg", "heartbeat failed", "task", task.ID, "err", err)
+				level.Warn(w.logger).Log("msg", "heartbeat failed; retrying on the next tick", "task", task.ID, "err", err)
 			}
-		} else if !resp.Acknowledged {
+		case !resp.Acknowledged:
 			level.Warn(w.logger).Log("msg", "the manager no longer recognizes our lease; abandoning the task", "task", task.ID)
 			abandon()
 			return
-		} else {
+		default:
 			lastAcknowledged = time.Now()
 		}
 
@@ -345,7 +352,7 @@ func (w *Worker) execute(ctx context.Context, task Task, acknowledged *atomic.Bo
 	}
 	defer func() {
 		if err := os.RemoveAll(dir); err != nil {
-			level.Warn(w.logger).Log("msg", "could not clean up the task work directory", "dir", dir, "err", err)
+			level.Warn(w.logger).Log("msg", "could not clean up the task work directory; it is removed when the worker next starts", "dir", dir, "err", err)
 		}
 	}()
 
@@ -364,14 +371,14 @@ func (w *Worker) execute(ctx context.Context, task Task, acknowledged *atomic.Bo
 			return errors.New("the manager no longer acknowledges our lease")
 		}
 
-		status, err := CheckOwnership(ctx, w.bkt, w.conf.JournalID, task.ID, task.LeaseToken, task.Generation, task.LeaseTTL)
+		status, checkErr := CheckOwnership(ctx, w.bkt, w.conf.JournalID, task.ID, task.LeaseToken, task.Generation, task.LeaseTTL)
 		switch status {
 		case OwnershipConfirmed:
 			return nil
 		case OwnershipLost:
 			w.m.ownershipCheckFailures.WithLabelValues("lost").Inc()
 			aborted = OutcomeAbortedOwnershipLost
-			return errors.Wrap(err, "we no longer own this task")
+			return errors.Wrap(checkErr, "we no longer own this task")
 		default:
 			// The journal could not be read, so whether we still own the task is
 			// unknown. Discard the work rather than risk uploading a block a
@@ -379,14 +386,14 @@ func (w *Worker) execute(ctx context.Context, task Task, acknowledged *atomic.Bo
 			// this is a storage problem and not a lost race.
 			w.m.ownershipCheckFailures.WithLabelValues("store_unreachable").Inc()
 			aborted = OutcomeAbortedStoreUnreachable
-			return errors.Wrap(err, "could not reach the journal to confirm ownership")
+			return errors.Wrap(checkErr, "reach the journal to confirm ownership")
 		}
 	}
 
 	if task.Type == TaskDownsample {
-		outIDs, err := w.executeDownsample(ctx, task, dir, ownershipGate)
-		if err != nil {
-			return w.triageExecutionError(ctx, res, err, aborted, acknowledged)
+		outIDs, dsErr := w.executeDownsample(ctx, task, dir, ownershipGate)
+		if dsErr != nil {
+			return w.triageExecutionError(ctx, res, dsErr, aborted, acknowledged)
 		}
 		return w.completeResult(ctx, res, outIDs, nil, acknowledged)
 	}
@@ -498,10 +505,11 @@ func (w *Worker) triageExecutionError(ctx context.Context, res Result, err error
 // but their delivery could not be confirmed. The requeued task's duplicate
 // result is reconciled by block deduplication, exactly as for a lost report.
 func (w *Worker) completeResult(ctx context.Context, res Result, ids []ulid.ULID, outputs []OutputResult, acknowledged *atomic.Bool) Result {
-	res.OutputChecksums = map[string]string{}
+	res.OutputBlocks = make([]string, 0, len(ids))
+	res.OutputChecksums = make(map[string]string, len(ids))
 	res.Outputs = outputs
 	for _, id := range ids {
-		sum, err := metaChecksumRetry(ctx, w.bkt, id)
+		sum, err := metaChecksumRetry(ctx, w.bkt, id, w.checksumRetryBackoff)
 		if err != nil {
 			level.Warn(w.logger).Log("msg", "could not checksum an uploaded result block; discarding the report", "block", id, "err", err)
 			res.OutputBlocks, res.OutputChecksums, res.Outputs = nil, nil, nil
@@ -537,8 +545,14 @@ func (w *Worker) rebuildGroup(ctx context.Context, task Task) (*compact.Group, [
 		task.Group.Resolution,
 		task.Group.AcceptMalformedIndex,
 		task.Group.EnableVerticalCompaction,
-		noopCounter(), noopCounter(), noopCounter(), noopCounter(),
-		noopCounter(), noopCounter(), noopCounter(), noopCounter(),
+		noopCounter(),
+		noopCounter(),
+		noopCounter(),
+		noopCounter(),
+		noopCounter(),
+		noopCounter(),
+		noopCounter(),
+		noopCounter(),
 		metadata.HashFunc(task.Group.HashFunc),
 		task.Group.BlockFilesConcurrency,
 		task.Group.CompactBlocksFetchConcurrency,
@@ -562,11 +576,10 @@ func (w *Worker) rebuildGroup(ctx context.Context, task Task) (*compact.Group, [
 		if err != nil {
 			return nil, nil, errors.Wrapf(err, "parse source block ID %q", raw)
 		}
-		meta, err := block.DownloadMeta(ctx, w.logger, w.bkt, id)
+		m, err := block.DownloadMeta(ctx, w.logger, w.bkt, id)
 		if err != nil {
 			return nil, nil, compact.NewRetryError(errors.Wrapf(err, "read metadata of source block %s", id))
 		}
-		m := meta
 		stripDedupReplicaLabels(&m, task.Group.DedupReplicaLabels)
 		if err := cg.AppendMeta(&m); err != nil {
 			return nil, nil, errors.Wrapf(err, "add source block %s to the group", id)
@@ -671,21 +684,18 @@ func metaChecksum(ctx context.Context, bkt objstore.Bucket, id ulid.ULID) (strin
 	return checksumOf(raw), nil
 }
 
-// metaChecksumRetryBackoff is the base delay between checksum read-back
-// retries. A variable so tests do not have to wait for real backoffs.
-var metaChecksumRetryBackoff = 2 * time.Second
-
 // metaChecksumRetry is metaChecksum with a few retries, because a completion
 // report without a checksum is worthless: the manager rejects it and the whole
-// task is executed again.
-func metaChecksumRetry(ctx context.Context, bkt objstore.Bucket, id ulid.ULID) (string, error) {
+// task is executed again. The delay before each retry grows linearly from
+// retryBackoff.
+func metaChecksumRetry(ctx context.Context, bkt objstore.Bucket, id ulid.ULID, retryBackoff time.Duration) (string, error) {
 	var (
 		sum string
 		err error
 	)
 	for attempt := range 3 {
 		if attempt > 0 {
-			if sleepErr := sleep(ctx, time.Duration(attempt)*metaChecksumRetryBackoff); sleepErr != nil {
+			if sleepErr := sleep(ctx, time.Duration(attempt)*retryBackoff); sleepErr != nil {
 				return "", err
 			}
 		}

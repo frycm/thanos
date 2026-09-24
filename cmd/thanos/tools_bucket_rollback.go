@@ -23,6 +23,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/compact/distributed"
 	"github.com/thanos-io/thanos/pkg/extkingpin"
 	"github.com/thanos-io/thanos/pkg/extprom"
+	"github.com/thanos-io/thanos/pkg/runutil"
 )
 
 type bucketRollbackConfig struct {
@@ -51,13 +52,15 @@ func (tbc *bucketRollbackConfig) registerBucketRollbackFlag(cmd extkingpin.FlagC
 }
 
 func registerBucketRollbackDistributedCompaction(app extkingpin.AppClause, objStoreConfig *extflag.PathOrContent) {
-	cmd := app.Command("rollback-distributed-compaction",
+	cmd := app.Command(
+		"rollback-distributed-compaction",
 		"Experimental. Undo what the distributed compactor (--compact.mode=manager/worker) did to the bucket: "+
 			"restore the recorded sources, including garbage-collection marks, then delete the blocks its workers produced, "+
 			"returning the bucket to the state the standalone compactor left behind. "+
 			"Stop the manager and every worker first and wait for in-flight tasks to end; the command refuses to apply while a journal in scope looks alive. "+
 			"Run it before the compactor's --delete-delay has passed for the oldest marks, since a block that was physically deleted cannot be restored. "+
-			"Nothing is changed unless --no-dry-run is given.")
+			"Nothing is changed unless --no-dry-run is given.",
+	)
 
 	tbc := &bucketRollbackConfig{}
 	tbc.registerBucketRollbackFlag(cmd)
@@ -83,6 +86,7 @@ func registerBucketRollbackDistributedCompaction(app extkingpin.AppClause, objSt
 
 		ctx, cancel := context.WithCancel(context.Background())
 		g.Add(func() error {
+			defer runutil.CloseWithLogOnErr(logger, insBkt, "bucket client")
 			defer cancel()
 			return runBucketRollback(ctx, logger, insBkt, tbc)
 		}, func(error) {

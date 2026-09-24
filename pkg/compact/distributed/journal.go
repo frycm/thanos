@@ -15,6 +15,8 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/thanos-io/objstore"
+
+	"github.com/thanos-io/thanos/pkg/runutil"
 )
 
 // JournalVersion is the schema version of the journal. It is bumped whenever the
@@ -171,7 +173,7 @@ func UnparkPath(journalID, taskID string) string {
 
 // ReadJournal loads a shard's journal. It returns a nil journal and no error
 // when the shard has no journal yet.
-func ReadJournal(ctx context.Context, bkt objstore.Bucket, journalID string) (*Journal, error) {
+func ReadJournal(ctx context.Context, bkt objstore.Bucket, journalID string) (_ *Journal, err error) {
 	r, err := bkt.Get(ctx, JournalPath(journalID))
 	if err != nil {
 		if bkt.IsObjNotFoundErr(err) {
@@ -179,7 +181,7 @@ func ReadJournal(ctx context.Context, bkt objstore.Bucket, journalID string) (*J
 		}
 		return nil, errors.Wrap(err, "get journal")
 	}
-	defer func() { _ = r.Close() }()
+	defer runutil.ExhaustCloseWithErrCapture(&err, r, "close journal reader")
 
 	body, err := io.ReadAll(r)
 	if err != nil {
@@ -242,8 +244,7 @@ func (j *Journal) Prune(retention time.Duration, now time.Time) int {
 // SelectorHash fingerprints a selector relabel config so a manager can notice it
 // is reusing the journal of a differently sharded manager.
 func SelectorHash(relabelConfigYAML []byte) string {
-	sum := sha256.Sum256(relabelConfigYAML)
-	return fmt.Sprintf("sha256:%x", sum)
+	return fmt.Sprintf("sha256:%x", sha256.Sum256(relabelConfigYAML))
 }
 
 // Ownership is the result of a worker asking whether it still owns a task.
@@ -261,6 +262,7 @@ const (
 	OwnershipUnknown
 )
 
+// String implements fmt.Stringer.
 func (o Ownership) String() string {
 	switch o {
 	case OwnershipConfirmed:

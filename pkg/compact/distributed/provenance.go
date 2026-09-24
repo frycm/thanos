@@ -60,16 +60,14 @@ func (p Provenance) For(id ulid.ULID, sources []string) Provenance {
 // Stamp adds the provenance to a block's extensions and returns the result.
 // Extensions are an open map; anything already there is kept.
 func (p Provenance) Stamp(extensions any) (any, error) {
-	ext := map[string]any{}
-	if extensions != nil {
-		existing, ok := extensions.(map[string]any)
-		if !ok {
-			// Extensions of another shape would be lost by merging, and silently
-			// dropping the provenance would undermine what it exists for.
-			return nil, errors.Errorf("cannot stamp provenance onto extensions of type %T", extensions)
-		}
-		maps.Copy(ext, existing)
+	existing, ok := extensions.(map[string]any)
+	if extensions != nil && !ok {
+		// Extensions of another shape would be lost by merging, and silently
+		// dropping the provenance would undermine what it exists for.
+		return nil, errors.Errorf("cannot stamp provenance onto extensions of type %T", extensions)
 	}
+	ext := make(map[string]any, len(existing)+1)
+	maps.Copy(ext, existing)
 	ext[ProvenanceExtension] = p
 	return ext, nil
 }
