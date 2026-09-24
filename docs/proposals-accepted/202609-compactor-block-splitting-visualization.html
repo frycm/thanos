@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Compactor block splitting by series: how it works</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1f2430; --muted: #6b7280; --line: #d1d5db; --panel: #f6f7f9;
+    --accent: #2563eb; --warn: #d97706; --bad: #dc2626; --ok: #059669;
+    --s1: #3b82f6; --s2: #f59e0b; --s3: #10b981; --s4: #ef4444;
+    --s5: #8b5cf6; --s6: #ec4899; --s7: #14b8a6; --s8: #f97316;
+    --s9: #6366f1; --s10: #84cc16; --s11: #06b6d4; --s12: #e11d48;
+    --s13: #a855f7; --s14: #22c55e; --s15: #eab308; --s16: #0ea5e9;
+    --unsplit: #9ca3af;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0f1216; --fg: #e5e7eb; --muted: #9ca3af; --line: #374151; --panel: #171b21; --unsplit: #6b7280; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; color: var(--fg); background: var(--bg); }
+  main { max-width: 1040px; margin: 0 auto; padding: 32px 20px 80px; }
+  h1 { font-size: 26px; margin: 0 0 4px; }
+  h2 { font-size: 20px; margin: 48px 0 8px; padding-top: 16px; border-top: 1px solid var(--line); }
+  p { margin: 8px 0; max-width: 78ch; }
+  .lead { color: var(--muted); }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin: 16px 0; }
+  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  button { font: inherit; padding: 6px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  .caption { font-size: 13px; color: var(--muted); margin-top: 6px; }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 13px; color: var(--muted); }
+  .legend span::before { content: ""; display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; background: var(--c); }
+  svg { width: 100%; height: auto; display: block; }
+  svg text { font: 12px system-ui, sans-serif; fill: var(--fg); }
+  svg .muted { fill: var(--muted); }
+  svg .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+  svg .box { fill: var(--panel); stroke: var(--line); }
+  svg .arrow { stroke: var(--muted); stroke-width: 1.5; fill: none; marker-end: url(#arr); }
+  svg .dim { opacity: .25; }
+  svg .hl { stroke: var(--accent); stroke-width: 2; }
+  .steps { display: grid; grid-template-columns: 1fr; gap: 6px; margin-top: 10px; }
+  .step { padding: 8px 12px; border-left: 3px solid var(--line); color: var(--muted); }
+  .step.active { border-color: var(--accent); color: var(--fg); background: var(--bg); border-radius: 0 8px 8px 0; }
+  .grid { display: grid; grid-template-columns: repeat(16, 1fr); gap: 4px; margin: 12px 0; }
+  .cell { aspect-ratio: 1; border-radius: 4px; display: flex; align-items: center; justify-content: center; font-size: 10px; color: #fff; font-family: ui-monospace, monospace; transition: background .25s, outline .15s; cursor: pointer; }
+  .cell.focus { outline: 3px solid var(--fg); outline-offset: 1px; }
+  .shards { display: grid; gap: 8px; margin-top: 8px; }
+  .shard { border: 1px solid var(--line); border-radius: 8px; padding: 8px; font-size: 13px; }
+  .shard b { font-family: ui-monospace, monospace; font-weight: 600; }
+  .bar { height: 8px; border-radius: 4px; margin-top: 6px; }
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; font-size: 14px; }
+  .kv b { font-family: ui-monospace, monospace; font-weight: 600; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; background: var(--panel); padding: 1px 5px; border-radius: 4px; }
+  input[type=range] { width: 200px; }
+  .warnbox { border-left: 3px solid var(--warn); padding: 8px 12px; background: var(--panel); border-radius: 0 8px 8px 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Compactor block splitting by series</h1>
+  <p class="lead">Visual companion to the proposal <code>202609-compactor-block-splitting.md</code>. Everything here is illustrative; sizes are examples.</p>
+
+  <!-- ─────────────────────────────────────────────────────────── -->
+  <h2>1. Today: the biggest block gets frozen</h2>
+  <p>The planner sums the index sizes of a plan's source blocks. When the running total reaches 85% of the limit it writes a <code>no-compact-mark.json</code> for the biggest block and replans without it. Two replicas of 30&nbsp;GiB each sum to 60&nbsp;GiB, so one is frozen even though the deduplicated result would be about 30&nbsp;GiB.</p>
+  <div class="panel">
+    <svg viewBox="0 0 900 250" role="img" aria-label="Today's behaviour">
+      <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker></defs>
+      <rect class="box" x="60" y="20" width="240" height="60" rx="8"/>
+      <text x="180" y="45" text-anchor="middle">replica A  [t0, t1)</text>
+      <text x="180" y="65" text-anchor="middle" class="muted mono">index 30 GiB</text>
+      <rect class="box" x="600" y="20" width="240" height="60" rx="8"/>
+      <text x="720" y="45" text-anchor="middle">replica B  [t0, t1)</text>
+      <text x="720" y="65" text-anchor="middle" class="muted mono">index 30 GiB</text>
+      <path class="arrow" d="M180 80 L 180 110 L 450 110 L 450 130"/>
+      <path class="arrow" d="M720 80 L 720 110 L 450 110"/>
+      <rect class="box" x="300" y="130" width="300" height="44" rx="8"/>
+      <text x="450" y="157" text-anchor="middle" class="mono">30 + 30 = 60 GiB  ≥  0.85 × 64 GiB</text>
+      <path class="arrow" d="M450 174 L 450 200"/>
+      <rect x="250" y="200" width="400" height="40" rx="8" fill="none" stroke="var(--bad)" stroke-width="1.5"/>
+      <text x="450" y="225" text-anchor="middle" fill="var(--bad)">mark B no-compact (index-size-exceeding), compact A alone</text>
+    </svg>
+    <p class="caption">B stays raw and overlapping forever. The marker survives a raised limit and must be removed by hand.</p>
+  </div>
+
+  <!-- ─────────────────────────────────────────────────────────── -->
+  <h2>2. With splitting: one plan becomes M shard blocks</h2>
+  <p>The planner decides the split. Once it has chosen a plan's sources, the split planner computes <code>M</code> from their metadata and names one output per shard in the plan: the group's labels plus <code>__compactor_shard__ = "i_of_M"</code>, and the series partition. The executor knows nothing about shards; it runs one compaction pass per named output over the sources it downloaded once. Pass <code>i</code> keeps only the series whose hash modulo <code>M</code> is <code>i-1</code>. Step through it:</p>
+  <div class="panel">
+    <div class="row">
+      <button id="prev">◀ Back</button>
+      <button id="next" class="primary">Next ▶</button>
+      <span id="stepLabel" class="caption"></span>
+    </div>
+    <svg id="flow" viewBox="0 0 900 430" role="img" aria-label="Split flow">
+      <!-- sources -->
+      <g id="g-src">
+        <rect class="box" x="120" y="20" width="150" height="50" rx="8"/><text x="195" y="42" text-anchor="middle">replica A</text><text x="195" y="60" text-anchor="middle" class="muted mono">30 GiB</text>
+        <rect class="box" x="630" y="20" width="150" height="50" rx="8"/><text x="705" y="42" text-anchor="middle">replica B</text><text x="705" y="60" text-anchor="middle" class="muted mono">30 GiB</text>
+      </g>
+      <!-- estimate -->
+      <g id="g-est">
+        <path class="arrow" d="M195 70 L195 95 L450 95 L450 110"/><path class="arrow" d="M705 70 L705 95 L450 95"/>
+        <rect class="box" x="250" y="110" width="400" height="44" rx="8"/>
+        <text x="450" y="128" text-anchor="middle" class="mono">planner: 60 GiB / 54.4 GiB = 1.1 → ceil 2 → pow2 → M = 2</text>
+        <text x="450" y="146" text-anchor="middle" class="muted">(example continues with M = 4 to show the fan-out)</text>
+      </g>
+      <!-- download -->
+      <g id="g-dl">
+        <path class="arrow" d="M450 154 L450 180"/>
+        <rect class="box" x="330" y="180" width="240" height="36" rx="8"/><text x="450" y="203" text-anchor="middle">executor: download + verify once</text>
+      </g>
+      <!-- passes -->
+      <g id="g-pass">
+        <path class="arrow" d="M450 216 L450 235 L150 235 L150 250"/>
+        <path class="arrow" d="M450 235 L350 235 L350 250"/>
+        <path class="arrow" d="M450 235 L550 235 L550 250"/>
+        <path class="arrow" d="M450 235 L750 235 L750 250"/>
+        <g class="pass"><rect x="80" y="250" width="140" height="44" rx="8" fill="var(--s1)" opacity=".9"/><text x="150" y="268" text-anchor="middle" fill="#fff">pass 1</text><text x="150" y="285" text-anchor="middle" class="mono" fill="#fff">hash % 4 == 0</text></g>
+        <g class="pass"><rect x="280" y="250" width="140" height="44" rx="8" fill="var(--s2)" opacity=".9"/><text x="350" y="268" text-anchor="middle" fill="#fff">pass 2</text><text x="350" y="285" text-anchor="middle" class="mono" fill="#fff">hash % 4 == 1</text></g>
+        <g class="pass"><rect x="480" y="250" width="140" height="44" rx="8" fill="var(--s3)" opacity=".9"/><text x="550" y="268" text-anchor="middle" fill="#fff">pass 3</text><text x="550" y="285" text-anchor="middle" class="mono" fill="#fff">hash % 4 == 2</text></g>
+        <g class="pass"><rect x="680" y="250" width="140" height="44" rx="8" fill="var(--s4)" opacity=".9"/><text x="750" y="268" text-anchor="middle" fill="#fff">pass 4</text><text x="750" y="285" text-anchor="middle" class="mono" fill="#fff">hash % 4 == 3</text></g>
+      </g>
+      <!-- outputs -->
+      <g id="g-out">
+        <path class="arrow" d="M150 294 L150 315"/><path class="arrow" d="M350 294 L350 315"/><path class="arrow" d="M550 294 L550 315"/><path class="arrow" d="M750 294 L750 315"/>
+        <g><rect class="box" x="80" y="315" width="140" height="58" rx="8" stroke="var(--s1)" stroke-width="2"/><text x="150" y="335" text-anchor="middle" class="mono">shard=1_of_4</text><text x="150" y="352" text-anchor="middle" class="muted mono">sources A,B</text><text x="150" y="366" text-anchor="middle" class="muted mono">set: all 4 shards</text></g>
+        <g><rect class="box" x="280" y="315" width="140" height="58" rx="8" stroke="var(--s2)" stroke-width="2"/><text x="350" y="335" text-anchor="middle" class="mono">shard=2_of_4</text><text x="350" y="352" text-anchor="middle" class="muted mono">sources A,B</text><text x="350" y="366" text-anchor="middle" class="muted mono">set: all 4 shards</text></g>
+        <g><rect class="box" x="480" y="315" width="140" height="58" rx="8" stroke="var(--s3)" stroke-width="2"/><text x="550" y="335" text-anchor="middle" class="mono">shard=3_of_4</text><text x="550" y="352" text-anchor="middle" class="muted mono">sources A,B</text><text x="550" y="366" text-anchor="middle" class="muted mono">set: all 4 shards</text></g>
+        <g><rect class="box" x="680" y="315" width="140" height="58" rx="8" stroke="var(--s4)" stroke-width="2"/><text x="750" y="335" text-anchor="middle" class="mono">shard=4_of_4</text><text x="750" y="352" text-anchor="middle" class="muted mono">sources A,B</text><text x="750" y="366" text-anchor="middle" class="muted mono">set: all 4 shards</text></g>
+      </g>
+      <!-- finalize -->
+      <g id="g-fin">
+        <rect x="200" y="392" width="500" height="30" rx="8" fill="none" stroke="var(--ok)" stroke-width="1.5"/>
+        <text x="450" y="412" text-anchor="middle" fill="var(--ok)">all 4 uploaded, set complete → A and B superseded, marked for deletion</text>
+      </g>
+    </svg>
+    <div class="steps" id="steps">
+      <div class="step">The planner selects the overlapping replicas A and B, exactly as today.</div>
+      <div class="step">The split planner sums index bytes (and optionally series), divides by the per-shard target, rounds up, then up again to a power of two, and applies the lineage floor and the cap (section 3). It names one output per shard in the plan. M = 2 here; the picture shows M = 4.</div>
+      <div class="step">The executor downloads and verifies the sources once. Nothing about this step changes.</div>
+      <div class="step">One compaction pass runs per output over the same directories. Pass i uses the seam's <code>PartitionedBlockPopulator</code>, which filters each source's postings to the series of its partition and keeps only the symbols those series use. Merge and deduplication are the standard code. If the partitions together keep fewer series than the sources hold, which is what a changed <code>--compact.block-split.ignore-labels</code> looks like, the compactor halts before uploading anything.</div>
+      <div class="step">Each output is a normal block: same time range, same resolution, group labels plus the shard label. All M record the full source set and the set of blocks the compaction produced. Series are disjoint across shards; replicas were deduplicated inside each shard.</div>
+      <div class="step">Only after every upload succeeded are the sources marked for deletion. Independently of the marking, the shards supersede A and B only once the whole set is in the bucket: a crash after the first shard leaves the sources in place and the lone shard unpublished (section 6).</div>
+    </div>
+  </div>
+
+  <!-- ─────────────────────────────────────────────────────────── -->
+  <h2>3. How the planner chooses M</h2>
+  <p><code>M</code> is not configured. Every stream starts unsplit, a plan splits only when its estimate demands it, and a shard group that outgrows the limits later splits again on its own. The estimate measures the sources, so for a shard group it measures that shard's data alone, and the count multiplies.</p>
+  <div class="panel">
+    <div class="kv">
+      <b>k</b><span>parts the sources need: index bytes over 85% of <code>--compact.block-max-index-size</code> and, optionally, series over <code>--compact.block-split.max-series</code>, rounded up to a power of two</span>
+      <b>L</b><span>the sources' own shard count; 1 for unsplit sources</span>
+      <b>F</b><span>the finest count present in the lineage: any shard of the stream for unsplit sources, the finer shards of <code>i_of_S</code> for a shard group</span>
+      <b>cap</b><span><code>--compact.block-split.max-shards</code>, rounded down to a power of two; <code>0</code> or <code>1</code> disables splitting</span>
+      <b>refuse</b><span>only when the index needs a split and <code>k_index × L</code> exceeds the cap: the biggest block is marked no-compact with the existing reason, as today</span>
+      <b>M</b><span><code>max(min(max(k × L, F), cap), L)</code>; M = L means no split</span>
+    </div>
+    <p class="caption">If shard blocks of the lineage already span the plan's whole range, the plan is split into exactly those shards instead, whatever the estimate (section 7).</p>
+    <div class="shards" style="grid-template-columns: repeat(2, 1fr)">
+      <div class="shard"><b>two 30 GiB replicas, unsplit</b><div class="caption">k = 2, L = 1 → <code>1_of_2</code>, <code>2_of_2</code></div></div>
+      <div class="shard"><b>two 40 GiB inputs of 1_of_4</b><div class="caption">k = 2, L = 4 → <code>1_of_8</code>, <code>5_of_8</code>; <code>max(k, S)</code> would have left the shard as it was</div></div>
+      <div class="shard"><b>a fresh range needing 4, stream at 8, cap 16</b><div class="caption">F = 8 → split into 8, or <code>_of_4</code> groups could never merge with the <code>_of_8</code> ones</div></div>
+      <div class="shard"><b>20 GiB of 1_of_8, cap lowered to 4</b><div class="caption">k = 1: a plan needing no further split always fits; it compacts at 8, never at a coarser count</div></div>
+      <div class="shard"><b>a fresh range, stream at 8, cap lowered to 4</b><div class="caption">the cap bounds the floor: split into 4; the ranges at 4 and at 8 stay in different groups</div></div>
+      <div class="shard"><b>series target alone wants more than the cap</b><div class="caption">split into the cap and compacted; only the index size refuses a plan</div></div>
+    </div>
+  </div>
+
+  <!-- ─────────────────────────────────────────────────────────── -->
+  <h2>4. Which series goes where, and why re-splitting is free</h2>
+  <p>Each square is one series, coloured by its shard. Move the slider to change M. Click a series to follow it: because M is always a power of two, a series in shard <code>i_of_M</code> can only land in <code>i_of_2M</code> or <code>(i+M)_of_2M</code>. That is why a shard group that grows too large can be split on its own, without reading any other shard.</p>
+  <div class="panel">
+    <div class="row">
+      <label>Shards M: <b id="mLabel" style="font-family:ui-monospace,monospace">4</b></label>
+      <input id="m" type="range" min="0" max="4" step="1" value="2">
+      <span class="caption">1, 2, 4, 8, 16</span>
+      <span class="caption" id="focusInfo" style="margin-left:auto"></span>
+    </div>
+    <div class="grid" id="grid"></div>
+    <div class="shards" id="shards"></div>
+    <p class="caption">Hashes here are synthetic. Real shards use <code>labels.StableHash</code> over the series labels stored in the block, without external labels, so the same series from two replicas hashes identically and is deduplicated inside its shard. Replica labels that live inside the series (HA pairs behind a receiver, agents over remote write) are left out of the hash with <code>--compact.block-split.ignore-labels</code>, so both replicas of a series share a shard. The ignored labels are part of a stream's lineage: set them before the first split and never change them.</p>
+  </div>
+
+  <!-- ─────────────────────────────────────────────────────────── -->
+  <h2>5. Groups: the shard label does most of the work</h2>
+  <p>The shard ID is an external label, so the grouper puts every shard in its own compaction group. The planner's overlap detection, vertical compaction and the store gateway's block sets work per group and need no shard awareness. A few places do have to know which shards hold which series, because all shards of a plan record the same sources: the metadata deduplication filter, the downsampling planner's coverage, and the split planner that keeps a stream's groups consistent.</p>
+  <div class="panel">
+    <svg viewBox="0 0 900 300" role="img" aria-label="Groups before and after">
+      <text x="20" y="24" class="muted">before</text>
+      <rect class="box" x="20" y="34" width="330" height="40" rx="8"/><text x="185" y="59" text-anchor="middle" class="mono">0@{cluster="eu1"}</text>
+      <path class="arrow" d="M350 54 L 420 54"/>
+      <text x="440" y="24" class="muted">after the first split (M = 4)</text>
+      <rect class="box" x="440" y="34" width="440" height="40" rx="8"/><text x="660" y="59" text-anchor="middle" class="mono">0@{cluster="eu1"}   ← still receives fresh 2h blocks</text>
+      <rect class="box" x="440" y="84" width="440" height="40" rx="8" stroke="var(--s1)" stroke-width="2"/><text x="660" y="109" text-anchor="middle" class="mono">0@{cluster="eu1", __compactor_shard__="1_of_4"}</text>
+      <rect class="box" x="440" y="134" width="440" height="40" rx="8" stroke="var(--s2)" stroke-width="2"/><text x="660" y="159" text-anchor="middle" class="mono">0@{cluster="eu1", __compactor_shard__="2_of_4"}</text>
+      <rect class="box" x="440" y="184" width="440" height="40" rx="8" stroke="var(--s3)" stroke-width="2"/><text x="660" y="209" text-anchor="middle" class="mono">0@{cluster="eu1", __compactor_shard__="3_of_4"}</text>
+      <rect class="box" x="440" y="234" width="440" height="40" rx="8" stroke="var(--s4)" stroke-width="2"/><text x="660" y="259" text-anchor="middle" class="mono">0@{cluster="eu1", __compactor_shard__="4_of_4"}</text>
+      <text x="20" y="104" class="muted">within a shard group:</text>
+      <text x="20" y="122" class="muted">• adjacent blocks compact horizontally</text>
+      <text x="20" y="140" class="muted">• overlapping blocks dedup vertically</text>
+      <text x="20" y="158" class="muted">• downsampling per block, label inherited</text>
+      <text x="20" y="194" class="muted">across the groups of one stream:</text>
+      <text x="20" y="212" class="muted">• dedup: a shard supersedes its sources, never a sibling</text>
+      <text x="20" y="230" class="muted">• downsampling coverage per stream and shard</text>
+      <text x="20" y="248" class="muted">• planner: lineage floor, newest per stream,</text>
+      <text x="20" y="266" class="muted">   stragglers split into the covering shards</text>
+    </svg>
+  </div>
+
+  <!-- ─────────────────────────────────────────────────────────── -->
+  <h2>6. Shards replace their sources only as a complete set</h2>
+  <p>One shard's existence cannot prove that its sources have been replaced. Every shard records the set its compaction produced, and it supersedes anything only once every block of the set is present. A shard whose set is incomplete is unpublished: it supersedes nothing, and the compactor withholds it from its view so that it is never compacted on.</p>
+  <div class="panel">
+    <svg viewBox="0 0 900 300" role="img" aria-label="Publication sets">
+      <text x="30" y="24">attempt 1: fails after the first shard</text>
+      <rect x="40" y="40" width="160" height="40" rx="8" fill="none" stroke="var(--ok)" stroke-width="1.5"/><text x="120" y="65" text-anchor="middle">source A</text>
+      <rect x="240" y="40" width="160" height="40" rx="8" fill="none" stroke="var(--ok)" stroke-width="1.5"/><text x="320" y="65" text-anchor="middle">source B</text>
+      <path class="arrow" d="M220 80 L220 110"/>
+      <rect class="box" x="40" y="110" width="160" height="50" rx="8" stroke="var(--s1)" stroke-width="2"/><text x="120" y="131" text-anchor="middle" class="mono">1_of_2  s1</text><text x="120" y="149" text-anchor="middle" class="muted mono">set {s1, s2}</text>
+      <rect x="240" y="110" width="160" height="50" rx="8" fill="none" stroke="var(--bad)" stroke-width="1.5" stroke-dasharray="5 4"/><text x="320" y="131" text-anchor="middle" class="mono">2_of_2  s2</text><text x="320" y="149" text-anchor="middle" fill="var(--bad)">upload failed</text>
+      <text x="40" y="186" class="muted">set incomplete → s1 is unpublished: it supersedes</text>
+      <text x="40" y="204" class="muted">nothing, the compactor withholds it, A and B stay</text>
+
+      <text x="480" y="24">attempt 2: the rerun completes its set</text>
+      <rect class="box" x="490" y="110" width="170" height="50" rx="8" stroke="var(--s1)" stroke-width="2"/><text x="575" y="131" text-anchor="middle" class="mono">1_of_2  s1'</text><text x="575" y="149" text-anchor="middle" class="muted mono">set {s1', s2'}</text>
+      <rect class="box" x="690" y="110" width="170" height="50" rx="8" stroke="var(--s2)" stroke-width="2"/><text x="775" y="131" text-anchor="middle" class="mono">2_of_2  s2'</text><text x="775" y="149" text-anchor="middle" class="muted mono">set {s1', s2'}</text>
+      <text x="490" y="186" class="muted">set complete → published: supersedes A, B and</text>
+      <text x="490" y="204" class="muted">the leftover s1; garbage collection deletes them</text>
+
+      <line x1="20" y1="226" x2="880" y2="226" stroke="var(--line)"/>
+      <text x="30" y="250">later: s1' is compacted with the next range of its group</text>
+      <text x="30" y="272" class="muted">The plan names s2' as a sibling, so the new block's set is {new, s2'}: s2' stays published once s1' is gone.</text>
+      <text x="30" y="290" class="muted">A block is published by its own complete set, or by any complete set that names it and names its holder.</text>
+    </svg>
+    <div class="kv" style="margin-top:12px">
+      <b>withheld, not lost</b><span>store gateways keep serving unpublished blocks next to their sources; retention still reaches them; <code>tools bucket downsample</code> withholds them like the compactor</span>
+      <b>empty shards</b><span>the set counts the planned outputs but names only the blocks produced, so a shard that held no series is not awaited</span>
+      <b>copies</b><span>block repair and <code>tools bucket rewrite</code> rename the copy into its set; a set that does not name its holder vouches for no other block</span>
+      <b>selectors</b><span>presence is judged on the view the compactor sees, so a compactor's <code>--selector.relabel-config</code> must keep a stream's shards together</span>
+    </div>
+    <p class="caption">The scenario <code>split_survives_partial_publication</code> fails the executor right after the first shard's <code>meta.json</code> is in the bucket, and <code>TestShardTreeNeverLosesCoverage</code> drives the filter through random histories of failed splits, re-splits, merges and garbage collection.</p>
+  </div>
+
+  <!-- ─────────────────────────────────────────────────────────── -->
+  <h2>7. One stream over time</h2>
+  <p>Fresh 2h blocks keep arriving in the unsplit group and compact to 2d as usual. When a plan exceeds the limit it splits, and its shards join the shard groups, which compact and downsample them like any other group.</p>
+  <div class="panel">
+    <svg viewBox="0 0 900 260" role="img" aria-label="Stream over time">
+      <text x="20" y="40" class="muted">2h</text>
+      <g id="lvl1"></g>
+      <text x="20" y="100" class="muted">2d</text>
+      <g id="lvl2"></g>
+      <text x="20" y="150" class="muted">14d</text>
+      <g id="lvl3"></g>
+      <text x="90" y="245" class="muted">time →</text>
+      <text x="560" y="245" class="muted">grey = unsplit block, colours = shards 1..4 of the same range</text>
+    </svg>
+  </div>
+  <p>The split planner keeps the unsplit group and the shard groups of one stream consistent:</p>
+  <div class="panel">
+    <div class="kv">
+      <b>lineage floor</b><span>a plan never gets fewer shards than its lineage already has, as far as the cap allows; once one range of <code>1_of_4</code> re-split into <code>1_of_8</code> and <code>5_of_8</code>, its other ranges follow</span>
+      <b>newest per stream</b><span>a stream's fresh blocks arrive unsplit, so a shard group's last range is not the stream's newest and is compacted and downsampled</span>
+      <b>stragglers</b><span>a block left alone in a range that shards refining its own already span (a window one replica missed, a late upload) is planned alone and split into exactly those shards, whatever their counts</span>
+      <b>behind its lineage</b><span>a lone shard block whose lineage moved on to a finer count the cap still allows is planned alone and split up to it, covered or not</span>
+      <b>same limits</b><span>a block planned alone is refused and marked like any plan when its split needs more shards than allowed, and skipped when it would not be split at all</span>
+    </div>
+  </div>
+
+  <!-- ─────────────────────────────────────────────────────────── -->
+  <h2>8. Read path: unchanged, except one label is stripped</h2>
+  <p>Shards are ordinary blocks. A query over a split range touches M blocks instead of one. Series are disjoint across shards, so no deduplication is involved. For every block that carries <code>__compactor_shard__</code>, the store gateway removes it from the series, label names and label values it returns, using the same mechanism it already uses to drop replica labels. The querier never sees the label.</p>
+  <div class="panel">
+    <svg viewBox="0 0 900 250" role="img" aria-label="Read path">
+      <rect class="box" x="330" y="10" width="240" height="36" rx="8"/><text x="450" y="33" text-anchor="middle" class="mono">query [t0,t1) {job="api"}</text>
+      <path class="arrow" d="M450 46 L450 70"/>
+      <rect class="box" x="120" y="70" width="660" height="120" rx="10"/>
+      <text x="450" y="90" text-anchor="middle">store gateway</text>
+      <rect x="150" y="105" width="130" height="44" rx="6" fill="var(--s1)" opacity=".9"/><text x="215" y="131" text-anchor="middle" fill="#fff" class="mono">1_of_4</text>
+      <rect x="310" y="105" width="130" height="44" rx="6" fill="var(--s2)" opacity=".9"/><text x="375" y="131" text-anchor="middle" fill="#fff" class="mono">2_of_4</text>
+      <rect x="470" y="105" width="130" height="44" rx="6" fill="var(--s3)" opacity=".9"/><text x="535" y="131" text-anchor="middle" fill="#fff" class="mono">3_of_4</text>
+      <rect x="630" y="105" width="130" height="44" rx="6" fill="var(--s4)" opacity=".9"/><text x="695" y="131" text-anchor="middle" fill="#fff" class="mono">4_of_4</text>
+      <text x="450" y="175" text-anchor="middle" class="muted">matchers → postings → chunks per block, as today; then drop __compactor_shard__ from results</text>
+      <path class="arrow" d="M450 190 L450 215"/>
+      <rect class="box" x="360" y="215" width="180" height="30" rx="8"/><text x="450" y="235" text-anchor="middle">querier (no change)</text>
+    </svg>
+    <p class="caption">With <code>--selector.relabel-config</code> on the shard label, shards 1 and 2 can live on one store gateway and 3 and 4 on another, which is the parallel fetch asked for in #5437. A compactor's selector must not separate them.</p>
+  </div>
+
+  <!-- ─────────────────────────────────────────────────────────── -->
+  <h2>9. Distributed compactor: inherit first, fan out later</h2>
+  <p>The plan names its outputs, so the manager's planner makes the split decision with its bucket-wide view, the task carries the outputs to the worker as data, the worker's executor produces exactly those, and the manager verifies every result block against one of the plan's outputs. None of it is shard-specific: one task, M passes, M outputs works as it is. The second step, drawn below, turns the M passes into M parallel tasks.</p>
+  <div class="panel">
+    <svg viewBox="0 0 900 330" role="img" aria-label="Manager fan-out">
+      <text x="40" y="24">manager</text>
+      <line x1="80" y1="34" x2="80" y2="320" stroke="var(--line)" stroke-dasharray="4 4"/>
+      <text x="300" y="24">worker 1</text><line x1="330" y1="34" x2="330" y2="320" stroke="var(--line)" stroke-dasharray="4 4"/>
+      <text x="480" y="24">worker 2</text><line x1="510" y1="34" x2="510" y2="320" stroke="var(--line)" stroke-dasharray="4 4"/>
+      <text x="660" y="24">worker 3</text><line x1="690" y1="34" x2="690" y2="320" stroke="var(--line)" stroke-dasharray="4 4"/>
+      <text x="820" y="24">worker 4</text><line x1="850" y1="34" x2="850" y2="320" stroke="var(--line)" stroke-dasharray="4 4"/>
+      <rect class="box" x="10" y="44" width="140" height="30" rx="6"/><text x="80" y="64" text-anchor="middle" class="mono">plan {A,B}, M=4</text>
+      <path class="arrow" d="M150 90 L325 90"/><text x="160" y="85" class="mono muted">task shard=1_of_4</text>
+      <path class="arrow" d="M150 110 L505 110"/><text x="160" y="105" class="mono muted">task shard=2_of_4</text>
+      <path class="arrow" d="M150 130 L685 130"/><text x="160" y="125" class="mono muted">task shard=3_of_4</text>
+      <path class="arrow" d="M150 150 L845 150"/><text x="160" y="145" class="mono muted">task shard=4_of_4</text>
+      <rect x="290" y="165" width="80" height="60" rx="6" fill="var(--s1)" opacity=".9"/><text x="330" y="190" text-anchor="middle" fill="#fff">download</text><text x="330" y="208" text-anchor="middle" fill="#fff">pass 1</text>
+      <rect x="470" y="165" width="80" height="60" rx="6" fill="var(--s2)" opacity=".9"/><text x="510" y="190" text-anchor="middle" fill="#fff">download</text><text x="510" y="208" text-anchor="middle" fill="#fff">pass 2</text>
+      <rect x="650" y="165" width="80" height="60" rx="6" fill="var(--s3)" opacity=".9"/><text x="690" y="190" text-anchor="middle" fill="#fff">download</text><text x="690" y="208" text-anchor="middle" fill="#fff">pass 3</text>
+      <rect x="810" y="165" width="80" height="60" rx="6" fill="var(--s4)" opacity=".9"/><text x="850" y="190" text-anchor="middle" fill="#fff">download</text><text x="850" y="208" text-anchor="middle" fill="#fff">pass 4</text>
+      <path class="arrow" d="M330 225 L330 245 L85 245"/><path class="arrow" d="M510 225 L510 250 L85 250"/><path class="arrow" d="M690 225 L690 255 L85 255"/><path class="arrow" d="M850 225 L850 260 L85 260"/>
+      <text x="400" y="278" class="mono muted">results: block ID + meta checksum each</text>
+      <rect x="10" y="285" width="380" height="34" rx="6" fill="none" stroke="var(--ok)" stroke-width="1.5"/>
+      <text x="200" y="306" text-anchor="middle" fill="var(--ok)">verify results against the plan's outputs → mark A, B</text>
+    </svg>
+    <p class="caption">Future step. Sources and the plan's time envelope are reserved in the manager for the whole set, so the four tasks never conflict with other plans of the group. Completed shards are recorded in the journal; a failed shard is re-issued alone.</p>
+  </div>
+
+  <!-- ─────────────────────────────────────────────────────────── -->
+  <h2>10. What stays the same, what changes</h2>
+  <div class="panel">
+    <div class="kv">
+      <b>grouper</b><span>unchanged; the label creates shard groups</span>
+      <b>planner</b><span>the index-size filter stays, at <code>max-shards × block-max-index-size</code>; the split planner wraps it: decides M, names outputs and siblings, refuses what the cap cannot hold, plans stragglers; "newest" judged per stream</span>
+      <b>executor (seam)</b><span>untouched by splitting: produces the outputs a plan names, records the set in each, uploads all before marking sources, halts if the partitions miss series</span>
+      <b>populator (seam)</b><span><code>PartitionedBlockPopulator</code>: filters postings and symbols to one partition</span>
+      <b>dedup filter</b><span>deduplicates a stream's shards with the blocks they were made from; a shard supersedes only as a complete set, never a sibling; the compactor withholds unpublished blocks</span>
+      <b>downsampling</b><span>per block, label inherited; coverage judged per stream and shard</span>
+      <b>retention</b><span>unaware of labels; also reaches the blocks the compactor withholds</span>
+      <b>bucket tools</b><span><code>rewrite</code> and block repair rename the copy into its set; <code>tools bucket downsample</code> withholds unpublished blocks</span>
+      <b>store gateway</b><span>strips one reserved label from blocks that carry it</span>
+      <b>querier</b><span>unchanged</span>
+      <b>manager (PR #1)</b><span>tasks carry the plan's outputs, the verifier checks results against them; later, dispatch one task per shard</span>
+      <b>worker (PR #1)</b><span>unchanged; inherits the executor</span>
+    </div>
+  </div>
+  <div class="warnbox" style="margin-top:16px">
+    <b>The one invariant.</b> A shard block lists the full source set but holds a fraction of the series. Any logic that says "X supersedes or covers Y because sources(Y) ⊆ sources(X)" has to account for shards. The deduplication filter lets a shard supersede only its own lineage and only as a complete set; the downsampling planner, and the store resolution filter in PR #3, judge coverage per stream and shard: a block is covered through its own shard, a coarser one holding it, or finer shards that together hold all of it, never through another shard; the stuck-block fences of PR #2 hold per shard. Each has a regression test with shards of one plan.
+  </div>
+
+<script>
+(() => {
+  // ── Section 2: step-through ────────────────────────────────────────────
+  const groups = ['g-src','g-est','g-dl','g-pass','g-out','g-fin'];
+  const steps = [...document.querySelectorAll('#steps .step')];
+  const labels = ['1 / 6  plan','2 / 6  planner decides M','3 / 6  download once','4 / 6  M passes','5 / 6  M outputs and their set','6 / 6  publish, then mark sources'];
+  let cur = 0;
+  const render = () => {
+    groups.forEach((id, i) => document.getElementById(id).classList.toggle('dim', i > cur));
+    steps.forEach((s, i) => s.classList.toggle('active', i === cur));
+    document.getElementById('stepLabel').textContent = labels[cur];
+    document.getElementById('prev').disabled = cur === 0;
+    document.getElementById('next').disabled = cur === groups.length - 1;
+  };
+  document.getElementById('prev').onclick = () => { cur = Math.max(0, cur - 1); render(); };
+  document.getElementById('next').onclick = () => { cur = Math.min(groups.length - 1, cur + 1); render(); };
+  render();
+
+  // ── Section 4: shard grid ──────────────────────────────────────────────
+  const N = 128;
+  // deterministic pseudo-hashes (xorshift), fixed seed so the page is stable
+  let x = 0x9e3779b9 >>> 0;
+  const hashes = Array.from({length: N}, () => { x ^= x << 13; x >>>= 0; x ^= x >>> 17; x ^= x << 5; x >>>= 0; return x; });
+  const color = (i, M) => M === 1 ? 'var(--unsplit)' : `var(--s${(i % 16) + 1})`;
+  const grid = document.getElementById('grid'), shardsEl = document.getElementById('shards');
+  const mInput = document.getElementById('m'), mLabel = document.getElementById('mLabel'), focusInfo = document.getElementById('focusInfo');
+  let focus = -1;
+  const cells = hashes.map((h, i) => {
+    const c = document.createElement('div'); c.className = 'cell'; c.title = `series ${i}`;
+    c.onclick = () => { focus = focus === i ? -1 : i; draw(); };
+    grid.appendChild(c); return c;
+  });
+  const draw = () => {
+    const M = 2 ** +mInput.value; mLabel.textContent = M;
+    const counts = Array(M).fill(0);
+    hashes.forEach((h, i) => {
+      const s = h % M; counts[s]++;
+      cells[i].style.background = color(s, M);
+      cells[i].textContent = M === 1 ? '' : s + 1;
+      cells[i].classList.toggle('focus', i === focus);
+    });
+    shardsEl.style.gridTemplateColumns = `repeat(${Math.min(M, 8)}, 1fr)`;
+    shardsEl.innerHTML = counts.map((n, s) => `<div class="shard"><b>${M === 1 ? 'unsplit' : `${s + 1}_of_${M}`}</b><div class="muted" style="font-size:12px">${n} series</div><div class="bar" style="background:${color(s, M)};width:${(n / N) * 100 * (M / 2)}%;max-width:100%"></div></div>`).join('');
+    if (focus >= 0) {
+      const h = hashes[focus];
+      const chain = [1, 2, 4, 8, 16].map(m => `${(h % m) + 1}_of_${m}`).join(' → ');
+      focusInfo.innerHTML = `series ${focus}: <code>${chain}</code>`;
+    } else focusInfo.textContent = 'click a series to follow it across M';
+  };
+  mInput.oninput = draw; draw();
+
+  // ── Section 7: stream over time ────────────────────────────────────────
+  const svgNS = 'http://www.w3.org/2000/svg';
+  const rect = (parent, x, y, w, h, fill, stroke) => {
+    const r = document.createElementNS(svgNS, 'rect');
+    r.setAttribute('x', x); r.setAttribute('y', y); r.setAttribute('width', w); r.setAttribute('height', h); r.setAttribute('rx', 3);
+    r.setAttribute('fill', fill); if (stroke) { r.setAttribute('stroke', stroke); r.setAttribute('stroke-width', 1); }
+    parent.appendChild(r);
+  };
+  const l1 = document.getElementById('lvl1'), l2 = document.getElementById('lvl2'), l3 = document.getElementById('lvl3');
+  const x0 = 60, W = 820, day14 = W / 2; // two 14d ranges
+  // 2h blocks: 24 per 2d, 7 × 2d per 14d → draw 14 × 2d per 14d range as 2h groups (thin bars)
+  for (let r = 0; r < 2; r++) for (let d = 0; d < 7; d++) for (let h = 0; h < 24; h++) {
+    const w = day14 / 7 / 24; rect(l1, x0 + r * day14 + d * (day14 / 7) + h * w, 26, w - 0.6, 18, 'var(--unsplit)');
+  }
+  for (let r = 0; r < 2; r++) for (let d = 0; d < 7; d++) rect(l2, x0 + r * day14 + d * (day14 / 7) + 1, 86, day14 / 7 - 2, 18, 'var(--unsplit)');
+  // first 14d range: split into 4 shards; second: split too, never into fewer shards than the stream has, joining the same groups
+  const sc = ['var(--s1)','var(--s2)','var(--s3)','var(--s4)'];
+  for (let r = 0; r < 2; r++) for (let s = 0; s < 4; s++) rect(l3, x0 + r * day14 + 1, 136 + s * 20, day14 - 2, 16, sc[s]);
+  // arrows text
+  const t = (x, y, s, cls) => { const e = document.createElementNS(svgNS, 'text'); e.setAttribute('x', x); e.setAttribute('y', y); e.setAttribute('class', cls || 'muted'); e.textContent = s; l3.appendChild(e); };
+  t(x0, 225, 'plan of 7 × 2d exceeds the limit → M = 4; shards join groups 1_of_4 .. 4_of_4');
+  t(x0 + day14 + 6, 130, 'next 14d range: split again, never into fewer shards than the stream has', 'muted');
+})();
+</script>
+</main>
+</body>
+</html>

@@ -26,6 +26,13 @@ type tsdbBasedPlanner struct {
 	ranges []int64
 
 	noCompBlocksFunc func() map[ulid.ULID]*metadata.NoCompactMark
+
+	// streamHasNewer, if set, reports whether the group's block stream has a
+	// block newer than the group's newest block, in another group of the same
+	// stream. The newest block of a group is normally left out of planning to
+	// give a just uploaded block its siblings; a group that is not the one
+	// receiving the stream's fresh blocks needs no such window.
+	streamHasNewer func(metasByMinTime []*metadata.Meta) bool
 }
 
 var _ Planner = &tsdbBasedPlanner{}
@@ -47,6 +54,19 @@ func NewTSDBBasedPlanner(logger log.Logger, ranges []int64) *tsdbBasedPlanner {
 // It's the same functionality just without accessing filesystem, and special handling of excluded blocks.
 func NewPlanner(logger log.Logger, ranges []int64, noCompBlocks *GatherNoCompactionMarkFilter) *tsdbBasedPlanner {
 	return &tsdbBasedPlanner{logger: logger, ranges: ranges, noCompBlocksFunc: noCompBlocks.NoCompactMarkedBlocks}
+}
+
+// WithStreamNewestAcrossShards makes the planner judge "the newest block" per
+// block stream rather than per group: a group's newest block is planned like
+// any other when the stream has a newer block in another of its groups. With
+// block splitting a stream's fresh blocks arrive in its unsplit group, and
+// without this its shard groups would never compact or downsample their last
+// range. metas is the compactor's synced view of the bucket.
+func (p *tsdbBasedPlanner) WithStreamNewestAcrossShards(metas func() map[ulid.ULID]*metadata.Meta) *tsdbBasedPlanner {
+	p.streamHasNewer = func(metasByMinTime []*metadata.Meta) bool {
+		return StreamHasNewerBlock(metasByMinTime, metas())
+	}
+	return p
 }
 
 // TODO(bwplotka): Consider smarter algorithm, this prefers smaller iterative compactions vs big single one: https://github.com/thanos-io/thanos/issues/3405
@@ -71,10 +91,14 @@ func (p *tsdbBasedPlanner) plan(noCompactMarked map[ulid.ULID]*metadata.NoCompac
 
 	// We do not include a recently produced block with max(minTime), so the block which was just uploaded to bucket.
 	// This gives users a window of a full block size maintenance if needed.
-	if _, excluded := noCompactMarked[metasByMinTime[len(metasByMinTime)-1].ULID]; !excluded {
-		notExcludedMetasByMinTime = notExcludedMetasByMinTime[:len(notExcludedMetasByMinTime)-1]
+	// A group whose stream has a newer block elsewhere - a shard group, while
+	// fresh blocks arrive unsplit - is not the one that window is for.
+	if p.streamHasNewer == nil || !p.streamHasNewer(metasByMinTime) {
+		if _, excluded := noCompactMarked[metasByMinTime[len(metasByMinTime)-1].ULID]; !excluded {
+			notExcludedMetasByMinTime = notExcludedMetasByMinTime[:len(notExcludedMetasByMinTime)-1]
+		}
+		metasByMinTime = metasByMinTime[:len(metasByMinTime)-1]
 	}
-	metasByMinTime = metasByMinTime[:len(metasByMinTime)-1]
 	res = append(res, selectMetas(p.ranges, noCompactMarked, metasByMinTime)...)
 	if len(res) > 0 {
 		return res, nil
