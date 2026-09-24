@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"slices"
 
 	"github.com/cespare/xxhash/v2"
@@ -117,12 +118,7 @@ func (p PartitionedBlockPopulator) PopulateBlock(ctx context.Context, metrics *t
 		sets = append(sets, tsdb.NewBlockChunkSeriesSet(b.Meta().ULID, indexr, chunkr, tombsr, index.NewListPostings(refs), meta.MinTime, meta.MaxTime-1, false))
 	}
 
-	sorted := make([]string, 0, len(symbols))
-	for s := range symbols {
-		sorted = append(sorted, s)
-	}
-	slices.Sort(sorted)
-	for _, s := range sorted {
+	for _, s := range slices.Sorted(maps.Keys(symbols)) {
 		if err := indexw.AddSymbol(s); err != nil {
 			return fmt.Errorf("add symbol: %w", err)
 		}

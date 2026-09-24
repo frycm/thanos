@@ -4,6 +4,7 @@
 package compacttest
 
 import (
+	"cmp"
 	"context"
 	"math"
 	"os"
@@ -55,9 +56,7 @@ func (c NodeConfig) WithDefaults() NodeConfig {
 	if len(c.Levels) == 0 {
 		c.Levels = Levels
 	}
-	if c.Concurrency == 0 {
-		c.Concurrency = 2
-	}
+	c.Concurrency = cmp.Or(c.Concurrency, 2)
 	return c
 }
 
@@ -137,7 +136,7 @@ func NewNode(t *testing.T, shared objstore.Bucket, conf NodeConfig, hooks Hooks)
 		Reg:    prometheus.NewRegistry(),
 	}
 	insBkt := objstore.WithNoopInstr(n.Bkt)
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	n.Ctx, n.stop = ctx, cancel
 	t.Cleanup(cancel)
 

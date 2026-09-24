@@ -4,7 +4,7 @@
 package block
 
 import (
-	"context"
+	"maps"
 	"slices"
 	"testing"
 
@@ -21,7 +21,7 @@ import (
 // unpublished leftover of an earlier attempt is superseded by the published
 // result of a later one, and a caller can declare further blocks unpublished.
 func TestDeduplicateFilterRequiresPublication(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	lbls := map[string]string{"tenant": "a"}
 	meta := func(id ulid.ULID, sources ...ulid.ULID) *metadata.Meta {
 		if len(sources) == 0 {
@@ -48,12 +48,7 @@ func TestDeduplicateFilterRequiresPublication(t *testing.T) {
 			f.SetPublishedFunc(published)
 		}
 		testutil.Ok(t, f.Filter(ctx, metas, newTestFetcherMetrics().Synced, nil))
-		ids := make([]ulid.ULID, 0, len(metas))
-		for id := range metas {
-			ids = append(ids, id)
-		}
-		slices.SortFunc(ids, func(a, b ulid.ULID) int { return a.Compare(b) })
-		return ids
+		return slices.SortedFunc(maps.Keys(metas), func(a, b ulid.ULID) int { return a.Compare(b) })
 	}
 
 	set := []ulid.ULID{ULID(10), ULID(11)}
@@ -120,7 +115,7 @@ func TestDeduplicateFilterRequiresPublication(t *testing.T) {
 // collection retires it, and a block the caller declares unpublished is
 // withheld too.
 func TestDeduplicateFilterHidesUnpublished(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	lbls := map[string]string{"tenant": "a"}
 	meta := func(id ulid.ULID, sources ...ulid.ULID) *metadata.Meta {
 		if len(sources) == 0 {
@@ -148,10 +143,7 @@ func TestDeduplicateFilterHidesUnpublished(t *testing.T) {
 			f.SetPublishedFunc(published)
 		}
 		testutil.Ok(t, f.Filter(ctx, metas, newTestFetcherMetrics().Synced, nil))
-		view = make([]ulid.ULID, 0, len(metas))
-		for id := range metas {
-			view = append(view, id)
-		}
+		view = slices.AppendSeq(make([]ulid.ULID, 0, len(metas)), maps.Keys(metas))
 		sorted := func(ids []ulid.ULID) []ulid.ULID {
 			slices.SortFunc(ids, func(a, b ulid.ULID) int { return a.Compare(b) })
 			return ids

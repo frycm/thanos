@@ -9,11 +9,11 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -81,7 +81,7 @@ func NewBucketDump() *BucketDump {
 // DumpBucket reads every served block of the bucket.
 func DumpBucket(t *testing.T, bkt objstore.Bucket) *BucketDump {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
 	logger := log.NewNopLogger()
 	insBkt := objstore.WithNoopInstr(bkt)
@@ -238,11 +238,7 @@ func SameContent(t *testing.T, want, got *BucketDump, what string) bool {
 	for k := range got.Series {
 		keys[k] = struct{}{}
 	}
-	sorted := make([]string, 0, len(keys))
-	for k := range keys {
-		sorted = append(sorted, k)
-	}
-	sort.Strings(sorted)
+	sorted := slices.Sorted(maps.Keys(keys))
 
 	var diffs []string
 	for _, k := range sorted {
@@ -314,7 +310,8 @@ func (d *BucketDump) Without(ext func(string) bool) *BucketDump {
 		}
 	}
 	for k, v := range d.Series {
-		e := strings.SplitN(strings.TrimPrefix(k[strings.Index(k, " ext="):], " ext="), " series=", 2)[0]
+		_, rest, _ := strings.Cut(k, " ext=")
+		e, _, _ := strings.Cut(rest, " series=")
 		if !ext(e) {
 			out.Series[k] = v
 		}
@@ -346,7 +343,7 @@ func (d *BucketDump) AssertNoOverlaps(t *testing.T) {
 // AssertNoDeletionMarks fails if any block in the bucket is marked for deletion.
 func AssertNoDeletionMarks(t *testing.T, bkt objstore.Bucket) {
 	t.Helper()
-	testutil.Ok(t, bkt.Iter(context.Background(), "", func(name string) error {
+	testutil.Ok(t, bkt.Iter(t.Context(), "", func(name string) error {
 		if strings.HasSuffix(name, metadata.DeletionMarkFilename) {
 			t.Errorf("unexpected deletion mark %s", name)
 		}
@@ -358,7 +355,7 @@ func AssertNoDeletionMarks(t *testing.T, bkt objstore.Bucket) {
 func BlockIDs(t *testing.T, bkt objstore.Bucket) []ulid.ULID {
 	t.Helper()
 	var ids []ulid.ULID
-	testutil.Ok(t, bkt.Iter(context.Background(), "", func(name string) error {
+	testutil.Ok(t, bkt.Iter(t.Context(), "", func(name string) error {
 		if !strings.HasSuffix(name, "/"+block.MetaFilename) {
 			return nil
 		}
@@ -375,7 +372,7 @@ func BlockIDs(t *testing.T, bkt objstore.Bucket) []ulid.ULID {
 // Exists reports whether the object exists.
 func Exists(t *testing.T, bkt objstore.Bucket, name string) bool {
 	t.Helper()
-	ok, err := bkt.Exists(context.Background(), name)
+	ok, err := bkt.Exists(t.Context(), name)
 	testutil.Ok(t, err)
 	return ok
 }
@@ -386,11 +383,11 @@ func SourceObjects(t *testing.T, bkt objstore.Bucket, ids []ulid.ULID) map[strin
 	t.Helper()
 	objects := map[string][]byte{}
 	for _, id := range ids {
-		testutil.Ok(t, bkt.Iter(context.Background(), id.String()+"/", func(name string) error {
+		testutil.Ok(t, bkt.Iter(t.Context(), id.String()+"/", func(name string) error {
 			if strings.HasSuffix(name, metadata.DeletionMarkFilename) {
 				return nil
 			}
-			r, err := bkt.Get(context.Background(), name)
+			r, err := bkt.Get(t.Context(), name)
 			testutil.Ok(t, err)
 			defer r.Close()
 			objects[name], err = io.ReadAll(r)
