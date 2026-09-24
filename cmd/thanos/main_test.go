@@ -15,6 +15,7 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/oklog/ulid/v2"
+	"github.com/pkg/errors"
 
 	"github.com/prometheus/client_golang/prometheus"
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
@@ -225,4 +226,18 @@ func TestCleanupDownsampleCacheFolder(t *testing.T) {
 
 	_, err = os.Stat(dir)
 	testutil.Assert(t, os.IsNotExist(err), "index cache dir should not exist at the end of execution")
+}
+
+// TestBestEffortMetaFilterSwallowsErrors pins down that the optional
+// no-compact gatherer cannot take the downsample component down: a transient
+// marker-read failure is logged and skipped, never propagated into the fetch.
+func TestBestEffortMetaFilterSwallowsErrors(t *testing.T) {
+	f := bestEffortMetaFilter{logger: log.NewNopLogger(), inner: failingMetaFilter{}}
+	testutil.Ok(t, f.Filter(t.Context(), nil, nil, nil))
+}
+
+type failingMetaFilter struct{}
+
+func (failingMetaFilter) Filter(context.Context, map[ulid.ULID]*metadata.Meta, block.GaugeVec, block.GaugeVec) error {
+	return errors.New("injected: marker read failed")
 }

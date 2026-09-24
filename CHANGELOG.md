@@ -19,6 +19,7 @@ It is recommend to upgrade the storage components first (Receive, Store, etc.) a
 ### Added
 
 - [#4](https://github.com/frycm/thanos/issues/4) Compact: blocks record the set of blocks their compaction produced (`thanos.output` in `meta.json`) and replace their sources only once the whole set is uploaded; blocks of an incomplete set are withheld from compaction and downsampling and counted as `state="unpublished"` in `thanos_blocks_meta_synced`.
+- [#6](https://github.com/frycm/thanos/issues/6) Compact: add experimental `--downsampling.enable-stuck-blocks` (also on `tools bucket downsample`) to downsample blocks that index-size no-compact marks keep below the minimum downsampling span; `tools bucket downsample` gains `--deduplication.replica-label` and honours no-downsample marks.
 
 ### Changed
 

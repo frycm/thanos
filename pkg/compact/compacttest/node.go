@@ -44,6 +44,8 @@ type NodeConfig struct {
 	Levels               []int64
 	Concurrency          int
 	AcceptMalformedIndex bool
+	// EnableStuckBlockDownsampling is --downsampling.enable-stuck-blocks.
+	EnableStuckBlockDownsampling bool
 }
 
 // WithDefaults fills the zero values.
@@ -245,10 +247,13 @@ func (n *Node) Stop() { n.stop() }
 func (n *Node) Stopped() bool { return n.Ctx.Err() != nil }
 
 // DownsamplePlanOptions is what the binary tells downsample.Plan about the
-// node's synced view at each downsampling pass.
+// node's synced view at each downsampling pass: the marks go along, so the
+// plan can waive the span rule for blocks the compactor is done with.
 func (n *Node) DownsamplePlanOptions() downsample.PlanOptions {
 	return downsample.PlanOptions{
 		NoDownsampleMarked: n.NoDownsampleFilter.NoDownsampleMarkedBlocks(),
+		NoCompactMarked:    n.NoCompactFilter.NoCompactMarkedBlocks(),
+		EnableStuckBlocks:  n.Conf.EnableStuckBlockDownsampling,
 	}
 }
 
