@@ -168,13 +168,10 @@ func (b *HookBucket) Outage() (lift func()) {
 	fail := func(context.Context, string) error { return errors.Wrap(ErrInjected, "object store down") }
 	b.SetOnGet(fail)
 	b.SetOnUpload(fail)
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			b.SetOnGet(nil)
-			b.SetOnUpload(nil)
-		})
-	}
+	return sync.OnceFunc(func() {
+		b.SetOnGet(nil)
+		b.SetOnUpload(nil)
+	})
 }
 
 // PublicationFault fails the first write of a block file of the given kind -

@@ -4,7 +4,6 @@
 package compact
 
 import (
-	"context"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -34,7 +33,7 @@ import (
 // result block records the whole set it belongs to, so that readers can tell
 // a complete replacement of the sources from a partial one.
 func TestLocalPlanExecutorPublishesOutputsAsSet(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	bkt := objstore.NewInMemBucket()
 	logger := log.NewNopLogger()
 	dir := t.TempDir()
@@ -106,7 +105,7 @@ func TestLocalPlanExecutorPublishesOutputsAsSet(t *testing.T) {
 // another hash would look - is refused before anything is uploaded, since
 // its outputs would replace the sources and lose the rest.
 func TestLocalPlanExecutorRefusesPartitionsThatLoseSeries(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	bkt := objstore.NewInMemBucket()
 	logger := log.NewNopLogger()
 	dir := t.TempDir()
@@ -163,7 +162,7 @@ func TestLocalPlanExecutorRefusesPartitionsThatLoseSeries(t *testing.T) {
 // - blocks outside the plan its outputs complete a set with - records them in
 // every output's set, also when the plan has the one default output.
 func TestLocalPlanExecutorPublishesSiblingsInTheSet(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	bkt := objstore.NewInMemBucket()
 	logger := log.NewNopLogger()
 	dir := t.TempDir()
