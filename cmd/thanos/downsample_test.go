@@ -72,11 +72,11 @@ func TestRunDownsamplingStuckBlocksOptIn(t *testing.T) {
 	}
 	metrics := newDownsampleMetrics(prometheus.NewRegistry())
 	conf := compactConfig{downsampleConcurrency: 1, blockFilesConcurrency: 1}
-	testutil.Ok(t, downsampleBucket(ctx, logger, metrics, bkt, metas, marks, nil, conf.enableStuckBlockDownsampling, t.TempDir(), conf.downsampleConcurrency, conf.blockFilesConcurrency, metadata.HashFunc(conf.hashFunc), conf.acceptMalformedIndex))
+	testutil.Ok(t, downsampleBucket(ctx, logger, metrics, bkt, metas, downsample.PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: conf.enableStuckBlockDownsampling}, t.TempDir(), conf.downsampleConcurrency, conf.blockFilesConcurrency, metadata.HashFunc(conf.hashFunc), conf.acceptMalformedIndex))
 	testutil.Equals(t, 0.0, promtest.ToFloat64(metrics.downsamples.WithLabelValues(meta.Thanos.ResolutionString())))
 
 	conf.enableStuckBlockDownsampling = true
-	testutil.Ok(t, downsampleBucket(ctx, logger, metrics, bkt, metas, marks, nil, conf.enableStuckBlockDownsampling, t.TempDir(), conf.downsampleConcurrency, conf.blockFilesConcurrency, metadata.HashFunc(conf.hashFunc), conf.acceptMalformedIndex))
+	testutil.Ok(t, downsampleBucket(ctx, logger, metrics, bkt, metas, downsample.PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: conf.enableStuckBlockDownsampling}, t.TempDir(), conf.downsampleConcurrency, conf.blockFilesConcurrency, metadata.HashFunc(conf.hashFunc), conf.acceptMalformedIndex))
 	testutil.Equals(t, 1.0, promtest.ToFloat64(metrics.downsamples.WithLabelValues(meta.Thanos.ResolutionString())))
 	var outputs int
 	testutil.Ok(t, bkt.Iter(ctx, "", func(name string) error {

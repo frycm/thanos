@@ -180,7 +180,7 @@ func RunDownsample(
 					metrics.downsamples.WithLabelValues(resolutionLabel)
 					metrics.downsampleFailures.WithLabelValues(resolutionLabel)
 				}
-				if err := downsampleBucket(ctx, logger, metrics, insBkt, metas, noCompactMarkerFilter.NoCompactMarkedBlocks(), noDownsampleMarkerFilter.NoDownsampleMarkedBlocks(), enableStuckBlocks, dataDir, downsampleConcurrency, blockFilesConcurrency, hashFunc, false); err != nil {
+				if err := downsampleBucket(ctx, logger, metrics, insBkt, metas, downsample.PlanOptions{NoDownsampleMarked: noDownsampleMarkerFilter.NoDownsampleMarkedBlocks(), NoCompactMarked: noCompactMarkerFilter.NoCompactMarkedBlocks(), EnableStuckBlocks: enableStuckBlocks}, dataDir, downsampleConcurrency, blockFilesConcurrency, hashFunc, false); err != nil {
 					return errors.Wrap(err, "downsampling failed")
 				}
 
@@ -189,7 +189,7 @@ func RunDownsample(
 				if err != nil {
 					return errors.Wrap(err, "sync before second pass of downsampling")
 				}
-				if err := downsampleBucket(ctx, logger, metrics, insBkt, metas, noCompactMarkerFilter.NoCompactMarkedBlocks(), noDownsampleMarkerFilter.NoDownsampleMarkedBlocks(), enableStuckBlocks, dataDir, downsampleConcurrency, blockFilesConcurrency, hashFunc, false); err != nil {
+				if err := downsampleBucket(ctx, logger, metrics, insBkt, metas, downsample.PlanOptions{NoDownsampleMarked: noDownsampleMarkerFilter.NoDownsampleMarkedBlocks(), NoCompactMarked: noCompactMarkerFilter.NoCompactMarkedBlocks(), EnableStuckBlocks: enableStuckBlocks}, dataDir, downsampleConcurrency, blockFilesConcurrency, hashFunc, false); err != nil {
 					return errors.Wrap(err, "downsampling failed")
 				}
 				return nil
@@ -226,9 +226,7 @@ func downsampleBucket(
 	metrics *DownsampleMetrics,
 	bkt objstore.Bucket,
 	metas map[ulid.ULID]*metadata.Meta,
-	noCompactMarked map[ulid.ULID]*metadata.NoCompactMark,
-	noDownsampleMarked map[ulid.ULID]*metadata.NoDownsampleMark,
-	enableStuckBlocks bool,
+	opts downsample.PlanOptions,
 	dir string,
 	downsampleConcurrency int,
 	blockFilesConcurrency int,
@@ -250,7 +248,7 @@ func downsampleBucket(
 		}
 	}()
 
-	candidates, err := downsample.Plan(metas, noCompactMarked, noDownsampleMarked, enableStuckBlocks)
+	candidates, err := downsample.Plan(metas, opts)
 	if err != nil {
 		return err
 	}

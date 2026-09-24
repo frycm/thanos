@@ -21,6 +21,24 @@ type Candidate struct {
 	TargetResolution int64
 }
 
+// PlanOptions is what Plan is told beyond the blocks themselves. The zero value
+// plans as if no block were marked.
+type PlanOptions struct {
+	// NoDownsampleMarked are the blocks an operator marked not to be
+	// downsampled. They are never candidates, and their downsampled blocks do
+	// not count as coverage, as if they were out of view, unless
+	// EnableStuckBlocks is set: then they still fence and cover. They stay in
+	// the metas Plan is given, so that planning sees every block the compactor
+	// does.
+	NoDownsampleMarked map[ulid.ULID]*metadata.NoDownsampleMark
+	// NoCompactMarked are the blocks marked not to be compacted. Only their
+	// index-size marks matter, and only with EnableStuckBlocks.
+	NoCompactMarked map[ulid.ULID]*metadata.NoCompactMark
+	// EnableStuckBlocks is --downsampling.enable-stuck-blocks: waive the
+	// minimum-span rule for blocks index-size marks prove can no longer grow.
+	EnableStuckBlocks bool
+}
+
 // Plan returns the blocks that need downsampling, in a deterministic order.
 //
 // A block is a candidate when no downsampled block covering all of its sources
@@ -31,16 +49,16 @@ type Candidate struct {
 //
 // The minimum-span rule exists only because a still-growing block is worth
 // waiting for. A block the compactor can provably never touch again would
-// otherwise never be downsampled at all. When enableStuckBlocks is true, the
-// rule is waived for those blocks (see stuckBelowRange). Both marker maps may
-// be nil when the caller has no marker information; then only the span rule
-// applies and no block is excluded.
+// otherwise never be downsampled at all. When opts.EnableStuckBlocks is true,
+// the rule is waived for those blocks (see stuckBelowRange). Both marker maps
+// may be nil when the caller has no marker information; then only the span
+// rule applies and no block is excluded.
 //
 // Blocks marked no-downsample are excluded here, not by the callers: excluding
 // them earlier (by deleting them from metas) would also delete the fences and
 // coverage needed by the waiver. With the feature disabled, marked blocks do
 // not contribute coverage, preserving the compactor's previous filtered view.
-func Plan(metas map[ulid.ULID]*metadata.Meta, noCompactMarked map[ulid.ULID]*metadata.NoCompactMark, noDownsampleMarked map[ulid.ULID]*metadata.NoDownsampleMark, enableStuckBlocks bool) ([]Candidate, error) {
+func Plan(metas map[ulid.ULID]*metadata.Meta, opts PlanOptions) ([]Candidate, error) {
 	// Blocks whose sources are already covered by a downsampled block do not need
 	// downsampling again. Coverage is per block stream: a downsampled block
 	// covers a source only for blocks with exactly its external labels. Blocks
@@ -51,8 +69,8 @@ func Plan(metas map[ulid.ULID]*metadata.Meta, noCompactMarked map[ulid.ULID]*met
 	sources1h := coverage{}
 
 	for _, m := range metas {
-		if !enableStuckBlocks {
-			if _, marked := noDownsampleMarked[m.ULID]; marked {
+		if !opts.EnableStuckBlocks {
+			if _, marked := opts.NoDownsampleMarked[m.ULID]; marked {
 				continue
 			}
 		}
@@ -82,12 +100,12 @@ func Plan(metas map[ulid.ULID]*metadata.Meta, noCompactMarked map[ulid.ULID]*met
 	// is silently starved by that.
 	byGroup := map[string][]*metadata.Meta{}
 	indexSizeMarked := func(id ulid.ULID) bool {
-		mark, ok := noCompactMarked[id]
+		mark, ok := opts.NoCompactMarked[id]
 		return ok && mark.Reason == metadata.IndexSizeExceedingNoCompactReason
 	}
 	haveIndexSizeMarks := false
-	if enableStuckBlocks {
-		for id := range noCompactMarked {
+	if opts.EnableStuckBlocks {
+		for id := range opts.NoCompactMarked {
 			if indexSizeMarked(id) {
 				haveIndexSizeMarks = true
 				break
@@ -107,14 +125,14 @@ func Plan(metas map[ulid.ULID]*metadata.Meta, noCompactMarked map[ulid.ULID]*met
 
 		// The operator said not to. The block still fences and still counts as
 		// coverage above; only its candidacy is off the table.
-		if _, ok := noDownsampleMarked[id]; ok {
+		if _, ok := opts.NoDownsampleMarked[id]; ok {
 			continue
 		}
 
 		// Only an index-size mark establishes that a block cannot grow safely.
 		// Other marks (for example out-of-order chunks) must not acquire the
 		// short-block waiver merely because index-size fences surround them.
-		_, marked := noCompactMarked[id]
+		_, marked := opts.NoCompactMarked[id]
 		waiverAllowed := !marked || indexSizeMarked(id)
 
 		switch m.Thanos.Downsample.Resolution {

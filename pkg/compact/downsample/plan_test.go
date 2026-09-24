@@ -32,7 +32,7 @@ func TestPlanPicksBlocksThatNeedDownsampling(t *testing.T) {
 		raw: planMeta(raw, ResLevel0, 0, ResLevel1DownsampleRange),
 	}
 
-	got, err := Plan(metas, nil, nil, false)
+	got, err := Plan(metas, PlanOptions{})
 	testutil.Ok(t, err)
 	testutil.Equals(t, 1, len(got))
 	testutil.Equals(t, raw, got[0].Meta.ULID)
@@ -46,9 +46,35 @@ func TestPlanSkipsBlocksThatAreTooShort(t *testing.T) {
 		raw: planMeta(raw, ResLevel0, 0, ResLevel1DownsampleRange-1),
 	}
 
-	got, err := Plan(metas, nil, nil, false)
+	got, err := Plan(metas, PlanOptions{})
 	testutil.Ok(t, err)
 	testutil.Equals(t, 0, len(got))
+}
+
+// TestPlanLeavesNoDownsampleMarkedBlocksOut: a marked block is never a
+// candidate, and a marked downsampled block covers nothing, as if neither
+// were in view.
+func TestPlanLeavesNoDownsampleMarkedBlocksOut(t *testing.T) {
+	raw, marked, markedDown := ulid.MustNew(1, nil), ulid.MustNew(2, nil), ulid.MustNew(3, nil)
+	metas := map[ulid.ULID]*metadata.Meta{
+		raw:        planMeta(raw, ResLevel0, 0, ResLevel1DownsampleRange),
+		marked:     planMeta(marked, ResLevel0, 0, ResLevel1DownsampleRange),
+		markedDown: planMeta(markedDown, ResLevel1, 0, ResLevel1DownsampleRange, raw),
+	}
+
+	got, err := Plan(metas, PlanOptions{})
+	testutil.Ok(t, err)
+	testutil.Equals(t, 1, len(got), "unmarked, the 5m block covers raw and only the other raw block is left")
+	testutil.Equals(t, marked, got[0].Meta.ULID)
+
+	got, err = Plan(metas, PlanOptions{NoDownsampleMarked: map[ulid.ULID]*metadata.NoDownsampleMark{
+		marked:     {ID: marked},
+		markedDown: {ID: markedDown},
+	}})
+	testutil.Ok(t, err)
+	testutil.Equals(t, 1, len(got), "the marked block is no candidate, and the marked 5m block no coverage")
+	testutil.Equals(t, raw, got[0].Meta.ULID)
+	testutil.Equals(t, ResLevel1, got[0].TargetResolution)
 }
 
 func TestPlanSkipsBlocksAlreadyCovered(t *testing.T) {
@@ -61,7 +87,7 @@ func TestPlanSkipsBlocksAlreadyCovered(t *testing.T) {
 		already: planMeta(already, ResLevel1, 0, ResLevel1DownsampleRange, raw),
 	}
 
-	got, err := Plan(metas, nil, nil, false)
+	got, err := Plan(metas, PlanOptions{})
 	testutil.Ok(t, err)
 	testutil.Equals(t, 0, len(got))
 }
@@ -72,7 +98,7 @@ func TestPlanAdvancesFiveMinuteBlocksToOneHour(t *testing.T) {
 		fiveMin: planMeta(fiveMin, ResLevel1, 0, ResLevel2DownsampleRange),
 	}
 
-	got, err := Plan(metas, nil, nil, false)
+	got, err := Plan(metas, PlanOptions{})
 	testutil.Ok(t, err)
 	testutil.Equals(t, 1, len(got))
 	testutil.Equals(t, ResLevel2, got[0].TargetResolution)
@@ -84,7 +110,7 @@ func TestPlanIgnoresFullyDownsampledBlocks(t *testing.T) {
 		oneHour: planMeta(oneHour, ResLevel2, 0, ResLevel2DownsampleRange),
 	}
 
-	got, err := Plan(metas, nil, nil, false)
+	got, err := Plan(metas, PlanOptions{})
 	testutil.Ok(t, err)
 	testutil.Equals(t, 0, len(got))
 }
@@ -95,7 +121,7 @@ func TestPlanRejectsUnknownResolution(t *testing.T) {
 		odd: planMeta(odd, 1234, 0, 100),
 	}
 
-	_, err := Plan(metas, nil, nil, false)
+	_, err := Plan(metas, PlanOptions{})
 	testutil.NotOk(t, err)
 }
 
@@ -120,7 +146,7 @@ func TestPlanStuckBlocksRequireOptIn(t *testing.T) {
 			// Both index-size marked and fenced short blocks must wait with
 			// the feature off. Normal downsampling remains enabled.
 			for _, enabled := range []bool{false, true, false} {
-				got, err := Plan(metas, marks, nil, enabled)
+				got, err := Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: enabled})
 				testutil.Ok(t, err)
 				want := []ulid.ULID{normal}
 				if enabled {
@@ -150,19 +176,19 @@ func TestPlanDisabledPreservesNoDownsampleFilteredCoverage(t *testing.T) {
 			}
 			marks := map[ulid.ULID]*metadata.NoDownsampleMark{coarse: {ID: coarse}}
 			// The previous compactor removed marked blocks before planning.
-			got, err := Plan(metas, nil, marks, false)
+			got, err := Plan(metas, PlanOptions{NoDownsampleMarked: marks})
 			testutil.Ok(t, err)
 			testutil.Equals(t, 1, len(got))
 			testutil.Equals(t, source, got[0].Meta.ULID)
 			// The opt-in planner retains marked blocks as coverage.
-			got, err = Plan(metas, nil, marks, true)
+			got, err = Plan(metas, PlanOptions{NoDownsampleMarked: marks, EnableStuckBlocks: true})
 			testutil.Ok(t, err)
 			testutil.Equals(t, 0, len(got))
 			testutil.Equals(t, 2, len(metas), "planning must not remove metadata from the caller's view")
 			// A no-downsample mark still excludes the source with either policy.
 			marks[source] = &metadata.NoDownsampleMark{ID: source}
 			for _, enabled := range []bool{false, true} {
-				got, err = Plan(metas, nil, marks, enabled)
+				got, err = Plan(metas, PlanOptions{NoDownsampleMarked: marks, EnableStuckBlocks: enabled})
 				testutil.Ok(t, err)
 				testutil.Equals(t, 0, len(got))
 			}
@@ -180,7 +206,7 @@ func TestPlanDownsamplesShortBlockMarkedForIndexSize(t *testing.T) {
 		raw: noCompactMark(raw, metadata.IndexSizeExceedingNoCompactReason),
 	}
 
-	got, err := Plan(metas, marks, nil, true)
+	got, err := Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
 	testutil.Ok(t, err)
 	testutil.Equals(t, 1, len(got))
 	testutil.Equals(t, raw, got[0].Meta.ULID)
@@ -196,7 +222,7 @@ func TestPlanLeavesShortBlocksMarkedForOtherReasonsAlone(t *testing.T) {
 		raw: noCompactMark(raw, metadata.OutOfOrderChunksNoCompactReason),
 	}
 
-	got, err := Plan(metas, marks, nil, true)
+	got, err := Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
 	testutil.Ok(t, err)
 	testutil.Equals(t, 0, len(got))
 }
@@ -217,7 +243,7 @@ func TestPlanDownsamplesShortBlockFencedInByMarkedBlocks(t *testing.T) {
 		right: noCompactMark(right, metadata.IndexSizeExceedingNoCompactReason),
 	}
 
-	got, err := Plan(metas, marks, nil, true)
+	got, err := Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
 	testutil.Ok(t, err)
 	// left and right for being marked, mid for being fenced in.
 	testutil.Equals(t, 3, len(got))
@@ -237,7 +263,7 @@ func TestPlanWaitsWhenFencedWindowIsStillLargeEnough(t *testing.T) {
 		right: noCompactMark(right, metadata.IndexSizeExceedingNoCompactReason),
 	}
 
-	got, err := Plan(metas, marks, nil, true)
+	got, err := Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
 	testutil.Ok(t, err)
 	// The marked fences are candidates themselves, but mid can still grow to
 	// the full window between them, which reaches the downsample range, so it
@@ -259,7 +285,7 @@ func TestPlanWaitsWhenOnlyOneSideIsFenced(t *testing.T) {
 		left: noCompactMark(left, metadata.IndexSizeExceedingNoCompactReason),
 	}
 
-	got, err := Plan(metas, marks, nil, true)
+	got, err := Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
 	testutil.Ok(t, err)
 	// Only the marked block itself is a candidate; mid is open towards new data.
 	testutil.Equals(t, 1, len(got))
@@ -284,7 +310,7 @@ func TestPlanIgnoresMarkedBlocksFromOtherCompactionGroups(t *testing.T) {
 		right: noCompactMark(right, metadata.IndexSizeExceedingNoCompactReason),
 	}
 
-	got, err := Plan(metas, marks, nil, true)
+	got, err := Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
 	testutil.Ok(t, err)
 	// The marked blocks of the other stream are candidates in their own right,
 	// but they say nothing about how far mid can grow.
@@ -303,10 +329,10 @@ func TestPlanIsDeterministic(t *testing.T) {
 		metas[id] = planMeta(id, ResLevel0, 0, ResLevel1DownsampleRange)
 	}
 
-	first, err := Plan(metas, nil, nil, false)
+	first, err := Plan(metas, PlanOptions{})
 	testutil.Ok(t, err)
 	for range 5 {
-		got, err := Plan(metas, nil, nil, false)
+		got, err := Plan(metas, PlanOptions{})
 		testutil.Ok(t, err)
 		testutil.Equals(t, len(first), len(got))
 		for j := range first {
@@ -340,7 +366,7 @@ func TestPlanWaitsForFencedSiblingsToMergeFirst(t *testing.T) {
 		right: noCompactMark(right, metadata.IndexSizeExceedingNoCompactReason),
 	}
 
-	got, err := Plan(metas, marks, nil, true)
+	got, err := Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
 	testutil.Ok(t, err)
 	// Only the fences themselves: a and b can still merge with each other.
 	testutil.Equals(t, 2, len(got))
@@ -354,7 +380,7 @@ func TestPlanWaitsForFencedSiblingsToMergeFirst(t *testing.T) {
 	delete(metas, b)
 	metas[merged] = planMeta(merged, ResLevel0, 200, 400, a, b)
 
-	got, err = Plan(metas, marks, nil, true)
+	got, err = Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
 	testutil.Ok(t, err)
 	testutil.Equals(t, 3, len(got))
 }
@@ -381,7 +407,7 @@ func TestPlanWaitsWhileAnOverlappingSiblingCanStillGrow(t *testing.T) {
 		right: noCompactMark(right, metadata.IndexSizeExceedingNoCompactReason),
 	}
 
-	got, err := Plan(metas, marks, nil, true)
+	got, err := Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
 	testutil.Ok(t, err)
 	for _, c := range got {
 		testutil.Assert(t, c.Meta.ULID != mid, "a fenced block with an overlapping compactable sibling must keep waiting")
@@ -389,7 +415,7 @@ func TestPlanWaitsWhileAnOverlappingSiblingCanStillGrow(t *testing.T) {
 
 	// The same guard protects a index-size marked block itself.
 	marks[mid] = noCompactMark(mid, metadata.IndexSizeExceedingNoCompactReason)
-	got, err = Plan(metas, marks, nil, true)
+	got, err = Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
 	testutil.Ok(t, err)
 	for _, c := range got {
 		testutil.Assert(t, c.Meta.ULID != mid, "a marked block with an overlapping compactable sibling must keep waiting")
@@ -414,7 +440,7 @@ func TestPlanFencesOnlyOnIndexSizeMarks(t *testing.T) {
 		right: noCompactMark(right, metadata.OutOfOrderChunksNoCompactReason),
 	}
 
-	got, err := Plan(metas, marks, nil, true)
+	got, err := Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
 	testutil.Ok(t, err)
 	testutil.Equals(t, 0, len(got))
 }
@@ -443,7 +469,7 @@ func TestPlanExcludesNoDownsampleMarkedBlocksButKeepsTheirFences(t *testing.T) {
 		right: {ID: right, Version: metadata.NoDownsampleMarkVersion1, Reason: metadata.ManualNoDownsampleReason},
 	}
 
-	got, err := Plan(metas, marks, noDownsample, true)
+	got, err := Plan(metas, PlanOptions{NoCompactMarked: marks, NoDownsampleMarked: noDownsample, EnableStuckBlocks: true})
 	testutil.Ok(t, err)
 	// The fences are excluded as candidates, but mid is still fenced by them.
 	testutil.Equals(t, 1, len(got))
@@ -471,7 +497,7 @@ func TestPlanClampsFenceWindowToCompactionAlignment(t *testing.T) {
 		right: noCompactMark(right, metadata.IndexSizeExceedingNoCompactReason),
 	}
 
-	got, err := Plan(metas, marks, nil, true)
+	got, err := Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
 	testutil.Ok(t, err)
 	found := false
 	for _, c := range got {
@@ -517,14 +543,14 @@ func TestPlanNeverWaivesOverlappingFinalBlocks(t *testing.T) {
 		right: noCompactMark(right, metadata.IndexSizeExceedingNoCompactReason),
 	}
 
-	got, err := Plan(metas, marks, nil, true)
+	got, err := Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
 	testutil.Ok(t, err)
 	testutil.Assert(t, !planned(got, a), "a marked block overlapped by a fenced sibling must stay raw")
 	testutil.Assert(t, !planned(got, b1), "a fenced block overlapping a marked sibling must stay raw")
 
 	// Both marked: still two final blocks over one range.
 	marks[b1] = noCompactMark(b1, metadata.IndexSizeExceedingNoCompactReason)
-	got, err = Plan(metas, marks, nil, true)
+	got, err = Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
 	testutil.Ok(t, err)
 	testutil.Assert(t, !planned(got, a) && !planned(got, b1), "overlapping marked blocks must both stay raw")
 }
@@ -554,20 +580,20 @@ func TestPlanWaitsBehindAnUnrelatedDownsampledBlock(t *testing.T) {
 		right: noCompactMark(right, metadata.IndexSizeExceedingNoCompactReason),
 	}
 
-	got, err := Plan(metas, marks, nil, true)
+	got, err := Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
 	testutil.Ok(t, err)
 	testutil.Assert(t, !planned(got, mid), "a fenced block must wait while an unrelated 5m block intersects it")
 
 	// The same for a marked block.
 	marks[mid] = noCompactMark(mid, metadata.IndexSizeExceedingNoCompactReason)
-	got, err = Plan(metas, marks, nil, true)
+	got, err = Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
 	testutil.Ok(t, err)
 	testutil.Assert(t, !planned(got, mid), "a marked block must wait while an unrelated 5m block intersects it")
 
 	// An earlier downsample of part of mid's own data is superseded by mid's.
 	metas[down] = planMeta(down, ResLevel1, 250, 300, gone)
 	metas[mid] = planMeta(mid, ResLevel0, 200, 300, mid, gone)
-	got, err = Plan(metas, marks, nil, true)
+	got, err = Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
 	testutil.Ok(t, err)
 	testutil.Assert(t, planned(got, mid), "a 5m block whose sources are all in the candidate must not hold it back")
 }
@@ -596,7 +622,7 @@ func TestPlanSeesSiblingsPastTheCompactionBoundary(t *testing.T) {
 		right: noCompactMark(right, metadata.IndexSizeExceedingNoCompactReason),
 	}
 
-	got, err := Plan(metas, marks, nil, true)
+	got, err := Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
 	testutil.Ok(t, err)
 	testutil.Assert(t, !planned(got, mid), "a block with a sibling overlapping its tail past the boundary must wait for the merge")
 
@@ -605,7 +631,7 @@ func TestPlanSeesSiblingsPastTheCompactionBoundary(t *testing.T) {
 	delete(metas, mid)
 	delete(metas, tail)
 	metas[merged] = planMeta(merged, ResLevel0, boundary-10*hour, boundary+4*hour, mid, tail)
-	got, err = Plan(metas, marks, nil, true)
+	got, err = Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
 	testutil.Ok(t, err)
 	testutil.Assert(t, planned(got, merged), "the merged block must be waived")
 }
@@ -634,7 +660,7 @@ func TestPlanWaitsForSiblingNestedInsideThePreviousFence(t *testing.T) {
 		right: noCompactMark(right, metadata.IndexSizeExceedingNoCompactReason),
 	}
 
-	got, err := Plan(metas, marks, nil, true)
+	got, err := Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
 	testutil.Ok(t, err)
 	testutil.Assert(t, !planned(got, mid), "mid still has a merge partner in its run and must keep waiting")
 	testutil.Assert(t, !planned(got, nested), "nested overlaps a fence and is never waived")
@@ -643,7 +669,7 @@ func TestPlanWaitsForSiblingNestedInsideThePreviousFence(t *testing.T) {
 
 	// Without the nested sibling, mid is the last block in its run.
 	delete(metas, nested)
-	got, err = Plan(metas, marks, nil, true)
+	got, err = Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
 	testutil.Ok(t, err)
 	testutil.Assert(t, planned(got, mid), "alone in its run, mid is stuck and eligible")
 	testutil.Assert(t, planned(got, left), "the fence is final once nothing overlaps it")
@@ -665,7 +691,7 @@ func TestPlanFencedBlockWaiverRespectsNoCompactReason(t *testing.T) {
 			if reason != "" {
 				marks[mid] = noCompactMark(mid, reason)
 			}
-			candidates, err := Plan(metas, marks, nil, true)
+			candidates, err := Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
 			testutil.Ok(t, err)
 			selected := false
 			for _, c := range candidates {
@@ -698,28 +724,28 @@ func TestPlanStuckBlockLateArrival(t *testing.T) {
 				right: noCompactMark(right, metadata.IndexSizeExceedingNoCompactReason),
 			}
 			excluded := map[ulid.ULID]*metadata.NoDownsampleMark{left: {ID: left}, right: {ID: right}}
-			plan, err := Plan(metas, marks, excluded, true)
+			plan, err := Plan(metas, PlanOptions{NoCompactMarked: marks, NoDownsampleMarked: excluded, EnableStuckBlocks: true})
 			testutil.Ok(t, err)
 			testutil.Equals(t, 1, len(plan))
 			testutil.Equals(t, mid, plan[0].Meta.ULID)
 			metas[first] = planMeta(first, target, 200, 300, mid)
 			metas[late] = planMeta(late, res, 250, 350)
-			plan, err = Plan(metas, marks, excluded, true)
+			plan, err = Plan(metas, PlanOptions{NoCompactMarked: marks, NoDownsampleMarked: excluded, EnableStuckBlocks: true})
 			testutil.Ok(t, err)
 			testutil.Equals(t, 0, len(plan), "late data must compact before another early downsample")
 
 			delete(metas, mid)
 			delete(metas, late)
 			metas[merged] = planMeta(merged, res, 200, 350, mid, late)
-			plan, err = Plan(metas, marks, excluded, false)
+			plan, err = Plan(metas, PlanOptions{NoCompactMarked: marks, NoDownsampleMarked: excluded})
 			testutil.Ok(t, err)
 			testutil.Equals(t, 0, len(plan), "disabling the feature still prevents a new exception")
-			plan, err = Plan(metas, marks, excluded, true)
+			plan, err = Plan(metas, PlanOptions{NoCompactMarked: marks, NoDownsampleMarked: excluded, EnableStuckBlocks: true})
 			testutil.Ok(t, err)
 			testutil.Equals(t, 1, len(plan))
 			testutil.Equals(t, merged, plan[0].Meta.ULID, "previous downsampling must not hide the new source")
 			metas[replacement] = planMeta(replacement, target, 200, 350, mid, late)
-			plan, err = Plan(metas, marks, excluded, true)
+			plan, err = Plan(metas, PlanOptions{NoCompactMarked: marks, NoDownsampleMarked: excluded, EnableStuckBlocks: true})
 			testutil.Ok(t, err)
 			testutil.Equals(t, 0, len(plan), "the replacement must cover both original and late sources")
 		})
@@ -744,13 +770,13 @@ func TestPlanScopesCoverageByExternalLabels(t *testing.T) {
 		down1: shard(planMeta(down1, ResLevel1, 0, ResLevel1DownsampleRange, source), "1_of_2"),
 	}
 
-	got, err := Plan(metas, nil, nil, false)
+	got, err := Plan(metas, PlanOptions{})
 	testutil.Ok(t, err)
 	testutil.Equals(t, 1, len(got), "shard 2 has never been downsampled")
 	testutil.Equals(t, raw2, got[0].Meta.ULID)
 
 	// Nor does the waiver machinery change that.
-	got, err = Plan(metas, nil, nil, true)
+	got, err = Plan(metas, PlanOptions{EnableStuckBlocks: true})
 	testutil.Ok(t, err)
 	testutil.Equals(t, 1, len(got))
 	testutil.Equals(t, raw2, got[0].Meta.ULID)
@@ -783,12 +809,12 @@ func TestPlanStuckBlocksPerShard(t *testing.T) {
 			s1: noCompactMark(s1, metadata.IndexSizeExceedingNoCompactReason),
 			s2: noCompactMark(s2, metadata.IndexSizeExceedingNoCompactReason),
 		}
-		got, err := Plan(metas, marks, nil, true)
+		got, err := Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
 		testutil.Ok(t, err)
 		testutil.Assert(t, planned(got, s1) && planned(got, s2), "both marked shards are waived: %v", got)
 
 		metas[d1] = shardMeta(d1, ResLevel1, 0, 100, "1_of_2", src)
-		got, err = Plan(metas, marks, nil, true)
+		got, err = Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
 		testutil.Ok(t, err)
 		testutil.Assert(t, !planned(got, s1) && planned(got, s2), "shard 1's downsampled block covers shard 1 only: %v", got)
 	})
@@ -804,7 +830,7 @@ func TestPlanStuckBlocksPerShard(t *testing.T) {
 			f1: noCompactMark(f1, metadata.IndexSizeExceedingNoCompactReason),
 			f2: noCompactMark(f2, metadata.IndexSizeExceedingNoCompactReason),
 		}
-		got, err := Plan(metas, marks, nil, true)
+		got, err := Plan(metas, PlanOptions{NoCompactMarked: marks, EnableStuckBlocks: true})
 		testutil.Ok(t, err)
 		testutil.Assert(t, planned(got, f1) && planned(got, b1) && planned(got, f2), "shard 1's fenced block and its fences are waived: %v", got)
 		testutil.Assert(t, !planned(got, b2), "shard 2's block with the same sources and range is not fenced in: %v", got)

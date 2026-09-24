@@ -767,7 +767,7 @@ func (ds *DownsampleProgressCalculator) ProgressCalculate(ctx context.Context, g
 		noDownsample = ds.noDownsampleMarked()
 	}
 
-	candidates, err := downsample.Plan(metas, noCompact, noDownsample, ds.enableStuckBlocks)
+	candidates, err := downsample.Plan(metas, downsample.PlanOptions{NoCompactMarked: noCompact, NoDownsampleMarked: noDownsample, EnableStuckBlocks: ds.enableStuckBlocks})
 	if err != nil {
 		return errors.Wrap(err, "plan downsampling for progress")
 	}
