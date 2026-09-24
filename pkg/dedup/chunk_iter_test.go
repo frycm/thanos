@@ -4,6 +4,7 @@
 package dedup
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/efficientgo/core/testutil"
@@ -473,4 +474,54 @@ func createSamplesWithStep(start, numOfSamples, step int) []chunks.Sample {
 	}
 
 	return res
+}
+
+// TestDedupChunkSeriesMergerTiesGoToTheFirstSeries: where replicas have
+// chunks with the same time range and disagree at the same timestamps, the
+// merged series takes the samples of the series offered first, however the
+// chunks before them made the heap settle.
+func TestDedupChunkSeriesMergerTiesGoToTheFirstSeries(t *testing.T) {
+	lset := labels.FromStrings("bar", "baz")
+	chunk := func(from, to int64, v float64) []chunks.Sample {
+		out := make([]chunks.Sample, 0, to-from+1)
+		for ts := from; ts <= to; ts++ {
+			out = append(out, sample{ts, v})
+		}
+		return out
+	}
+	values := func(t *testing.T, s storage.ChunkSeries) map[int64]float64 {
+		out := map[int64]float64{}
+		it := s.Iterator(nil)
+		for it.Next() {
+			si := it.At().Chunk.Iterator(nil)
+			for si.Next() == chunkenc.ValFloat {
+				ts, v := si.At()
+				out[ts] = v
+			}
+			testutil.Ok(t, si.Err())
+		}
+		testutil.Ok(t, it.Err())
+		return out
+	}
+	// Five replicas; all have the same chunk at [20, 25], with their own
+	// value, and some have earlier chunks that move the heap around first.
+	replicas := make([]storage.ChunkSeries, 0, 5)
+	for i := range 5 {
+		chks := make([][]chunks.Sample, 0, i+1)
+		for j := range i {
+			chks = append(chks, chunk(int64(j*3), int64(j*3+1), -1))
+		}
+		chks = append(chks, chunk(20, 25, float64(i)))
+		replicas = append(replicas, storage.NewListChunkSeriesFromSamples(lset, chks...))
+	}
+	m := NewChunkSeriesMerger()
+	for first := range replicas {
+		t.Run(fmt.Sprint(first), func(t *testing.T) {
+			order := append([]storage.ChunkSeries{replicas[first]}, append(append([]storage.ChunkSeries{}, replicas[:first]...), replicas[first+1:]...)...)
+			got := values(t, m(order...))
+			for ts := int64(20); ts <= 25; ts++ {
+				testutil.Equals(t, float64(first), got[ts], "replica %d was offered first, at %d", first, ts)
+			}
+		})
+	}
 }

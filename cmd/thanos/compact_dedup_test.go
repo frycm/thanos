@@ -19,6 +19,7 @@ func TestDedupFuncFor(t *testing.T) {
 	}{
 		{name: "default merger", conf: compactConfig{}},
 		{name: "penalty with a replica label", conf: compactConfig{dedupFunc: compact.DedupAlgorithmPenalty, dedupReplicaLabels: []string{"replica"}}},
+		{name: "penalty with a series replica label alone", conf: compactConfig{dedupFunc: compact.DedupAlgorithmPenalty, seriesReplicaLabels: []string{"replica"}}},
 		{name: "penalty without a replica label", conf: compactConfig{dedupFunc: compact.DedupAlgorithmPenalty}, wantErr: true},
 		{name: "penalty with an empty replica label", conf: compactConfig{dedupFunc: compact.DedupAlgorithmPenalty, dedupReplicaLabels: []string{""}}, wantErr: true},
 		{name: "unknown func", conf: compactConfig{dedupFunc: "other"}, wantErr: true},

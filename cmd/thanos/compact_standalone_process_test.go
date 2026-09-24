@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"math"
 	"os"
 	"os/exec"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/efficientgo/core/testutil"
 	"github.com/go-kit/log"
+	"github.com/oklog/ulid/v2"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
@@ -231,4 +233,58 @@ func processBucketSamples(t *testing.T, bkt objstore.Bucket) map[string][]string
 		slices.Sort(values)
 	}
 	return result
+}
+
+// TestCompactorProcessSeriesReplicaDedupWithoutExternalReplicaLabels runs the
+// real compact command with penalty deduplication by a series replica label
+// alone - HA Prometheus pairs remote-writing to receivers that replicate
+// nothing, so the replicas differ only in a series label. The command must
+// start, and the compacted blocks must hold each Prometheus pair's series
+// once, without the label, recording it.
+func TestCompactorProcessSeriesReplicaDedupWithoutExternalReplicaLabels(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns the compact process")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+	defer cancel()
+	f := newCompactorProcessFixture(t, ctx, 1)
+	config := filepath.Join(t.TempDir(), "bucket.yaml")
+	testutil.Ok(t, os.WriteFile(config, []byte(fmt.Sprintf("type: FILESYSTEM\nconfig:\n  directory: %q\n", f.Dirs[0])), 0600))
+	f.Wait(f.Start([]string{
+		"compact",
+		"--objstore.config-file=" + config,
+		"--data-dir=" + t.TempDir(),
+		"--http-address=127.0.0.1:0",
+		"--consistency-delay=0s",
+		"--compact.progress-interval=0s",
+		"--web.disable",
+		"--deduplication.func=penalty",
+		"--deduplication.series-replica-label=prometheus_replica",
+	}))
+
+	got := processBucketSamples(t, f.Buckets[0])
+	for _, receiver := range []string{"r0", "r1"} {
+		ext := labels.FromStrings("receiver_replica", receiver, "tenant", "one").String()
+		_, deduplicated := got[ext+`{__name__="prom_metric"}`]
+		testutil.Assert(t, deduplicated, "receiver %s's stream holds no deduplicated prom_metric: %v", receiver, slices.Collect(maps.Keys(got)))
+		_, otel := got[ext+`{__name__="otel_metric", otelcol_replica="A"}`]
+		testutil.Assert(t, otel, "a label not listed must be left alone")
+	}
+
+	logger := log.NewNopLogger()
+	metas, _, err := func() (map[ulid.ULID]*metadata.Meta, map[ulid.ULID]error, error) {
+		instrumented := objstore.WithNoopInstr(f.Buckets[0])
+		fetcher, err := block.NewMetaFetcher(logger, 1, instrumented, block.NewConcurrentLister(logger, instrumented), "", nil, nil)
+		testutil.Ok(t, err)
+		return fetcher.Fetch(ctx)
+	}()
+	testutil.Ok(t, err)
+	var recorded int
+	for _, m := range metas {
+		if m.Compaction.Level > 1 {
+			testutil.Equals(t, []string{"prometheus_replica"}, m.Thanos.SeriesReplicaLabels)
+			recorded++
+		}
+	}
+	testutil.Assert(t, recorded > 0, "no compacted block")
 }
