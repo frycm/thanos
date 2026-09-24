@@ -5,7 +5,6 @@ package compacttest
 
 import (
 	"context"
-	"maps"
 	"math"
 	"os"
 	"path/filepath"
@@ -235,15 +234,11 @@ func (n *Node) Stop() { n.stop() }
 // Stopped reports whether the node was stopped.
 func (n *Node) Stopped() bool { return n.Ctx.Err() != nil }
 
-// downsampleInProcess is the binary's standalone downsampling pass: blocks
-// marked no-downsample are taken out of the view, and what downsample.Plan
-// selects is downsampled here.
+// downsampleInProcess is the binary's standalone downsampling pass: what
+// downsample.Plan selects, told which blocks are marked no-downsample, is
+// downsampled here.
 func downsampleInProcess(ctx context.Context, n *Node, metas map[ulid.ULID]*metadata.Meta, _ map[ulid.ULID]*metadata.NoCompactMark, noDownsample map[ulid.ULID]*metadata.NoDownsampleMark) error {
-	metas = maps.Clone(metas)
-	for id := range noDownsample {
-		delete(metas, id)
-	}
-	candidates, err := downsample.Plan(metas)
+	candidates, err := downsample.Plan(metas, downsample.PlanOptions{NoDownsampleMarked: noDownsample})
 	if err != nil {
 		return err
 	}
