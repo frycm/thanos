@@ -11,7 +11,6 @@ import (
 
 	"github.com/efficientgo/core/testutil"
 	"github.com/go-kit/log"
-	"github.com/oklog/ulid/v2"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/objstore/providers/filesystem"
@@ -52,7 +51,7 @@ func TestBucketStoreStripsCompactorShardLabel(t *testing.T) {
 		testutil.Ok(t, head.Close())
 		lbls := extLset.Map()
 		lbls[metadata.CompactorShardLabel] = shard
-		_, err := metadata.InjectThanos(logger, filepath.Join(bktDir, id.String()), metadata.Thanos{
+		_, err = metadata.InjectThanos(logger, filepath.Join(bktDir, id.String()), metadata.Thanos{
 			Labels: lbls, Downsample: metadata.ThanosDownsample{Resolution: 0}, Source: metadata.TestSource,
 		}, nil)
 		testutil.Ok(t, err)
@@ -64,10 +63,21 @@ func TestBucketStoreStripsCompactorShardLabel(t *testing.T) {
 	indexCache, err := storecache.NewInMemoryIndexCacheWithConfig(logger, nil, nil, storecache.InMemoryIndexCacheConfig{})
 	testutil.Ok(t, err)
 	store, err := NewBucketStore(
-		instrBkt, fetcher, tmpDir,
-		NewChunksLimiterFactory(10000/MaxSamplesPerChunk), NewSeriesLimiterFactory(0), NewBytesLimiterFactory(0),
-		NewGapBasedPartitioner(PartitionerMaxGapSize), 10, false, DefaultPostingOffsetInMemorySampling, true, false, 0,
-		WithLogger(logger), WithIndexCache(indexCache),
+		instrBkt,
+		fetcher,
+		tmpDir,
+		NewChunksLimiterFactory(10000/MaxSamplesPerChunk),
+		NewSeriesLimiterFactory(0),
+		NewBytesLimiterFactory(0),
+		NewGapBasedPartitioner(PartitionerMaxGapSize),
+		10,
+		false,
+		DefaultPostingOffsetInMemorySampling,
+		true,
+		false,
+		0,
+		WithLogger(logger),
+		WithIndexCache(indexCache),
 	)
 	testutil.Ok(t, err)
 	defer func() { testutil.Ok(t, store.Close()) }()
@@ -122,10 +132,5 @@ func TestBucketStoreStripsCompactorShardLabel(t *testing.T) {
 	// Without the shard label the two blocks would be one block set; with it
 	// they are two, which is what keeps the deduplication filter and the
 	// planner from confusing them.
-	sets := 0
-	for range store.blockSets {
-		sets++
-	}
-	testutil.Equals(t, 2, sets)
-	_ = ulid.ULID{}
+	testutil.Equals(t, 2, len(store.blockSets))
 }

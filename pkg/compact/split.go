@@ -52,9 +52,10 @@ type SplitConfig struct {
 }
 
 // Enabled reports whether splitting can happen at all.
-func (c SplitConfig) Enabled() bool { return c.effectiveMaxShards() > 1 }
+func (c SplitConfig) Enabled() bool { return c.MaxShardCount() > 1 }
 
-func (c SplitConfig) effectiveMaxShards() uint64 {
+// MaxShardCount is the largest shard count the configuration allows.
+func (c SplitConfig) MaxShardCount() uint64 {
 	if c.MaxShards <= 1 {
 		return 1
 	}
@@ -69,7 +70,7 @@ func (c SplitConfig) PlannerIndexSizeLimit(limit int64) int64 {
 	if !c.Enabled() || limit <= 0 {
 		return limit
 	}
-	m := c.effectiveMaxShards()
+	m := c.MaxShardCount()
 	if uint64(math.MaxInt64)/m < uint64(limit) {
 		return math.MaxInt64
 	}
@@ -97,9 +98,9 @@ func PlanEstimate(metas []*metadata.Meta) (indexBytes int64, series uint64) {
 // none does; count is zero for unsplit sources.
 func SourceShard(metas []*metadata.Meta) (index, count uint64, err error) {
 	for i, m := range metas {
-		idx, cnt, ok, err := metadata.Shard(m.Thanos.Labels)
-		if err != nil {
-			return 0, 0, errors.Wrapf(err, "block %s", m.ULID)
+		idx, cnt, ok, shardErr := metadata.Shard(m.Thanos.Labels)
+		if shardErr != nil {
+			return 0, 0, errors.Wrapf(shardErr, "block %s", m.ULID)
 		}
 		if !ok {
 			idx, cnt = 0, 0
@@ -153,7 +154,7 @@ func (c SplitConfig) ShardCount(metas []*metadata.Meta, sourceShards, floor uint
 	// stop ordinary compaction within its shards. A plan that does not fit
 	// reports the count it would need.
 	need := nextPow2(byIndex) * lineage
-	if nextPow2(byIndex) > 1 && need > c.effectiveMaxShards() {
+	if nextPow2(byIndex) > 1 && need > c.MaxShardCount() {
 		return need, false
 	}
 	count = nextPow2(max(byIndex, bySeries)) * lineage
@@ -161,12 +162,9 @@ func (c SplitConfig) ShardCount(metas []*metadata.Meta, sourceShards, floor uint
 	// The cap bounds how far a plan is split, but never below the count its
 	// sources already have: a coarser shard made from one finer shard would
 	// carry a label that claims series it does not hold.
-	count = max(min(count, c.effectiveMaxShards()), lineage)
+	count = max(min(count, c.MaxShardCount()), lineage)
 	return count, true
 }
-
-// MaxShardCount is the largest shard count the configuration allows.
-func (c SplitConfig) MaxShardCount() uint64 { return c.effectiveMaxShards() }
 
 // ShardsToProduce lists the 0-based shard indexes of count that a plan whose
 // sources are shard sourceIndex of sourceCount produces. Counts are powers of
@@ -176,7 +174,10 @@ func ShardsToProduce(sourceIndex, sourceCount, count uint64) []uint64 {
 	if sourceCount == 0 {
 		sourceIndex, sourceCount = 0, 1
 	}
-	var out []uint64
+	if sourceIndex >= count {
+		return nil
+	}
+	out := make([]uint64, 0, (count-sourceIndex+sourceCount-1)/sourceCount)
 	for j := sourceIndex; j < count; j += sourceCount {
 		out = append(out, j)
 	}
@@ -269,7 +270,16 @@ var (
 // source block is marked no-compact in bkt, with the same reason, and
 // markedForNoCompact counts it. metas is the compactor's synced view of the
 // bucket, across groups; metrics may be nil.
-func WithBlockSplitting(inner Planner, logger log.Logger, conf SplitConfig, metrics *SplitMetrics, bkt objstore.Bucket, markedForNoCompact prometheus.Counter, metas func() map[ulid.ULID]*metadata.Meta, noCompact func() map[ulid.ULID]*metadata.NoCompactMark) Planner {
+func WithBlockSplitting(
+	inner Planner,
+	logger log.Logger,
+	conf SplitConfig,
+	metrics *SplitMetrics,
+	bkt objstore.Bucket,
+	markedForNoCompact prometheus.Counter,
+	metas func() map[ulid.ULID]*metadata.Meta,
+	noCompact func() map[ulid.ULID]*metadata.NoCompactMark,
+) Planner {
 	conf.HashWithout = slices.DeleteFunc(slices.Clone(conf.HashWithout), func(name string) bool { return name == "" })
 	slices.Sort(conf.HashWithout)
 	conf.HashWithout = slices.Compact(conf.HashWithout)
@@ -297,7 +307,12 @@ func (p *splitPlanner) PlansSingleBlockGroups() bool { return true }
 // Unsplit blocks in a range the stream's shards already cover are split into
 // exactly those shards; otherwise the estimate decides, never below the count
 // the stream has.
-func (p *splitPlanner) decide(ctx context.Context, groupLabels map[string]string, resolution int64, sources []*metadata.Meta) (pieces []ShardRef, count uint64, fits bool, err error) {
+func (p *splitPlanner) decide(
+	ctx context.Context,
+	groupLabels map[string]string,
+	resolution int64,
+	sources []*metadata.Meta,
+) (pieces []ShardRef, count uint64, fits bool, err error) {
 	if err := p.lookupIndexSizes(ctx, sources); err != nil {
 		return nil, 0, false, err
 	}
@@ -323,8 +338,10 @@ func (p *splitPlanner) decide(ctx context.Context, groupLabels map[string]string
 	if !fits || count <= max(sourceShards, 1) {
 		return nil, count, fits, nil
 	}
-	for _, j := range ShardsToProduce(sourceShard, sourceShards, count) {
-		pieces = append(pieces, ShardRef{Index: j, Count: count})
+	shards := ShardsToProduce(sourceShard, sourceShards, count)
+	pieces = make([]ShardRef, len(shards))
+	for i, j := range shards {
+		pieces[i] = ShardRef{Index: j, Count: count}
 	}
 	return pieces, count, true, nil
 }
@@ -393,7 +410,7 @@ func (p *splitPlanner) PlanOutputs(ctx context.Context, cg *Group, sources []*me
 		outputs = append(outputs, PlanOutput{Labels: lbls, Series: &SeriesPartition{Index: piece.Index, Count: piece.Count, Without: p.conf.HashWithout}})
 		labelsOf = append(labelsOf, piece.Label())
 	}
-	level.Info(p.logger).Log("msg", "splitting compaction by series", "group", cg.Key(), "shards", fmt.Sprintf("%v", labelsOf), "source_shards", sourceShards, "sources", len(sources))
+	level.Info(p.logger).Log("msg", "splitting compaction by series", "group", cg.Key(), "shards", fmt.Sprintf("%v", labelsOf), "sourceShards", sourceShards, "sources", len(sources))
 	if p.metrics != nil {
 		p.metrics.Splits.Inc()
 		p.metrics.Shards.Observe(float64(len(pieces)))
@@ -444,8 +461,7 @@ func (p *splitPlanner) Plan(ctx context.Context, metasByMinTime []*metadata.Meta
 	if err != nil {
 		return nil, err
 	}
-	all := p.metas()
-	covered := shardCoverage(metasByMinTime[0], source, all)
+	covered := shardCoverage(metasByMinTime[0], source, p.metas())
 	// A shard block whose lineage has moved on to a finer count anywhere in
 	// the stream has no future at its own: no range at that count can ever
 	// be completed again. It is split up to the lineage's count, covered or
@@ -468,6 +484,11 @@ func (p *splitPlanner) Plan(ctx context.Context, metasByMinTime []*metadata.Meta
 	// stragglers are gone it is the group's newest block, and it must still
 	// be split. The candidates exclude blocks refused above, whose marks the
 	// snapshot of no-compact marks does not hold yet.
+	var (
+		pieces []ShardRef
+		count  uint64
+		fits   bool
+	)
 	for _, m := range candidates {
 		if _, excluded := noCompact[m.ULID]; excluded {
 			continue
@@ -479,7 +500,7 @@ func (p *splitPlanner) Plan(ctx context.Context, metasByMinTime []*metadata.Meta
 		// would need more shards than allowed, and skipped when it would
 		// not be split at all: it would only be rewritten as itself, pass
 		// after pass.
-		pieces, count, fits, err := p.decide(ctx, m.Thanos.Labels, m.Thanos.Downsample.Resolution, []*metadata.Meta{m})
+		pieces, count, fits, err = p.decide(ctx, m.Thanos.Labels, m.Thanos.Downsample.Resolution, []*metadata.Meta{m})
 		if err != nil {
 			return nil, err
 		}
@@ -512,14 +533,20 @@ func (p *splitPlanner) refuse(ctx context.Context, plan []*metadata.Meta, count 
 		p.metrics.Fallbacks.Inc()
 	}
 	level.Warn(p.logger).Log("msg", "a compaction would need more shards than allowed; marking its biggest block for no compaction",
-		"block", biggest.ULID, "shards_needed", count, "max_shards", p.conf.MaxShardCount())
+		"block", biggest.ULID, "shardsNeeded", count, "maxShards", p.conf.MaxShardCount())
 	if p.bkt == nil {
 		return biggest
 	}
-	if err := block.MarkForNoCompact(ctx, p.logger, p.bkt, biggest.ULID, metadata.IndexSizeExceedingNoCompactReason,
+	if err := block.MarkForNoCompact(
+		ctx,
+		p.logger,
+		p.bkt,
+		biggest.ULID,
+		metadata.IndexSizeExceedingNoCompactReason,
 		fmt.Sprintf("splitPlanner: the compaction would need %d shards, over --compact.block-split.max-shards=%d; raise the cap or lower the per-shard limits. See https://github.com/thanos-io/thanos/issues/1424", count, p.conf.MaxShardCount()),
-		p.markedForNoCompact); err != nil {
-		level.Error(p.logger).Log("msg", "could not mark the block for no compaction; it is skipped this pass", "block", biggest.ULID, "err", err)
+		p.markedForNoCompact,
+	); err != nil {
+		level.Warn(p.logger).Log("msg", "could not mark the block for no compaction; it is skipped this pass", "block", biggest.ULID, "err", err)
 	}
 	return biggest
 }
@@ -552,18 +579,18 @@ func (r ShardRef) refines(source ShardRef) bool {
 // shardCoverage returns the merged time ranges of the shard blocks of the
 // same stream and resolution as the given block that refine its shard: for an
 // unsplit block every shard, for a shard block the finer shards of its lineage.
-func shardCoverage(block *metadata.Meta, source ShardRef, all map[ulid.ULID]*metadata.Meta) []timeRange {
-	stream := streamLabels(block.Thanos.Labels)
+func shardCoverage(m *metadata.Meta, source ShardRef, all map[ulid.ULID]*metadata.Meta) []timeRange {
+	stream := streamLabels(m.Thanos.Labels)
 	var ranges []timeRange
-	for _, m := range all {
-		if m.Thanos.Downsample.Resolution != block.Thanos.Downsample.Resolution || !sameStream(m.Thanos.Labels, stream) {
+	for _, o := range all {
+		if o.Thanos.Downsample.Resolution != m.Thanos.Downsample.Resolution || !sameStream(o.Thanos.Labels, stream) {
 			continue
 		}
-		index, count, ok, err := metadata.Shard(m.Thanos.Labels)
+		index, count, ok, err := metadata.Shard(o.Thanos.Labels)
 		if err != nil || !ok || !(ShardRef{index, count}).refines(source) {
 			continue
 		}
-		ranges = append(ranges, timeRange{m.MinTime, m.MaxTime})
+		ranges = append(ranges, timeRange{o.MinTime, o.MaxTime})
 	}
 	if len(ranges) == 0 {
 		return nil
@@ -609,7 +636,9 @@ func coversRange(ranges []timeRange, mint, maxt int64) bool {
 // given - in the compactor's synced view: among the shards that refine the
 // given source shard, which for an unsplit source is every shard of the
 // stream. Zero if there are none.
-func StreamShardCountFunc(metas func() map[ulid.ULID]*metadata.Meta) func(labels map[string]string, resolution int64, source ShardRef) uint64 {
+func StreamShardCountFunc(
+	metas func() map[ulid.ULID]*metadata.Meta,
+) func(labels map[string]string, resolution int64, source ShardRef) uint64 {
 	return func(unsplit map[string]string, resolution int64, source ShardRef) uint64 {
 		var most uint64
 		for _, m := range metas() {
@@ -678,7 +707,9 @@ func (r ShardRef) Label() string { return metadata.FormatShardLabelValue(r.Index
 //
 // The labels are the stream's, without the shard label; source is the plan's
 // own shard, with a zero count for unsplit blocks.
-func StreamLeavesFunc(metas func() map[ulid.ULID]*metadata.Meta) func(labels map[string]string, resolution, mint, maxt int64, source ShardRef) []ShardRef {
+func StreamLeavesFunc(
+	metas func() map[ulid.ULID]*metadata.Meta,
+) func(labels map[string]string, resolution, mint, maxt int64, source ShardRef) []ShardRef {
 	return func(stream map[string]string, resolution, mint, maxt int64, source ShardRef) []ShardRef {
 		seen := map[ShardRef]struct{}{}
 		var finest uint64

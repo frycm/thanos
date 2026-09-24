@@ -110,10 +110,11 @@ func (s *shardTreeSim) history() string {
 	out += "  bucket:\n"
 	for _, b := range s.blocks {
 		state := "live"
+		if slices.Contains(s.view, b) {
+			state = "in view"
+		}
 		if b.deleted {
 			state = "deleted"
-		} else if slices.Contains(s.view, b) {
-			state = "in view"
 		}
 		out += fmt.Sprintf("    %s %s [%d,%d) sources=%v set=%v %s\n", b.id, b.label(), b.mint, b.maxt, b.sources, b.set, state)
 	}
@@ -159,7 +160,7 @@ func (s *shardTreeSim) split() {
 	for _, p := range plan {
 		sources = append(sources, p.sources...)
 	}
-	slices.SortFunc(sources, func(a, b ulid.ULID) int { return a.Compare(b) })
+	slices.SortFunc(sources, func(x, y ulid.ULID) int { return x.Compare(y) })
 	sources = slices.Compact(sources)
 	// Output indexes: the shards congruent to the source shard.
 	var idx []uint64

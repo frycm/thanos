@@ -383,8 +383,13 @@ func runCompact(
 	var splitMetrics *compact.SplitMetrics
 	if split.Enabled() {
 		splitMetrics = compact.NewSplitMetrics(reg)
-		level.Info(logger).Log("msg", "block splitting by series is enabled", "max_shards", conf.blockSplitMaxShards,
-			"shard_max_index_size", conf.maxBlockIndexSize, "shard_max_series", conf.blockSplitMaxSeries, "hash_ignore_labels", strings.Join(split.HashWithout, ","))
+		level.Info(logger).Log(
+			"msg", "block splitting by series is enabled",
+			"maxShards", conf.blockSplitMaxShards,
+			"shardMaxIndexSize", conf.maxBlockIndexSize,
+			"shardMaxSeries", conf.blockSplitMaxSeries,
+			"hashIgnoreLabels", strings.Join(split.HashWithout, ","),
+		)
 	}
 
 	tsdbPlanner := compact.NewPlanner(logger, levels, noCompactMarkerFilter)
@@ -409,9 +414,16 @@ func runCompact(
 	if split.Enabled() {
 		// Plans over the limits are split by series, and blocks a split stream
 		// leaves behind unsplit are planned alone and split.
-		planner = compact.WithBlockSplitting(planner, logger, split, splitMetrics, insBkt,
+		planner = compact.WithBlockSplitting(
+			planner,
+			logger,
+			split,
+			splitMetrics,
+			insBkt,
 			compactMetrics.blocksMarked.WithLabelValues(metadata.NoCompactMarkFilename, metadata.IndexSizeExceedingNoCompactReason),
-			sy.Metas, noCompactMarkerFilter.NoCompactMarkedBlocks)
+			sy.Metas,
+			noCompactMarkerFilter.NoCompactMarkedBlocks,
+		)
 	}
 	blocksCleaner := compact.NewBlocksCleaner(logger, insBkt, ignoreDeletionMarkFilter, deleteDelay, compactMetrics.blocksCleaned, compactMetrics.blockCleanupFailures)
 

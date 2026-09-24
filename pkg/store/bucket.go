@@ -1568,8 +1568,9 @@ func debugFoundBlockSetOverview(logger log.Logger, mint, maxt, maxResolutionMill
 // withoutShardLabel adds the compactor's shard label to the set of external
 // labels removed from what the block serves, when the block carries it. Shards
 // of one compaction are separate blocks with disjoint series; the label only
-// exists so that the compactor and this store keep them apart, and must not
-// reach queriers. Blocks without the label keep the caller's set untouched.
+// exists so that the compactor and this store gateway keep them apart, and
+// must not reach queriers. Blocks without the label keep the caller's set
+// untouched.
 func withoutShardLabel(b *bucketBlock, extLsetToRemove map[string]struct{}) map[string]struct{} {
 	if !b.extLset.Has(metadata.CompactorShardLabel) {
 		return extLsetToRemove

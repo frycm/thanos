@@ -26,9 +26,9 @@ import (
 
 const gib = 1 << 30
 
-func metaWith(indexBytes int64, series uint64, lbls map[string]string) *metadata.Meta {
+func metaWith(id uint64, indexBytes int64, series uint64, lbls map[string]string) *metadata.Meta {
 	m := &metadata.Meta{}
-	m.ULID = ulid.MustNew(ulid.Now(), nil)
+	m.ULID = ulid.MustNew(id, nil)
 	m.Stats.NumSeries = series
 	m.Thanos.Labels = lbls
 	if indexBytes > 0 {
@@ -48,35 +48,35 @@ func TestSplitConfigShardCount(t *testing.T) {
 		want         uint64
 		fits         bool
 	}{
-		{name: "disabled", conf: SplitConfig{}, metas: []*metadata.Meta{metaWith(100*gib, 0, nil)}, want: 1, fits: true},
-		{name: "disabled keeps the sources' count", conf: SplitConfig{}, metas: []*metadata.Meta{metaWith(100*gib, 0, nil)}, sourceShards: 4, want: 4, fits: true},
-		{name: "max shards one is disabled", conf: SplitConfig{MaxShards: 1, MaxIndexSizeBytes: gib}, metas: []*metadata.Meta{metaWith(100*gib, 0, nil)}, want: 1, fits: true},
-		{name: "fits", conf: sixtyFour, metas: []*metadata.Meta{metaWith(20*gib, 0, nil), metaWith(20*gib, 0, nil)}, want: 1, fits: true},
-		{name: "two replicas over the headroom", conf: sixtyFour, metas: []*metadata.Meta{metaWith(30*gib, 0, nil), metaWith(30*gib, 0, nil)}, want: 2, fits: true},
-		{name: "rounds up to a power of two", conf: sixtyFour, metas: []*metadata.Meta{metaWith(100*gib, 0, nil), metaWith(100*gib, 0, nil), metaWith(60*gib, 0, nil)}, want: 8, fits: true},
-		{name: "over the cap by index, cap rounded down, reports what it needs", conf: SplitConfig{MaxShards: 6, MaxIndexSizeBytes: gib}, metas: []*metadata.Meta{metaWith(100*gib, 0, nil)}, want: 128, fits: false},
-		{name: "over the cap by series is capped, not refused", conf: SplitConfig{MaxShards: 4, MaxSeries: 10}, metas: []*metadata.Meta{metaWith(0, 60, nil)}, want: 4, fits: true},
-		{name: "series criterion", conf: SplitConfig{MaxShards: 16, MaxSeries: 10}, metas: []*metadata.Meta{metaWith(0, 12, nil), metaWith(0, 12, nil)}, want: 4, fits: true},
-		{name: "never below the stream's count", conf: sixtyFour, metas: []*metadata.Meta{metaWith(gib, 0, nil)}, floor: 4, want: 4, fits: true},
-		{name: "a fresh range outgrows the stream's count", conf: sixtyFour, metas: []*metadata.Meta{metaWith(60*gib, 0, nil), metaWith(60*gib, 0, nil)}, floor: 2, want: 4, fits: true},
-		{name: "no index size known", conf: SplitConfig{MaxShards: 16, MaxIndexSizeBytes: gib}, metas: []*metadata.Meta{metaWith(0, 0, nil)}, want: 1, fits: true},
+		{name: "disabled", conf: SplitConfig{}, metas: []*metadata.Meta{metaWith(1, 100*gib, 0, nil)}, want: 1, fits: true},
+		{name: "disabled keeps the sources' count", conf: SplitConfig{}, metas: []*metadata.Meta{metaWith(1, 100*gib, 0, nil)}, sourceShards: 4, want: 4, fits: true},
+		{name: "max shards one is disabled", conf: SplitConfig{MaxShards: 1, MaxIndexSizeBytes: gib}, metas: []*metadata.Meta{metaWith(1, 100*gib, 0, nil)}, want: 1, fits: true},
+		{name: "fits", conf: sixtyFour, metas: []*metadata.Meta{metaWith(1, 20*gib, 0, nil), metaWith(2, 20*gib, 0, nil)}, want: 1, fits: true},
+		{name: "two replicas over the headroom", conf: sixtyFour, metas: []*metadata.Meta{metaWith(1, 30*gib, 0, nil), metaWith(2, 30*gib, 0, nil)}, want: 2, fits: true},
+		{name: "rounds up to a power of two", conf: sixtyFour, metas: []*metadata.Meta{metaWith(1, 100*gib, 0, nil), metaWith(2, 100*gib, 0, nil), metaWith(3, 60*gib, 0, nil)}, want: 8, fits: true},
+		{name: "over the cap by index, cap rounded down, reports what it needs", conf: SplitConfig{MaxShards: 6, MaxIndexSizeBytes: gib}, metas: []*metadata.Meta{metaWith(1, 100*gib, 0, nil)}, want: 128, fits: false},
+		{name: "over the cap by series is capped, not refused", conf: SplitConfig{MaxShards: 4, MaxSeries: 10}, metas: []*metadata.Meta{metaWith(1, 0, 60, nil)}, want: 4, fits: true},
+		{name: "series criterion", conf: SplitConfig{MaxShards: 16, MaxSeries: 10}, metas: []*metadata.Meta{metaWith(1, 0, 12, nil), metaWith(2, 0, 12, nil)}, want: 4, fits: true},
+		{name: "never below the stream's count", conf: sixtyFour, metas: []*metadata.Meta{metaWith(1, gib, 0, nil)}, floor: 4, want: 4, fits: true},
+		{name: "a fresh range outgrows the stream's count", conf: sixtyFour, metas: []*metadata.Meta{metaWith(1, 60*gib, 0, nil), metaWith(2, 60*gib, 0, nil)}, floor: 2, want: 4, fits: true},
+		{name: "no index size known", conf: SplitConfig{MaxShards: 16, MaxIndexSizeBytes: gib}, metas: []*metadata.Meta{metaWith(1, 0, 0, nil)}, want: 1, fits: true},
 		// The sources of a shard group hold that shard's data alone: what
 		// they need is parts of the shard, and the stream's count grows by
 		// that factor.
-		{name: "a shard within the limit keeps its count", conf: sixtyFour, metas: []*metadata.Meta{metaWith(20*gib, 0, nil), metaWith(20*gib, 0, nil)}, sourceShards: 4, want: 4, fits: true},
-		{name: "a shard needing two parts doubles the count", conf: sixtyFour, metas: []*metadata.Meta{metaWith(40*gib, 0, nil), metaWith(40*gib, 0, nil)}, sourceShards: 4, want: 8, fits: true},
-		{name: "a shard needing three parts quadruples the count", conf: sixtyFour, metas: []*metadata.Meta{metaWith(60*gib, 0, nil), metaWith(60*gib, 0, nil), metaWith(40*gib, 0, nil)}, sourceShards: 4, want: 16, fits: true},
-		{name: "a shard's series count works the same", conf: SplitConfig{MaxShards: 16, MaxSeries: 10}, metas: []*metadata.Meta{metaWith(0, 12, nil), metaWith(0, 12, nil)}, sourceShards: 2, want: 8, fits: true},
-		{name: "a shard at the cap that needs more index does not fit", conf: SplitConfig{MaxShards: 8, MaxIndexSizeBytes: 64 * gib}, metas: []*metadata.Meta{metaWith(40*gib, 0, nil), metaWith(40*gib, 0, nil)}, sourceShards: 8, want: 16, fits: false},
+		{name: "a shard within the limit keeps its count", conf: sixtyFour, metas: []*metadata.Meta{metaWith(1, 20*gib, 0, nil), metaWith(2, 20*gib, 0, nil)}, sourceShards: 4, want: 4, fits: true},
+		{name: "a shard needing two parts doubles the count", conf: sixtyFour, metas: []*metadata.Meta{metaWith(1, 40*gib, 0, nil), metaWith(2, 40*gib, 0, nil)}, sourceShards: 4, want: 8, fits: true},
+		{name: "a shard needing three parts quadruples the count", conf: sixtyFour, metas: []*metadata.Meta{metaWith(1, 60*gib, 0, nil), metaWith(2, 60*gib, 0, nil), metaWith(3, 40*gib, 0, nil)}, sourceShards: 4, want: 16, fits: true},
+		{name: "a shard's series count works the same", conf: SplitConfig{MaxShards: 16, MaxSeries: 10}, metas: []*metadata.Meta{metaWith(1, 0, 12, nil), metaWith(2, 0, 12, nil)}, sourceShards: 2, want: 8, fits: true},
+		{name: "a shard at the cap that needs more index does not fit", conf: SplitConfig{MaxShards: 8, MaxIndexSizeBytes: 64 * gib}, metas: []*metadata.Meta{metaWith(1, 40*gib, 0, nil), metaWith(2, 40*gib, 0, nil)}, sourceShards: 8, want: 16, fits: false},
 		// The cap was lowered below a count the stream already has: what
 		// needs no further split still compacts within its shard, at its own
 		// count - a coarser label would claim series the shard does not hold.
-		{name: "a shard beyond a lowered cap keeps its count when it needs no split", conf: SplitConfig{MaxShards: 4, MaxIndexSizeBytes: 64 * gib}, metas: []*metadata.Meta{metaWith(20*gib, 0, nil), metaWith(20*gib, 0, nil)}, sourceShards: 8, want: 8, fits: true},
-		{name: "a shard beyond a lowered cap keeps its count although its series want more", conf: SplitConfig{MaxShards: 4, MaxSeries: 4}, metas: []*metadata.Meta{metaWith(0, 6, nil), metaWith(0, 6, nil)}, sourceShards: 8, floor: 8, want: 8, fits: true},
-		{name: "a shard beyond a lowered cap that needs a split does not fit", conf: SplitConfig{MaxShards: 4, MaxIndexSizeBytes: 64 * gib}, metas: []*metadata.Meta{metaWith(40*gib, 0, nil), metaWith(40*gib, 0, nil)}, sourceShards: 8, want: 16, fits: false},
-		{name: "a fresh range under a lowered cap splits at the cap, not the stream's count", conf: SplitConfig{MaxShards: 4, MaxIndexSizeBytes: 64 * gib}, metas: []*metadata.Meta{metaWith(60*gib, 0, nil), metaWith(60*gib, 0, nil)}, floor: 8, want: 4, fits: true},
-		{name: "a shard at a lowered cap is not split towards the stream's count", conf: SplitConfig{MaxShards: 4, MaxIndexSizeBytes: 64 * gib}, metas: []*metadata.Meta{metaWith(gib, 0, nil)}, sourceShards: 4, floor: 8, want: 4, fits: true},
-		{name: "a shard at the cap that wants more for its series stays", conf: SplitConfig{MaxShards: 8, MaxSeries: 4}, metas: []*metadata.Meta{metaWith(0, 3, nil), metaWith(0, 3, nil), metaWith(0, 3, nil)}, sourceShards: 8, want: 8, fits: true},
+		{name: "a shard beyond a lowered cap keeps its count when it needs no split", conf: SplitConfig{MaxShards: 4, MaxIndexSizeBytes: 64 * gib}, metas: []*metadata.Meta{metaWith(1, 20*gib, 0, nil), metaWith(2, 20*gib, 0, nil)}, sourceShards: 8, want: 8, fits: true},
+		{name: "a shard beyond a lowered cap keeps its count although its series want more", conf: SplitConfig{MaxShards: 4, MaxSeries: 4}, metas: []*metadata.Meta{metaWith(1, 0, 6, nil), metaWith(2, 0, 6, nil)}, sourceShards: 8, floor: 8, want: 8, fits: true},
+		{name: "a shard beyond a lowered cap that needs a split does not fit", conf: SplitConfig{MaxShards: 4, MaxIndexSizeBytes: 64 * gib}, metas: []*metadata.Meta{metaWith(1, 40*gib, 0, nil), metaWith(2, 40*gib, 0, nil)}, sourceShards: 8, want: 16, fits: false},
+		{name: "a fresh range under a lowered cap splits at the cap, not the stream's count", conf: SplitConfig{MaxShards: 4, MaxIndexSizeBytes: 64 * gib}, metas: []*metadata.Meta{metaWith(1, 60*gib, 0, nil), metaWith(2, 60*gib, 0, nil)}, floor: 8, want: 4, fits: true},
+		{name: "a shard at a lowered cap is not split towards the stream's count", conf: SplitConfig{MaxShards: 4, MaxIndexSizeBytes: 64 * gib}, metas: []*metadata.Meta{metaWith(1, gib, 0, nil)}, sourceShards: 4, floor: 8, want: 4, fits: true},
+		{name: "a shard at the cap that wants more for its series stays", conf: SplitConfig{MaxShards: 8, MaxSeries: 4}, metas: []*metadata.Meta{metaWith(1, 0, 3, nil), metaWith(2, 0, 3, nil), metaWith(3, 0, 3, nil)}, sourceShards: 8, want: 8, fits: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			count, fits := tc.conf.ShardCount(tc.metas, tc.sourceShards, tc.floor)
@@ -87,37 +87,85 @@ func TestSplitConfigShardCount(t *testing.T) {
 }
 
 func TestSplitConfigPlannerIndexSizeLimit(t *testing.T) {
-	testutil.Equals(t, int64(100), SplitConfig{}.PlannerIndexSizeLimit(100))
-	testutil.Equals(t, int64(800), SplitConfig{MaxShards: 8}.PlannerIndexSizeLimit(100))
-	testutil.Equals(t, int64(400), SplitConfig{MaxShards: 7}.PlannerIndexSizeLimit(100))
-	testutil.Equals(t, int64(math.MaxInt64), SplitConfig{MaxShards: 8}.PlannerIndexSizeLimit(math.MaxInt64))
+	for _, tc := range []struct {
+		name  string
+		conf  SplitConfig
+		limit int64
+		want  int64
+	}{
+		{name: "disabled keeps the limit", conf: SplitConfig{}, limit: 100, want: 100},
+		{name: "scaled by the maximum shards", conf: SplitConfig{MaxShards: 8}, limit: 100, want: 800},
+		{name: "maximum shards rounded down to a power of two", conf: SplitConfig{MaxShards: 7}, limit: 100, want: 400},
+		{name: "saturates instead of overflowing", conf: SplitConfig{MaxShards: 8}, limit: math.MaxInt64, want: math.MaxInt64},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testutil.Equals(t, tc.want, tc.conf.PlannerIndexSizeLimit(tc.limit))
+		})
+	}
 }
 
 func TestShardsToProduce(t *testing.T) {
-	testutil.Equals(t, []uint64{0, 1, 2, 3}, ShardsToProduce(0, 0, 4))
-	testutil.Equals(t, []uint64{2, 6}, ShardsToProduce(2, 4, 8))
-	testutil.Equals(t, []uint64{3, 11, 19, 27}, ShardsToProduce(3, 8, 32))
-	testutil.Equals(t, []uint64{1}, ShardsToProduce(1, 2, 2))
+	for _, tc := range []struct {
+		name                            string
+		sourceIndex, sourceCount, count uint64
+		want                            []uint64
+	}{
+		{name: "unsplit sources produce every shard", sourceIndex: 0, sourceCount: 0, count: 4, want: []uint64{0, 1, 2, 3}},
+		{name: "a shard doubling its count", sourceIndex: 2, sourceCount: 4, count: 8, want: []uint64{2, 6}},
+		{name: "a shard quadrupling its count", sourceIndex: 3, sourceCount: 8, count: 32, want: []uint64{3, 11, 19, 27}},
+		{name: "a shard keeping its count", sourceIndex: 1, sourceCount: 2, count: 2, want: []uint64{1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testutil.Equals(t, tc.want, ShardsToProduce(tc.sourceIndex, tc.sourceCount, tc.count))
+		})
+	}
 }
 
 func TestSourceShard(t *testing.T) {
-	_, count, err := SourceShard([]*metadata.Meta{metaWith(0, 0, map[string]string{"a": "b"}), metaWith(0, 0, map[string]string{"a": "b"})})
-	testutil.Ok(t, err)
-	testutil.Equals(t, uint64(0), count)
+	for _, tc := range []struct {
+		name string
 
-	index, count, err := SourceShard([]*metadata.Meta{
-		metaWith(0, 0, map[string]string{"a": "b", metadata.CompactorShardLabel: "3_of_4"}),
-		metaWith(0, 0, map[string]string{"a": "b", metadata.CompactorShardLabel: "3_of_4"}),
-	})
-	testutil.Ok(t, err)
-	testutil.Equals(t, uint64(2), index)
-	testutil.Equals(t, uint64(4), count)
+		metas []*metadata.Meta
 
-	_, _, err = SourceShard([]*metadata.Meta{
-		metaWith(0, 0, map[string]string{"a": "b", metadata.CompactorShardLabel: "3_of_4"}),
-		metaWith(0, 0, map[string]string{"a": "b"}),
-	})
-	testutil.NotOk(t, err)
+		wantIndex, wantCount uint64
+		wantErr              bool
+	}{
+		{
+			name: "unsplit sources",
+			metas: []*metadata.Meta{
+				metaWith(1, 0, 0, map[string]string{"a": "b"}),
+				metaWith(2, 0, 0, map[string]string{"a": "b"}),
+			},
+		},
+		{
+			name: "sources of one shard",
+			metas: []*metadata.Meta{
+				metaWith(1, 0, 0, map[string]string{"a": "b", metadata.CompactorShardLabel: "3_of_4"}),
+				metaWith(2, 0, 0, map[string]string{"a": "b", metadata.CompactorShardLabel: "3_of_4"}),
+			},
+			wantIndex: 2,
+			wantCount: 4,
+		},
+		{
+			name: "mixed shard and unsplit sources",
+			metas: []*metadata.Meta{
+				metaWith(1, 0, 0, map[string]string{"a": "b", metadata.CompactorShardLabel: "3_of_4"}),
+				metaWith(2, 0, 0, map[string]string{"a": "b"}),
+			},
+			wantErr: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			index, count, err := SourceShard(tc.metas)
+			if tc.wantErr {
+				testutil.NotOk(t, err)
+				return
+			}
+			testutil.Ok(t, err)
+			testutil.Equals(t, tc.wantIndex, index)
+			testutil.Equals(t, tc.wantCount, count)
+		})
+	}
 }
 
 func noopCounter() prometheus.Counter {
@@ -131,8 +179,7 @@ func (p fixedPlanner) Plan(context.Context, []*metadata.Meta, chan error, any) (
 }
 
 func rangeMeta(id int, lbls map[string]string, mint, maxt int64) *metadata.Meta {
-	m := metaWith(0, 0, lbls)
-	m.ULID = ulid.MustNew(uint64(id), nil)
+	m := metaWith(uint64(id), 0, 0, lbls)
 	m.MinTime, m.MaxTime = mint, maxt
 	return m
 }
@@ -249,13 +296,12 @@ func TestShardStragglerPlanner(t *testing.T) {
 func TestStreamShardCountFunc(t *testing.T) {
 	base := map[string]string{"tenant": "a"}
 	all := map[ulid.ULID]*metadata.Meta{}
-	for i, m := range []*metadata.Meta{
+	for _, m := range []*metadata.Meta{
 		rangeMeta(1, map[string]string{"tenant": "a", metadata.CompactorShardLabel: "1_of_4"}, 0, 1),
 		rangeMeta(2, map[string]string{"tenant": "a", metadata.CompactorShardLabel: "3_of_8"}, 1, 2),
 		rangeMeta(3, map[string]string{"tenant": "b", metadata.CompactorShardLabel: "1_of_16"}, 0, 1),
 		rangeMeta(4, base, 2, 3),
 	} {
-		_ = i
 		all[m.ULID] = m
 	}
 	downsampled := rangeMeta(5, map[string]string{"tenant": "a", metadata.CompactorShardLabel: "1_of_32"}, 0, 1)
@@ -263,14 +309,25 @@ func TestStreamShardCountFunc(t *testing.T) {
 	all[downsampled.ULID] = downsampled
 
 	f := StreamShardCountFunc(func() map[ulid.ULID]*metadata.Meta { return all })
-	unsplit := ShardRef{}
-	testutil.Equals(t, uint64(8), f(base, 0, unsplit))
-	testutil.Equals(t, uint64(32), f(base, 300000, unsplit))
-	testutil.Equals(t, uint64(0), f(map[string]string{"tenant": "c"}, 0, unsplit))
-	// A shard's lineage: 3 of 8 refines 3 of 4, but 1 of 4 does not.
-	testutil.Equals(t, uint64(8), f(base, 0, ShardRef{Index: 2, Count: 4}))
-	testutil.Equals(t, uint64(0), f(base, 0, ShardRef{Index: 1, Count: 4}))
-	testutil.Equals(t, uint64(0), f(base, 0, ShardRef{Index: 0, Count: 4}), "1 of 4 is present at count 4 only, which is not finer")
+	for _, tc := range []struct {
+		name       string
+		labels     map[string]string
+		resolution int64
+		source     ShardRef
+		want       uint64
+	}{
+		{name: "unsplit stream at raw resolution", labels: base, resolution: 0, source: ShardRef{}, want: 8},
+		{name: "unsplit stream at a downsampled resolution", labels: base, resolution: 300000, source: ShardRef{}, want: 32},
+		{name: "a stream without shards", labels: map[string]string{"tenant": "c"}, resolution: 0, source: ShardRef{}, want: 0},
+		// A shard's lineage: 3 of 8 refines 3 of 4, but 1 of 4 does not.
+		{name: "3 of 4 is refined by 3 of 8", labels: base, resolution: 0, source: ShardRef{Index: 2, Count: 4}, want: 8},
+		{name: "2 of 4 has no refinement", labels: base, resolution: 0, source: ShardRef{Index: 1, Count: 4}, want: 0},
+		{name: "1 of 4 is present at count 4 only, which is not finer", labels: base, resolution: 0, source: ShardRef{Index: 0, Count: 4}, want: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testutil.Equals(t, tc.want, f(tc.labels, tc.resolution, tc.source))
+		})
+	}
 }
 
 func TestSplitPlannerPlansSingleBlockGroups(t *testing.T) {
@@ -298,22 +355,38 @@ func TestPlannerNewestAcrossShards(t *testing.T) {
 		return func() map[ulid.ULID]*metadata.Meta { return all }
 	}
 
-	plain := &tsdbBasedPlanner{logger: log.NewNopLogger(), ranges: ranges, noCompBlocksFunc: noMarks}
-	plan, err := plain.Plan(t.Context(), group, nil, nil)
-	testutil.Ok(t, err)
-	testutil.Equals(t, 0, len(plan), "without the stream view the last range is the newest and is left alone")
-
-	streamAware := (&tsdbBasedPlanner{logger: log.NewNopLogger(), ranges: ranges, noCompBlocksFunc: noMarks}).
-		WithStreamNewestAcrossShards(view(rangeMeta(10, unsplit, 400, 500)))
-	plan, err = streamAware.Plan(t.Context(), group, nil, nil)
-	testutil.Ok(t, err)
-	testutil.Equals(t, 4, len(plan), "with a newer unsplit block in the stream the last range is planned")
-
-	sameStreamOnly := (&tsdbBasedPlanner{logger: log.NewNopLogger(), ranges: ranges, noCompBlocksFunc: noMarks}).
-		WithStreamNewestAcrossShards(view(rangeMeta(11, map[string]string{"tenant": "b"}, 400, 500)))
-	plan, err = sameStreamOnly.Plan(t.Context(), group, nil, nil)
-	testutil.Ok(t, err)
-	testutil.Equals(t, 0, len(plan), "a newer block of another stream does not count")
+	for _, tc := range []struct {
+		name string
+		// newer is the block the stream view adds to the group; nil means
+		// the planner has no stream view.
+		newer *metadata.Meta
+		want  int
+	}{
+		{
+			name: "without the stream view the last range is the newest and is left alone",
+			want: 0,
+		},
+		{
+			name:  "with a newer unsplit block in the stream the last range is planned",
+			newer: rangeMeta(10, unsplit, 400, 500),
+			want:  4,
+		},
+		{
+			name:  "a newer block of another stream does not count",
+			newer: rangeMeta(11, map[string]string{"tenant": "b"}, 400, 500),
+			want:  0,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &tsdbBasedPlanner{logger: log.NewNopLogger(), ranges: ranges, noCompBlocksFunc: noMarks}
+			if tc.newer != nil {
+				p = p.WithStreamNewestAcrossShards(view(tc.newer))
+			}
+			plan, err := p.Plan(t.Context(), group, nil, nil)
+			testutil.Ok(t, err)
+			testutil.Equals(t, tc.want, len(plan))
+		})
+	}
 }
 
 func TestStreamLeavesFunc(t *testing.T) {
@@ -339,23 +412,78 @@ func TestStreamLeavesFunc(t *testing.T) {
 	add(rangeMeta(8, base, 0, 400))
 
 	leaves := StreamLeavesFunc(func() map[ulid.ULID]*metadata.Meta { return all })
-	unsplit := ShardRef{}
-	got := leaves(base, 0, 100, 200, unsplit)
-	testutil.Equals(t, []ShardRef{{0, 4}, {1, 4}, {2, 8}, {3, 8}, {6, 8}, {7, 8}}, got, "present leaves plus the empty shard's part at the finest count")
-	testutil.Equals(t, "1_of_4", got[0].Label())
-
-	testutil.Equals(t, 0, len(leaves(base, 0, 300, 500, unsplit)), "a range no shard covers whole is a fresh split")
-	testutil.Equals(t, 0, len(leaves(map[string]string{"tenant": "c"}, 0, 100, 200, unsplit)))
-	testutil.Equals(t, []ShardRef{{0, 2}, {1, 2}}, leaves(base, 300000, 100, 200, unsplit), "the downsampled stream has its own leaves; the empty shard's part is added")
-
-	// A shard block of 4 of 4 is refined by 4 and 8 of 8 only; the 4-count
-	// shards of other indexes and the coarser 2-count one are not its lineage.
-	testutil.Equals(t, []ShardRef{{3, 8}, {7, 8}}, leaves(base, 0, 100, 200, ShardRef{3, 4}))
-	// A shard block of 1 of 4 has no finer shard covering it: not a straggler.
-	testutil.Equals(t, 0, len(leaves(base, 0, 100, 200, ShardRef{0, 4})))
-	// When only one of the two finer shards exists, the other's part is added.
-	delete(all, rangeMeta(4, nil, 0, 0).ULID)
-	testutil.Equals(t, []ShardRef{{3, 8}, {7, 8}}, leaves(base, 0, 100, 200, ShardRef{3, 4}))
+	for _, tc := range []struct {
+		name       string
+		stream     map[string]string
+		resolution int64
+		mint, maxt int64
+		source     ShardRef
+		want       []ShardRef
+		// wantFirstLabel, when set, is the label of the first leaf.
+		wantFirstLabel string
+	}{
+		{
+			name:           "present leaves plus the empty shard's part at the finest count",
+			stream:         base,
+			mint:           100,
+			maxt:           200,
+			want:           []ShardRef{{0, 4}, {1, 4}, {2, 8}, {3, 8}, {6, 8}, {7, 8}},
+			wantFirstLabel: "1_of_4",
+		},
+		{
+			name:   "a range no shard covers whole is a fresh split",
+			stream: base,
+			mint:   300,
+			maxt:   500,
+		},
+		{
+			name:   "a stream without shards has no leaves",
+			stream: map[string]string{"tenant": "c"},
+			mint:   100,
+			maxt:   200,
+		},
+		{
+			name:       "the downsampled stream has its own leaves; the empty shard's part is added",
+			stream:     base,
+			resolution: 300000,
+			mint:       100,
+			maxt:       200,
+			want:       []ShardRef{{0, 2}, {1, 2}},
+		},
+		{
+			// The 4-count shards of other indexes and the coarser 2-count one
+			// are not its lineage.
+			name:   "a shard block of 4 of 4 is refined by 4 and 8 of 8 only",
+			stream: base,
+			mint:   100,
+			maxt:   200,
+			source: ShardRef{3, 4},
+			want:   []ShardRef{{3, 8}, {7, 8}},
+		},
+		{
+			name:   "a shard block of 1 of 4 has no finer shard covering it: not a straggler",
+			stream: base,
+			mint:   100,
+			maxt:   200,
+			source: ShardRef{0, 4},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := leaves(tc.stream, tc.resolution, tc.mint, tc.maxt, tc.source)
+			if len(tc.want) == 0 {
+				testutil.Equals(t, 0, len(got))
+				return
+			}
+			testutil.Equals(t, tc.want, got)
+			if tc.wantFirstLabel != "" {
+				testutil.Equals(t, tc.wantFirstLabel, got[0].Label())
+			}
+		})
+	}
+	t.Run("when only one of the two finer shards exists, the other's part is added", func(t *testing.T) {
+		delete(all, rangeMeta(4, nil, 0, 0).ULID)
+		testutil.Equals(t, []ShardRef{{3, 8}, {7, 8}}, leaves(base, 0, 100, 200, ShardRef{3, 4}))
+	})
 }
 
 // TestSplitPlannerPlanOutputs: the planner decides what a plan produces, so an
@@ -378,18 +506,36 @@ func TestSplitPlannerPlanOutputs(t *testing.T) {
 		return func() map[ulid.ULID]*metadata.Meta { return all }
 	}
 	planner := func(conf SplitConfig, metrics *SplitMetrics, ms ...*metadata.Meta) OutputPlanner {
-		return WithBlockSplitting(fixedPlanner{}, log.NewNopLogger(), conf, metrics, objstore.NewInMemBucket(), promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"}), view(ms...), nil).(OutputPlanner)
+		return WithBlockSplitting(fixedPlanner{}, log.NewNopLogger(), conf, metrics, objstore.NewInMemBucket(), noopCounter(), view(ms...), nil).(OutputPlanner)
 	}
 	group := func(lbls map[string]string) *Group {
-		g, err := NewGroup(log.NewNopLogger(), nil, "k", labels.FromMap(lbls), 0, false, false,
-			nil, nil, nil, nil, nil, nil, nil, nil, metadata.NoneFunc, 1, 1)
+		g, err := NewGroup(
+			log.NewNopLogger(),
+			nil,
+			"k",
+			labels.FromMap(lbls),
+			0,
+			false,
+			false,
+			nil,
+			nil,
+			nil,
+			nil,
+			nil,
+			nil,
+			nil,
+			nil,
+			metadata.NoneFunc,
+			1,
+			1,
+		)
 		testutil.Ok(t, err)
 		return g
 	}
 	sources := func(lbls map[string]string, series uint64) []*metadata.Meta {
-		a := metaWith(0, series, lbls)
+		a := metaWith(100, 0, series, lbls)
 		a.MinTime, a.MaxTime = 0, 100
-		b := metaWith(0, series, lbls)
+		b := metaWith(101, 0, series, lbls)
 		b.MinTime, b.MaxTime = 100, 200
 		return []*metadata.Meta{a, b}
 	}
@@ -482,7 +628,7 @@ func TestSplitPlannerPlanOutputs(t *testing.T) {
 		}
 	})
 	t.Run("a shard group over the cap by index is an error here, refused by Plan before", func(t *testing.T) {
-		big := []*metadata.Meta{metaWith(40*gib, 0, shard("1_of_8")), metaWith(40*gib, 0, shard("1_of_8"))}
+		big := []*metadata.Meta{metaWith(100, 40*gib, 0, shard("1_of_8")), metaWith(101, 40*gib, 0, shard("1_of_8"))}
 		big[0].MinTime, big[0].MaxTime, big[1].MinTime, big[1].MaxTime = 0, 100, 100, 200
 		_, err := planner(SplitConfig{MaxShards: 8, MaxIndexSizeBytes: 64 * gib}, nil).PlanOutputs(ctx, group(shard("1_of_8")), big)
 		testutil.NotOk(t, err)
@@ -507,7 +653,7 @@ func TestSplitPlannerPlanOutputs(t *testing.T) {
 		testutil.Equals(t, &SeriesPartition{Index: 3, Count: 4}, out[2].Series)
 	})
 	t.Run("mixed shards are refused", func(t *testing.T) {
-		mixed := []*metadata.Meta{metaWith(0, 1, shard("1_of_2")), metaWith(0, 1, shard("2_of_2"))}
+		mixed := []*metadata.Meta{metaWith(100, 0, 1, shard("1_of_2")), metaWith(101, 0, 1, shard("2_of_2"))}
 		_, err := planner(conf, nil).PlanOutputs(ctx, group(base), mixed)
 		testutil.NotOk(t, err)
 	})
@@ -540,19 +686,16 @@ func (p candidatePlanner) Plan(_ context.Context, candidates []*metadata.Meta, _
 func TestSplitPlannerRefusesWhatTheCapCannotHold(t *testing.T) {
 	ctx := t.Context()
 	shard := map[string]string{"tenant": "a", metadata.CompactorShardLabel: "1_of_8"}
-	big := metaWith(150*gib, 0, shard)
-	big.ULID = ulid.MustNew(1, nil)
-	bigger := metaWith(160*gib, 0, shard)
-	bigger.ULID = ulid.MustNew(2, nil)
-	small := metaWith(20*gib, 0, shard)
-	small.ULID = ulid.MustNew(3, nil)
+	big := metaWith(1, 150*gib, 0, shard)
+	bigger := metaWith(2, 160*gib, 0, shard)
+	small := metaWith(3, 20*gib, 0, shard)
 	for i, m := range []*metadata.Meta{big, bigger, small} {
 		m.MinTime, m.MaxTime = int64(i*100), int64(i*100+100)
 	}
 	group := []*metadata.Meta{big, bigger, small}
 
 	bkt := objstore.NewInMemBucket()
-	marked := promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "marked"})
+	marked := noopCounter()
 	metrics := NewSplitMetrics(nil)
 	conf := SplitConfig{MaxShards: 8, MaxIndexSizeBytes: 64 * gib}
 	p := WithBlockSplitting(candidatePlanner{plan: group}, log.NewNopLogger(), conf, metrics, bkt, marked, func() map[ulid.ULID]*metadata.Meta { return nil }, nil)
@@ -566,12 +709,13 @@ func TestSplitPlannerRefusesWhatTheCapCannotHold(t *testing.T) {
 	testutil.Equals(t, 0, len(plan))
 	testutil.Equals(t, 2.0, promtestutil.ToFloat64(metrics.Fallbacks))
 	testutil.Equals(t, 2.0, promtestutil.ToFloat64(marked))
+	var ok bool
 	for _, m := range []*metadata.Meta{bigger, big} {
-		ok, err := bkt.Exists(ctx, m.ULID.String()+"/"+metadata.NoCompactMarkFilename)
+		ok, err = bkt.Exists(ctx, m.ULID.String()+"/"+metadata.NoCompactMarkFilename)
 		testutil.Ok(t, err)
 		testutil.Equals(t, true, ok, "block %s must be marked", m.ULID)
 	}
-	ok, err := bkt.Exists(ctx, small.ULID.String()+"/"+metadata.NoCompactMarkFilename)
+	ok, err = bkt.Exists(ctx, small.ULID.String()+"/"+metadata.NoCompactMarkFilename)
 	testutil.Ok(t, err)
 	testutil.Equals(t, false, ok)
 
@@ -589,18 +733,44 @@ func TestSplitPlannerLooksUpMissingIndexSizes(t *testing.T) {
 	ctx := t.Context()
 	bkt := objstore.NewInMemBucket()
 	base := map[string]string{"tenant": "a"}
-	a, b := metaWith(0, 0, base), metaWith(0, 0, base)
+	a, b := metaWith(1, 0, 0, base), metaWith(2, 0, 0, base)
 	a.MinTime, a.MaxTime, b.MinTime, b.MaxTime = 0, 100, 100, 200
 	// 40 bytes each in the bucket, nothing in the metadata: 80 bytes need two
 	// shards under a 64 byte limit with headroom.
 	for _, m := range []*metadata.Meta{a, b} {
 		testutil.Ok(t, bkt.Upload(ctx, m.ULID.String()+"/index", bytes.NewReader(make([]byte, 40))))
 	}
-	g, err := NewGroup(log.NewNopLogger(), nil, "k", labels.FromMap(base), 0, false, false,
-		nil, nil, nil, nil, nil, nil, nil, nil, metadata.NoneFunc, 1, 1)
+	g, err := NewGroup(
+		log.NewNopLogger(),
+		nil,
+		"k",
+		labels.FromMap(base),
+		0,
+		false,
+		false,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		metadata.NoneFunc,
+		1,
+		1,
+	)
 	testutil.Ok(t, err)
-	planner := WithBlockSplitting(fixedPlanner{}, log.NewNopLogger(), SplitConfig{MaxShards: 8, MaxIndexSizeBytes: 64}, nil, bkt,
-		promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"}), func() map[ulid.ULID]*metadata.Meta { return nil }, nil).(OutputPlanner)
+	planner := WithBlockSplitting(
+		fixedPlanner{},
+		log.NewNopLogger(),
+		SplitConfig{MaxShards: 8, MaxIndexSizeBytes: 64},
+		nil,
+		bkt,
+		noopCounter(),
+		func() map[ulid.ULID]*metadata.Meta { return nil },
+		nil,
+	).(OutputPlanner)
 	out, err := planner.PlanOutputs(ctx, g, []*metadata.Meta{a, b})
 	testutil.Ok(t, err)
 	testutil.Equals(t, 2, len(out), "80 bytes of index measured in the bucket need two shards")
@@ -608,7 +778,7 @@ func TestSplitPlannerLooksUpMissingIndexSizes(t *testing.T) {
 
 	// A block whose index is not in the bucket at all counts as unknown,
 	// and the compaction itself reports what is wrong with it.
-	c := metaWith(0, 0, base)
+	c := metaWith(3, 0, 0, base)
 	c.MinTime, c.MaxTime = 200, 300
 	out, err = planner.PlanOutputs(ctx, g, []*metadata.Meta{c})
 	testutil.Ok(t, err)
@@ -643,8 +813,16 @@ func TestSplitPlannerPlanSiblings(t *testing.T) {
 	for _, m := range []*metadata.Meta{a, c, d, other, unsplit} {
 		all[m.ULID] = m
 	}
-	planner := WithBlockSplitting(fixedPlanner{}, log.NewNopLogger(), SplitConfig{MaxShards: 8, MaxSeries: 100}, nil, objstore.NewInMemBucket(),
-		promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"}), func() map[ulid.ULID]*metadata.Meta { return all }, nil).(SiblingPlanner)
+	planner := WithBlockSplitting(
+		fixedPlanner{},
+		log.NewNopLogger(),
+		SplitConfig{MaxShards: 8, MaxSeries: 100},
+		nil,
+		objstore.NewInMemBucket(),
+		noopCounter(),
+		func() map[ulid.ULID]*metadata.Meta { return all },
+		nil,
+	).(SiblingPlanner)
 
 	got, err := planner.PlanSiblings(ctx, nil, []*metadata.Meta{a, other})
 	testutil.Ok(t, err)
@@ -746,9 +924,26 @@ func TestSplitPlannerSiblingsReachThePlan(t *testing.T) {
 	next := rangeMeta(3, shardLabels, 100, 200)
 	all := map[ulid.ULID]*metadata.Meta{a.ULID: a, b.ULID: b, next.ULID: next}
 
-	cnt := func() prometheus.Counter { return promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"}) }
-	cg, err := NewGroup(log.NewNopLogger(), objstore.NewInMemBucket(), "0@shard", labels.FromMap(shardLabels), 0, false, false,
-		cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), cnt(), metadata.NoneFunc, 1, 1)
+	cg, err := NewGroup(
+		log.NewNopLogger(),
+		objstore.NewInMemBucket(),
+		"0@shard",
+		labels.FromMap(shardLabels),
+		0,
+		false,
+		false,
+		noopCounter(),
+		noopCounter(),
+		noopCounter(),
+		noopCounter(),
+		noopCounter(),
+		noopCounter(),
+		noopCounter(),
+		noopCounter(),
+		metadata.NoneFunc,
+		1,
+		1,
+	)
 	testutil.Ok(t, err)
 	testutil.Ok(t, cg.AppendMeta(a))
 	testutil.Ok(t, cg.AppendMeta(next))

@@ -28,10 +28,12 @@ import (
 // eight shards per plan. The replica labels the corpus writes inside its
 // series are left out of the hash, as an operator with HA pairs behind a
 // receiver would, so both replicas of a series share a shard.
-var splitConfig = compact.SplitConfig{MaxShards: 8, MaxSeries: 4, HashWithout: []string{"prometheus_replica", "otelcol_replica"}}
+func splitConfig() compact.SplitConfig {
+	return compact.SplitConfig{MaxShards: 8, MaxSeries: 4, HashWithout: []string{"prometheus_replica", "otelcol_replica"}}
+}
 
 func withSplitting(c compacttest.NodeConfig) compacttest.NodeConfig {
-	c.Split = splitConfig
+	c.Split = splitConfig()
 	return c
 }
 
@@ -100,7 +102,7 @@ func splitScenarios() []compacttest.Scenario {
 						continue
 					}
 					shardBlocks++
-					testutil.Assert(t, count >= 2 && count <= uint64(splitConfig.MaxShards) && count&(count-1) == 0, "block %s has shard count %d", b.ID, count)
+					testutil.Assert(t, count >= 2 && count <= uint64(splitConfig().MaxShards) && count&(count-1) == 0, "block %s has shard count %d", b.ID, count)
 					base := labels.NewBuilder(labels.FromMap(b.Meta.Thanos.Labels)).Del(metadata.CompactorShardLabel).Labels().String()
 					k := rangeKey{base: base, res: b.Res, mint: b.MinT, maxt: b.MaxT}
 					if leaves[k] == nil {

@@ -156,7 +156,7 @@ func (c coverage) add(m *metadata.Meta) {
 		c[stream] = sc
 	}
 	if sc.shards[s] == nil {
-		sc.shards[s] = map[ulid.ULID]struct{}{}
+		sc.shards[s] = make(map[ulid.ULID]struct{}, len(m.Compaction.Sources))
 	}
 	for _, id := range m.Compaction.Sources {
 		sc.shards[s][id] = struct{}{}
@@ -188,7 +188,7 @@ func (sc *streamCoverage) coveredBy(s shardRef, m *metadata.Meta) bool {
 		return false
 	}
 	for _, id := range m.Compaction.Sources {
-		if _, ok := sources[id]; !ok {
+		if _, found := sources[id]; !found {
 			return false
 		}
 	}

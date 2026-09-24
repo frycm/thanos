@@ -86,9 +86,9 @@ func TestDeduplicateFilterWithShards(t *testing.T) {
 		{
 			name: "a re-split shard supersedes the coarser shards of its lineage only",
 			input: []*metadata.Meta{
-				meta(ULID(10), shard("1_of_2"), ULID(1)), // lineage of 1_of_4 and 3_of_4
+				meta(ULID(10), shard("1_of_2"), ULID(1)), // In the lineage of 1_of_4 and 3_of_4.
 				meta(ULID(11), shard("1_of_2"), ULID(2)),
-				meta(ULID(12), shard("2_of_2"), ULID(1)), // other lineage, must stay
+				meta(ULID(12), shard("2_of_2"), ULID(1)), // Another lineage; it must stay.
 				meta(ULID(20), shard("1_of_4"), ULID(1), ULID(2)),
 				meta(ULID(21), shard("3_of_4"), ULID(1), ULID(2)),
 			},
@@ -148,7 +148,7 @@ func TestDeduplicateFilterShardsSupersedeOnlyAsASet(t *testing.T) {
 		}
 		return m
 	}
-	run := func(input ...*metadata.Meta) []ulid.ULID {
+	run := func(t *testing.T, input ...*metadata.Meta) []ulid.ULID {
 		metas := map[ulid.ULID]*metadata.Meta{}
 		for _, m := range input {
 			metas[m.ULID] = m
@@ -159,30 +159,74 @@ func TestDeduplicateFilterShardsSupersedeOnlyAsASet(t *testing.T) {
 	}
 
 	set := []ulid.ULID{ULID(10), ULID(11)}
-	src1, src2 := meta(ULID(1), base, nil, ULID(1)), meta(ULID(2), base, nil, ULID(2))
-	testutil.Equals(t, ULIDs(1, 2, 10), run(src1, src2, meta(ULID(10), shard("1_of_2"), set, ULID(1), ULID(2))),
-		"one shard of two present: the sources stay")
-	testutil.Equals(t, ULIDs(10, 11), run(src1, src2, meta(ULID(10), shard("1_of_2"), set, ULID(1), ULID(2)), meta(ULID(11), shard("2_of_2"), set, ULID(1), ULID(2))),
-		"both shards present: the sources are superseded")
-
-	// The interrupted attempt left shard 1 behind; a later attempt produced
-	// both shards. The leftover, older ULID and all, is the duplicate.
 	later := []ulid.ULID{ULID(20), ULID(21)}
-	testutil.Equals(t, ULIDs(20, 21), run(src1, src2,
-		meta(ULID(10), shard("1_of_2"), set, ULID(1), ULID(2)),
-		meta(ULID(20), shard("1_of_2"), later, ULID(1), ULID(2)),
-		meta(ULID(21), shard("2_of_2"), later, ULID(1), ULID(2))))
-
-	// A planned shard that held no series is not in the set and not awaited.
 	only := []ulid.ULID{ULID(30)}
-	testutil.Equals(t, ULIDs(30), run(src1, src2, meta(ULID(30), shard("1_of_2"), only, ULID(1), ULID(2))))
-
-	// A shard re-split on its own - a block left behind its lineage's count
-	// - records the same sources as the finer shards made from it. The finer
-	// ones supersede it although it is older and still published.
 	finer := []ulid.ULID{ULID(40), ULID(41)}
-	testutil.Equals(t, ULIDs(11, 40, 41), run(
-		meta(ULID(10), shard("1_of_2"), set, ULID(1), ULID(2)), meta(ULID(11), shard("2_of_2"), set, ULID(1), ULID(2)),
-		meta(ULID(40), shard("1_of_8"), finer, ULID(1), ULID(2)), meta(ULID(41), shard("5_of_8"), finer, ULID(1), ULID(2))),
-		"1 of 8 and 5 of 8 supersede 1 of 2; 2 of 2 is another lineage")
+	src1, src2 := meta(ULID(1), base, nil, ULID(1)), meta(ULID(2), base, nil, ULID(2))
+	for _, tc := range []struct {
+		name     string
+		input    []*metadata.Meta
+		expected []ulid.ULID
+	}{
+		{
+			name: "one shard of two present: the sources stay",
+			input: []*metadata.Meta{
+				src1,
+				src2,
+				meta(ULID(10), shard("1_of_2"), set, ULID(1), ULID(2)),
+			},
+			expected: ULIDs(1, 2, 10),
+		},
+		{
+			name: "both shards present: the sources are superseded",
+			input: []*metadata.Meta{
+				src1,
+				src2,
+				meta(ULID(10), shard("1_of_2"), set, ULID(1), ULID(2)),
+				meta(ULID(11), shard("2_of_2"), set, ULID(1), ULID(2)),
+			},
+			expected: ULIDs(10, 11),
+		},
+		{
+			// The interrupted attempt left shard 1 behind; a later attempt
+			// produced both shards. The leftover, older ULID and all, is the
+			// duplicate.
+			name: "a later complete attempt supersedes an interrupted one",
+			input: []*metadata.Meta{
+				src1,
+				src2,
+				meta(ULID(10), shard("1_of_2"), set, ULID(1), ULID(2)),
+				meta(ULID(20), shard("1_of_2"), later, ULID(1), ULID(2)),
+				meta(ULID(21), shard("2_of_2"), later, ULID(1), ULID(2)),
+			},
+			expected: ULIDs(20, 21),
+		},
+		{
+			name: "a planned shard that held no series is not in the set and not awaited",
+			input: []*metadata.Meta{
+				src1,
+				src2,
+				meta(ULID(30), shard("1_of_2"), only, ULID(1), ULID(2)),
+			},
+			expected: ULIDs(30),
+		},
+		{
+			// A shard re-split on its own - a block left behind its lineage's
+			// count - records the same sources as the finer shards made from
+			// it. The finer ones supersede it although it is older and still
+			// published.
+			name: "1 of 8 and 5 of 8 supersede 1 of 2; 2 of 2 is another lineage",
+			input: []*metadata.Meta{
+				meta(ULID(10), shard("1_of_2"), set, ULID(1), ULID(2)),
+				meta(ULID(11), shard("2_of_2"), set, ULID(1), ULID(2)),
+				meta(ULID(40), shard("1_of_8"), finer, ULID(1), ULID(2)),
+				meta(ULID(41), shard("5_of_8"), finer, ULID(1), ULID(2)),
+			},
+			expected: ULIDs(11, 40, 41),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testutil.Equals(t, tc.expected, run(t, tc.input...))
+		})
+	}
 }
