@@ -5,6 +5,7 @@ package compact
 
 import (
 	"context"
+	"maps"
 	"slices"
 
 	"github.com/cespare/xxhash/v2"
@@ -183,12 +184,7 @@ func SetSiblings(view map[ulid.ULID]*metadata.Meta, sources []*metadata.Meta) []
 			collect(m.Thanos.Output.Blocks)
 		}
 	}
-	out := make([]ulid.ULID, 0, len(siblings))
-	for id := range siblings {
-		out = append(out, id)
-	}
-	slices.SortFunc(out, func(a, b ulid.ULID) int { return a.Compare(b) })
-	return out
+	return slices.SortedFunc(maps.Keys(siblings), func(a, b ulid.ULID) int { return a.Compare(b) })
 }
 
 // SingleBlockPlanner is implemented by planners that can have work for a
