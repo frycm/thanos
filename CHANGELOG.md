@@ -16,6 +16,7 @@ It is recommend to upgrade the storage components first (Receive, Store, etc.) a
 
 - [#8667](https://github.com/thanos-io/thanos/pull/8667): Query: fix data race in GetStoreClients by making endpointRef mutex a pointer
 - [#XXXX](https://github.com/thanos-io/thanos/pull/XXXX) Compact: penalty deduplication no longer drops samples when the replicas' chunk boundaries do not line up, and no longer drops chunks of another encoding.
+- [#XXXX](https://github.com/thanos-io/thanos/pull/XXXX) Compact: penalty deduplication of downsampled blocks no longer drops the first sum, min, max and counter sample of each output chunk after the first.
 
 ### Added
 
