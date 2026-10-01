@@ -572,16 +572,17 @@ func testCompactWithStoreGateway(t *testing.T, penaltyDedup bool) {
 			{Value: 120, Metric: map[model.LabelName]model.LabelValue{"a": "1", "b": "5", "case": "compaction-ready-after-dedup"}},
 			{Value: 120, Metric: map[model.LabelName]model.LabelValue{"a": "1", "b": "6", "case": "compaction-ready-after-dedup", "replica": "1"}},
 			{Value: 120, Metric: map[model.LabelName]model.LabelValue{"a": "1", "b": "1", "case": "a-partial-overlap-dedup-ready"}},
-			// If no penalty dedup enabled, the value should be 360.
-			{Value: 200, Metric: map[model.LabelName]model.LabelValue{"a": "1", "b": "2", "case": "a-partial-overlap-dedup-ready"}},
+			// If no penalty dedup enabled, the value should be 360. The penalty algorithm restarts at each group of
+			// overlapping chunks, so this keeps a few more samples than the 199 a querier deduplicating the whole range returns.
+			{Value: 202, Metric: map[model.LabelName]model.LabelValue{"a": "1", "b": "2", "case": "a-partial-overlap-dedup-ready"}},
 			{Value: 120, Metric: map[model.LabelName]model.LabelValue{"a": "1", "b": "2", "case": "a-partial-overlap-dedup-ready", "replica": "1"}},
 			{Value: 120, Metric: map[model.LabelName]model.LabelValue{"a": "1", "b": "3", "case": "a-partial-overlap-dedup-ready"}},
 			{Value: 120, Metric: map[model.LabelName]model.LabelValue{"a": "1", "b": "4", "case": "a-partial-overlap-dedup-ready"}},
 			{Value: 120, Metric: map[model.LabelName]model.LabelValue{"a": "1", "b": "5", "case": "a-partial-overlap-dedup-ready", "replica": "1"}},
 			{Value: 120, Metric: map[model.LabelName]model.LabelValue{"a": "1", "b": "1", "case": "partial-multi-replica-overlap-dedup-ready"}},
 			{Value: 120, Metric: map[model.LabelName]model.LabelValue{"a": "1", "b": "2", "case": "partial-multi-replica-overlap-dedup-ready", "replica": "1", "rule_replica": "1"}},
-			// If no penalty dedup enabled, the value should be 240.
-			{Value: 195, Metric: map[model.LabelName]model.LabelValue{"a": "1", "b": "2", "case": "partial-multi-replica-overlap-dedup-ready"}},
+			// If no penalty dedup enabled, the value should be 240. This equals what a querier deduplicating the whole range returns.
+			{Value: 199, Metric: map[model.LabelName]model.LabelValue{"a": "1", "b": "2", "case": "partial-multi-replica-overlap-dedup-ready"}},
 			{Value: 120, Metric: map[model.LabelName]model.LabelValue{"a": "1", "b": "3", "case": "partial-multi-replica-overlap-dedup-ready"}},
 			{Value: 120, Metric: map[model.LabelName]model.LabelValue{"a": "1", "b": "4", "case": "partial-multi-replica-overlap-dedup-ready"}},
 			{Value: 120, Metric: map[model.LabelName]model.LabelValue{"a": "1", "b": "5", "case": "partial-multi-replica-overlap-dedup-ready", "replica": "1", "rule_replica": "1"}},
@@ -828,8 +829,7 @@ func testCompactWithStoreGateway(t *testing.T, penaltyDedup bool) {
 		// pre-aggregated sum/count should be used.
 		testutil.Ok(t, block.Delete(ctx, log.NewNopLogger(), bkt, downsampledRawID))
 
-		testutil.Ok(t, str.Stop())
-		testutil.Ok(t, e2e.StartAndWaitReady(str))
+		testutil.Ok(t, e2ethanos.Restart(e, str))
 		testutil.Ok(t, runutil.Retry(time.Second, ctx.Done(), func() error {
 			return str.WaitSumMetricsWithOptions(
 				e2emon.Equals(20),

@@ -7,6 +7,8 @@ import (
 	"bytes"
 	"container/heap"
 
+	"github.com/pkg/errors"
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
@@ -16,6 +18,13 @@ import (
 
 // NewChunkSeriesMerger merges several chunk series into one.
 // Deduplication is based on penalty based deduplication algorithm without handling counter reset.
+//
+// A chunk that overlaps no other chunk is passed through as it is. Chunks that
+// overlap, directly or through a chain of overlaps, are deduplicated together:
+// the chunks each input series has among them are read as one series, those
+// series are deduplicated with the penalty algorithm the querier uses,
+// preferring them in the order the input series are given, and the result is
+// encoded into new chunks.
 func NewChunkSeriesMerger() storage.VerticalChunkSeriesMergeFunc {
 	return func(series ...storage.ChunkSeries) storage.ChunkSeries {
 		if len(series) == 0 {
@@ -40,91 +49,120 @@ type dedupChunksIterator struct {
 	iterators []chunks.Iterator
 	h         chunkIteratorHeap
 
+	// group is the current group of overlapping chunks.
+	group []groupChunk
+	// merged holds the chunks deduplicated from the current group that are
+	// yet to be returned.
+	merged chunks.Iterator
+
 	err  error
 	curr chunks.Meta
+}
+
+// groupChunk is a chunk of a group of overlapping chunks, along with the
+// index of the input series it comes from.
+type groupChunk struct {
+	chunks.Meta
+	input int
 }
 
 func (d *dedupChunksIterator) At() chunks.Meta {
 	return d.curr
 }
 
-// Next method is almost the same as https://github.com/prometheus/prometheus/blob/v2.27.1/storage/merge.go#L615.
+// Next method is based on https://github.com/prometheus/prometheus/blob/v2.27.1/storage/merge.go#L615.
 // The difference is that it handles both XOR/Histogram/FloatHistogram and Aggr chunk Encoding.
 func (d *dedupChunksIterator) Next() bool {
 	if d.h == nil {
-		for _, iter := range d.iterators {
+		d.h = make(chunkIteratorHeap, 0, len(d.iterators))
+		for i, iter := range d.iterators {
 			if iter.Next() {
-				heap.Push(&d.h, iter)
+				heap.Push(&d.h, &inputChunkIterator{Iterator: iter, input: i})
 			}
 		}
 	}
-	if len(d.h) == 0 {
-		return false
-	}
-
-	iter := heap.Pop(&d.h).(chunks.Iterator)
-	d.curr = iter.At()
-	if iter.Next() {
-		heap.Push(&d.h, iter)
-	}
-
-	var (
-		om       = newOverlappingMerger()
-		oMaxTime = d.curr.MaxTime
-		prev     = d.curr
-	)
-
-	// Detect overlaps to compact.
-	for len(d.h) > 0 {
-		// Get the next oldest chunk by min, then max time.
-		next := d.h[0].At()
-		if next.MinTime > oMaxTime {
-			// No overlap with current one.
-			break
+	for {
+		if d.merged != nil {
+			if d.merged.Next() {
+				d.curr = d.merged.At()
+				return true
+			}
+			if d.err = d.merged.Err(); d.err != nil {
+				return false
+			}
+			d.merged = nil
+		}
+		if len(d.h) == 0 {
+			return false
 		}
 
+		d.nextGroup()
+		if len(d.group) == 1 {
+			// No overlap, the chunk is passed through as it is.
+			d.curr = d.group[0].Meta
+			return true
+		}
+		d.merged = mergeOverlappingChunks(d.group, len(d.iterators))
+	}
+}
+
+// nextGroup collects the oldest chunk left and every chunk that overlaps it,
+// directly or through a chain of overlaps, in the order of their min time.
+func (d *dedupChunksIterator) nextGroup() {
+	first := d.popChunk()
+	d.group = append(d.group[:0], first)
+
+	maxTime, prev := first.MaxTime, first.Meta
+	for len(d.h) > 0 {
+		// Get the next oldest chunk by min, then max time.
+		if d.h[0].At().MinTime > maxTime {
+			// No overlap with the group.
+			break
+		}
+		next := d.popChunk()
 		if next.MinTime == prev.MinTime &&
 			next.MaxTime == prev.MaxTime &&
 			bytes.Equal(next.Chunk.Bytes(), prev.Chunk.Bytes()) {
 			// 1:1 duplicates, skip it.
-		} else {
-			// We operate on same series, so labels does not matter here.
-			om.addChunk(next)
-
-			if next.MaxTime > oMaxTime {
-				oMaxTime = next.MaxTime
-			}
-			prev = next
+			continue
 		}
+		d.group = append(d.group, next)
+		maxTime = max(maxTime, next.MaxTime)
+		prev = next.Meta
+	}
+}
 
-		iter := heap.Pop(&d.h).(chunks.Iterator)
-		if iter.Next() {
-			heap.Push(&d.h, iter)
-		}
-	}
-	if om.empty() {
-		return true
-	}
-
-	iter = om.iterator(d.curr)
-	if !iter.Next() {
-		if d.err = iter.Err(); d.err != nil {
-			return false
-		}
-		panic("unexpected seriesToChunkEncoder lack of iterations")
-	}
-	d.curr = iter.At()
+// popChunk returns the oldest chunk left and advances the iterator it comes from.
+func (d *dedupChunksIterator) popChunk() groupChunk {
+	iter := d.h[0]
+	chk := groupChunk{Meta: iter.At(), input: iter.input}
 	if iter.Next() {
-		heap.Push(&d.h, iter)
+		heap.Fix(&d.h, 0)
+	} else {
+		heap.Pop(&d.h)
 	}
-	return true
+	return chk
 }
 
 func (d *dedupChunksIterator) Err() error {
-	return d.err
+	if d.err != nil {
+		return d.err
+	}
+	for _, iter := range d.iterators {
+		if err := iter.Err(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-type chunkIteratorHeap []chunks.Iterator
+// inputChunkIterator iterates over the chunks of one input series.
+type inputChunkIterator struct {
+	chunks.Iterator
+	input int
+}
+
+type chunkIteratorHeap []*inputChunkIterator
 
 func (h chunkIteratorHeap) Len() int      { return len(h) }
 func (h chunkIteratorHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
@@ -133,13 +171,16 @@ func (h chunkIteratorHeap) Less(i, j int) bool {
 	at := h[i].At()
 	bt := h[j].At()
 	if at.MinTime == bt.MinTime {
+		if at.MaxTime == bt.MaxTime {
+			return h[i].input < h[j].input
+		}
 		return at.MaxTime < bt.MaxTime
 	}
 	return at.MinTime < bt.MinTime
 }
 
 func (h *chunkIteratorHeap) Push(x any) {
-	*h = append(*h, x.(chunks.Iterator))
+	*h = append(*h, x.(*inputChunkIterator))
 }
 
 func (h *chunkIteratorHeap) Pop() any {
@@ -150,117 +191,182 @@ func (h *chunkIteratorHeap) Pop() any {
 	return x
 }
 
-type overlappingMerger struct {
-	xorIterators       []chunkenc.Iterator
-	histIterators      []chunkenc.Iterator
-	floatHistIterators []chunkenc.Iterator
-	aggrIterators      [5][]chunkenc.Iterator
+// mergeOverlappingChunks deduplicates a group of overlapping chunks of the
+// given number of input series. The chunks of each input series are read as
+// one series, and those series are deduplicated with the penalty algorithm,
+// in the order of the input series, the same way the querier deduplicates
+// replicas (see dedupSeries).
+//
+// Merging the chunks pairwise instead would treat the next chunk of the same
+// input series as another replica: when the first chunk ends, the penalty the
+// next one got as a replica would skip samples that both input series have.
+func mergeOverlappingChunks(group []groupChunk, numInputs int) chunks.Iterator {
+	// Raw and downsampled chunks are never compacted together; the oldest
+	// chunk decides which ones are deduplicated.
+	isAggr := group[0].Chunk.Encoding() == downsample.ChunkEncAggr
 
-	samplesMergeFunc func(a, b chunkenc.Iterator) chunkenc.Iterator
-}
-
-func newOverlappingMerger() *overlappingMerger {
-	return &overlappingMerger{
-		samplesMergeFunc: func(a, b chunkenc.Iterator) chunkenc.Iterator {
-			return newDedupSeriesIterator(
-				noopAdjustableSeriesIterator{a},
-				noopAdjustableSeriesIterator{b},
-			)
-		},
+	perInput := make([][]chunks.Meta, numInputs)
+	for _, chk := range group {
+		switch chk.Chunk.Encoding() {
+		case chunkenc.EncXOR, chunkenc.EncHistogram, chunkenc.EncFloatHistogram:
+			if isAggr {
+				continue
+			}
+		case downsample.ChunkEncAggr:
+			if !isAggr {
+				continue
+			}
+		default:
+			continue
+		}
+		perInput[chk.input] = append(perInput[chk.input], chk.Meta)
 	}
+
+	if isAggr {
+		return mergeAggrChunks(perInput)
+	}
+	return storage.NewSeriesToChunkEncoder(&storage.SeriesEntry{
+		SampleIteratorFn: func(chunkenc.Iterator) chunkenc.Iterator {
+			replicas := make([]adjustableSeriesIterator, 0, len(perInput))
+			for _, metas := range perInput {
+				if len(metas) == 0 {
+					continue
+				}
+				chks := make([]chunkenc.Chunk, 0, len(metas))
+				for _, m := range metas {
+					chks = append(chks, m.Chunk)
+				}
+				replicas = append(replicas, newReplicaIterator(chks, overlapping(metas)))
+			}
+			if len(replicas) == 0 {
+				return chunkenc.NewNopIterator()
+			}
+			return newPenaltyDedupIterator(replicas)
+		},
+	}).Iterator(nil)
 }
 
-func (o *overlappingMerger) addChunk(chk chunks.Meta) {
-	switch chk.Chunk.Encoding() {
-	case chunkenc.EncXOR:
-		o.xorIterators = append(o.xorIterators, chk.Chunk.Iterator(nil))
-	case chunkenc.EncFloatHistogram:
-		o.floatHistIterators = append(o.floatHistIterators, chk.Chunk.Iterator(nil))
-	case chunkenc.EncHistogram:
-		o.histIterators = append(o.histIterators, chk.Chunk.Iterator(nil))
-	case downsample.ChunkEncAggr:
-		aggrChk := chk.Chunk.(*downsample.AggrChunk)
-		for i := downsample.AggrCount; i <= downsample.AggrCounter; i++ {
-			if c, err := aggrChk.Get(i); err == nil {
-				o.aggrIterators[i] = append(o.aggrIterators[i], c.Iterator(nil))
+// mergeAggrChunks deduplicates each aggregate of the downsampled chunks of a
+// group on its own, and encodes the results into aggregated chunks.
+func mergeAggrChunks(perInput [][]chunks.Meta) chunks.Iterator {
+	var samplesIter [5]chunkenc.Iterator
+	for at := downsample.AggrCount; at <= downsample.AggrCounter; at++ {
+		var replicas []adjustableSeriesIterator
+		for _, metas := range perInput {
+			var chks []chunkenc.Chunk
+			for _, m := range metas {
+				aggrChk, ok := m.Chunk.(*downsample.AggrChunk)
+				if !ok {
+					continue
+				}
+				if c, err := aggrChk.Get(at); err == nil {
+					chks = append(chks, c)
+				}
+			}
+			if len(chks) > 0 {
+				replicas = append(replicas, newReplicaIterator(chks, overlapping(metas)))
 			}
 		}
-	case chunkenc.EncNone:
-	default:
-		// exhausted options for chunk
-		return
+		if len(replicas) > 0 {
+			samplesIter[at] = newPenaltyDedupIterator(replicas)
+		}
+	}
+	if samplesIter[downsample.AggrCount] == nil {
+		return errChunksIterator{err: errors.New("deduplicate downsampled chunks: no count aggregate")}
+	}
+	return newAggrChunkIterator(samplesIter)
+}
+
+// overlapping reports whether any of the chunks, sorted by min time, overlap.
+func overlapping(metas []chunks.Meta) bool {
+	for i := 1; i < len(metas); i++ {
+		// As long as no chunks overlap, the previous one ends last.
+		if metas[i].MinTime <= metas[i-1].MaxTime {
+			return true
+		}
+	}
+	return false
+}
+
+// newReplicaIterator returns an iterator over the samples of the chunks one
+// input series has in a group, sorted by min time. They are normally
+// consecutive and are read one after another; overlapping ones are merged
+// by timestamp, keeping one sample per timestamp.
+func newReplicaIterator(chks []chunkenc.Chunk, overlapping bool) adjustableSeriesIterator {
+	if len(chks) == 1 {
+		return noopAdjustableSeriesIterator{chks[0].Iterator(nil)}
+	}
+	if overlapping {
+		iters := make([]chunkenc.Iterator, 0, len(chks))
+		for _, c := range chks {
+			iters = append(iters, c.Iterator(nil))
+		}
+		return noopAdjustableSeriesIterator{storage.ChainSampleIteratorFromIterators(nil, iters)}
+	}
+	return noopAdjustableSeriesIterator{&consecutiveChunksIterator{chks: chks, curr: chks[0].Iterator(nil)}}
+}
+
+// consecutiveChunksIterator iterates over the samples of chunks that follow
+// each other in time without overlapping.
+type consecutiveChunksIterator struct {
+	chks []chunkenc.Chunk
+	i    int
+	curr chunkenc.Iterator
+}
+
+func (it *consecutiveChunksIterator) Next() chunkenc.ValueType {
+	for {
+		if vt := it.curr.Next(); vt != chunkenc.ValNone || !it.nextChunk() {
+			return vt
+		}
 	}
 }
 
-func (o *overlappingMerger) empty() bool {
-	if len(o.xorIterators) > 0 || len(o.histIterators) > 0 || len(o.floatHistIterators) > 0 {
+func (it *consecutiveChunksIterator) Seek(t int64) chunkenc.ValueType {
+	for {
+		if vt := it.curr.Seek(t); vt != chunkenc.ValNone || !it.nextChunk() {
+			return vt
+		}
+	}
+}
+
+// nextChunk moves on to the next chunk, unless the current one failed or is the last one.
+func (it *consecutiveChunksIterator) nextChunk() bool {
+	if it.curr.Err() != nil || it.i+1 >= len(it.chks) {
 		return false
 	}
-	return len(o.aggrIterators[downsample.AggrCount]) == 0
+	it.i++
+	it.curr = it.chks[it.i].Iterator(nil)
+	return true
 }
 
-// Return a chunk iterator based on the encoding of base chunk.
-func (o *overlappingMerger) iterator(baseChk chunks.Meta) chunks.Iterator {
-	var it chunkenc.Iterator
-	switch baseChk.Chunk.Encoding() {
-	case chunkenc.EncXOR:
-		// If XOR encoding, we need to deduplicate the samples and re-encode them to chunks.
-		return storage.NewSeriesToChunkEncoder(&storage.SeriesEntry{
-			SampleIteratorFn: func(_ chunkenc.Iterator) chunkenc.Iterator {
-				it = baseChk.Chunk.Iterator(nil)
-				for _, i := range o.xorIterators {
-					it = o.samplesMergeFunc(it, i)
-				}
-				return it
-			}}).Iterator(nil)
-
-	case chunkenc.EncHistogram:
-		return storage.NewSeriesToChunkEncoder(&storage.SeriesEntry{
-			SampleIteratorFn: func(_ chunkenc.Iterator) chunkenc.Iterator {
-				it = baseChk.Chunk.Iterator(nil)
-				for _, i := range o.histIterators {
-					it = o.samplesMergeFunc(it, i)
-				}
-				return it
-			},
-		}).Iterator(nil)
-
-	case chunkenc.EncFloatHistogram:
-		return storage.NewSeriesToChunkEncoder(&storage.SeriesEntry{
-			SampleIteratorFn: func(_ chunkenc.Iterator) chunkenc.Iterator {
-				it = baseChk.Chunk.Iterator(nil)
-				for _, i := range o.floatHistIterators {
-					it = o.samplesMergeFunc(it, i)
-				}
-				return it
-			},
-		}).Iterator(nil)
-
-	case downsample.ChunkEncAggr:
-		// If Aggr encoding, each aggregated chunks need to be expanded and deduplicated,
-		// then re-encoded into Aggr chunks.
-		aggrChk := baseChk.Chunk.(*downsample.AggrChunk)
-		samplesIter := [5]chunkenc.Iterator{}
-		for i := downsample.AggrCount; i <= downsample.AggrCounter; i++ {
-			if c, err := aggrChk.Get(i); err == nil {
-				o.aggrIterators[i] = append(o.aggrIterators[i], c.Iterator(nil))
-			}
-
-			if len(o.aggrIterators[i]) > 0 {
-				for _, j := range o.aggrIterators[i][1:] {
-					o.aggrIterators[i][0] = o.samplesMergeFunc(o.aggrIterators[i][0], j)
-				}
-				samplesIter[i] = o.aggrIterators[i][0]
-			} else {
-				samplesIter[i] = nil
-			}
-		}
-
-		return newAggrChunkIterator(samplesIter)
-	default:
-		return nil
-	}
+func (it *consecutiveChunksIterator) At() (int64, float64) {
+	return it.curr.At()
 }
+
+func (it *consecutiveChunksIterator) AtHistogram(h *histogram.Histogram) (int64, *histogram.Histogram) {
+	return it.curr.AtHistogram(h)
+}
+
+func (it *consecutiveChunksIterator) AtFloatHistogram(fh *histogram.FloatHistogram) (int64, *histogram.FloatHistogram) {
+	return it.curr.AtFloatHistogram(fh)
+}
+
+func (it *consecutiveChunksIterator) AtT() int64 {
+	return it.curr.AtT()
+}
+
+func (it *consecutiveChunksIterator) Err() error {
+	return it.curr.Err()
+}
+
+type errChunksIterator struct {
+	err error
+}
+
+func (errChunksIterator) At() chunks.Meta { return chunks.Meta{} }
+func (errChunksIterator) Next() bool      { return false }
+func (e errChunksIterator) Err() error    { return e.err }
 
 type aggrChunkIterator struct {
 	iters        [5]chunkenc.Iterator

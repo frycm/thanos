@@ -199,23 +199,25 @@ func (s *dedupSeries) Labels() labels.Labels {
 }
 
 func (s *dedupSeries) Iterator(_ chunkenc.Iterator) chunkenc.Iterator {
-	var it adjustableSeriesIterator
-	if s.isCounter {
-		it = &counterErrAdjustSeriesIterator{Iterator: s.replicas[0].Iterator(nil)}
-	} else {
-		it = noopAdjustableSeriesIterator{Iterator: s.replicas[0].Iterator(nil)}
-	}
-
-	for _, o := range s.replicas[1:] {
-		var replicaIter adjustableSeriesIterator
+	replicas := make([]adjustableSeriesIterator, 0, len(s.replicas))
+	for _, o := range s.replicas {
 		if s.isCounter {
-			replicaIter = &counterErrAdjustSeriesIterator{Iterator: o.Iterator(nil)}
+			replicas = append(replicas, &counterErrAdjustSeriesIterator{Iterator: o.Iterator(nil)})
 		} else {
-			replicaIter = noopAdjustableSeriesIterator{Iterator: o.Iterator(nil)}
+			replicas = append(replicas, noopAdjustableSeriesIterator{Iterator: o.Iterator(nil)})
 		}
-		it = newDedupSeriesIterator(it, replicaIter)
 	}
+	return newPenaltyDedupIterator(replicas)
+}
 
+// newPenaltyDedupIterator deduplicates replicas of a series with the penalty
+// algorithm. Of replicas with a sample at the same time, the one given first
+// is preferred. It expects at least one replica.
+func newPenaltyDedupIterator(replicas []adjustableSeriesIterator) adjustableSeriesIterator {
+	it := replicas[0]
+	for _, r := range replicas[1:] {
+		it = newDedupSeriesIterator(it, r)
+	}
 	return it
 }
 
