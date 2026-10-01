@@ -80,6 +80,9 @@ func registerReceive(app *extkingpin.App) {
 		if lset.Len() == 0 {
 			return errors.New("no external labels configured for receive, uniquely identifying external labels must be configured (ideally with `receive_` prefix); see https://thanos.io/tip/thanos/storage.md#external-labels for details.")
 		}
+		if err := validateSeriesReplicaLabelName(conf, lset); err != nil {
+			return err
+		}
 
 		grpcLogOpts, logFilterMethods, err := logging.ParsegRPCOptions(conf.reqLogConfig)
 
@@ -145,6 +148,7 @@ func runReceive(
 	multiTSDBOptions := []receive.MultiTSDBOption{
 		receive.WithHeadExpandedPostingsCacheSize(conf.headExpandedPostingsCacheSize),
 		receive.WithBlockExpandedPostingsCacheSize(conf.compactedBlocksExpandedPostingsCacheSize),
+		receive.WithSeriesReplicaLabelName(conf.seriesReplicaLabelName),
 	}
 	for _, feature := range *conf.featureList {
 		if feature == metricNamesFilter {
@@ -296,6 +300,7 @@ func runReceive(
 		ReplicationProtocol:     receive.ReplicationProtocol(conf.replicationProtocol),
 		OtlpEnableTargetInfo:    conf.otlpEnableTargetInfo,
 		OtlpResourceAttributes:  conf.otlpResourceAttributes,
+		SeriesReplicaLabelName:  conf.seriesReplicaLabelName,
 	})
 
 	grpcProbe := prober.NewGRPC()
@@ -828,6 +833,23 @@ func startTSDBAndUpload(g *run.Group,
 	return nil
 }
 
+func validateSeriesReplicaLabelName(conf *receiveConfig, lset labels.Labels) error {
+	name := conf.seriesReplicaLabelName
+	switch {
+	case name == "":
+		return nil
+	case !model.LegacyValidation.IsValidLabelName(name):
+		return errors.Errorf("unsupported format for series replica label name %q, must match [a-zA-Z_][a-zA-Z0-9_]*", name)
+	case name == conf.tenantLabelName:
+		return errors.Errorf("series replica label name %q must differ from --receive.tenant-label-name", name)
+	case name == conf.splitTenantLabelName:
+		return errors.Errorf("series replica label name %q must differ from --receive.split-tenant-label-name", name)
+	case lset.Has(name):
+		return errors.Errorf("series replica label name %q must differ from the names of --label", name)
+	}
+	return nil
+}
+
 func createDefautTenantTSDB(logger log.Logger, dataDir, defaultTenantID string) error {
 	defaultTenantDataDir := path.Join(dataDir, defaultTenantID)
 
@@ -911,6 +933,8 @@ type receiveConfig struct {
 	noLockFile           bool
 	writerInterning      bool
 	splitTenantLabelName string
+
+	seriesReplicaLabelName string
 
 	hashFunc string
 
@@ -1002,6 +1026,14 @@ func (rc *receiveConfig) registerFlag(cmd extkingpin.FlagClause) {
 	cmd.Flag("receive.split-tenant-label-name", "Label name through which the request will be split into multiple tenants. This takes precedence over the HTTP header.").Default("").StringVar(&rc.splitTenantLabelName)
 
 	cmd.Flag("receive.tenant-label-name", "Label name through which the tenant will be announced.").Default(tenancy.DefaultTenantLabel).StringVar(&rc.tenantLabelName)
+
+	cmd.Flag("receive.series-replica-label-name", "Name of a series label identifying the HA replica (e.g. Prometheus) that sent the series. "+
+		"A series with a non-empty value of this label is written, without the label, to a TSDB dedicated to its tenant and that value, "+
+		"whose external labels are those of the tenant's TSDB plus this label. "+
+		"The tenant is determined as without this flag (from the tenant header, the default tenant or receive.split-tenant-label-name, which is applied first); "+
+		"series without the label go to the tenant's TSDB. Series are routed by their labels without this label. "+
+		"Set it on routers and ingestors, and deduplicate the replicas with the compactor's deduplication.replica-label and the querier's query.replica-label.").
+		Default("").StringVar(&rc.seriesReplicaLabelName)
 
 	cmd.Flag("receive.replica-header", "HTTP header specifying the replica number of a write request.").Default(receive.DefaultReplicaHeader).StringVar(&rc.replicaHeader)
 

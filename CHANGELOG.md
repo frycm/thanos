@@ -14,7 +14,11 @@ It is recommend to upgrade the storage components first (Receive, Store, etc.) a
 
 ### Fixed
 
+- [#8667](https://github.com/thanos-io/thanos/pull/8667): Query: fix data race in GetStoreClients by making endpointRef mutex a pointer
+
 ### Added
+
+- [#XXXX](https://github.com/thanos-io/thanos/pull/XXXX) Receive: `--receive.series-replica-label-name` moves an in-series replica label into the external labels of a per-replica TSDB of the same tenant, so the compactor can deduplicate HA replicas written through Receive.
 
 ### Changed
 

@@ -5,6 +5,7 @@ package receive
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"maps"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +23,7 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
@@ -61,13 +64,23 @@ type MultiTSDB struct {
 	labels          labels.Labels
 	bucket          objstore.Bucket
 
-	mtx                   *sync.RWMutex
-	tenants               map[string]*tenant
+	// seriesReplicaLabelName is the series label whose value selects a per-replica TSDB of the
+	// tenant; empty when disabled. See WithSeriesReplicaLabelName.
+	seriesReplicaLabelName string
+	// seriesReplicaMetricLabel tells whether the metrics of every TSDB carry the
+	// seriesReplicaMetricLabel label next to the tenant label.
+	seriesReplicaMetricLabel bool
+
+	mtx *sync.RWMutex
+	// tenants holds all TSDBs: the TSDB of each tenant and the per-replica TSDBs of tenants.
+	tenants               map[tsdbID]*tenant
 	allowOutOfOrderUpload bool
 	skipCorruptedBlocks   bool
 	hashFunc              metadata.HashFunc
 	uploadConcurrency     int
-	hashringConfigs       []HashringConfig
+
+	hashringConfigsMtx sync.RWMutex
+	hashringConfigs    []HashringConfig
 
 	matcherCache storecache.MatchersCache
 
@@ -116,6 +129,16 @@ func WithUploadConcurrency(concurrency int) MultiTSDBOption {
 	}
 }
 
+// WithSeriesReplicaLabelName makes the MultiTSDB keep, for each tenant and each value of the given
+// series label, a separate TSDB whose external labels are the tenant's ones plus that label and
+// value. Writers remove the label from such series and append them through TenantReplicaAppendable.
+// The name must be a valid legacy Prometheus label name.
+func WithSeriesReplicaLabelName(name string) MultiTSDBOption {
+	return func(s *MultiTSDB) {
+		s.seriesReplicaLabelName = name
+	}
+}
+
 // NewMultiTSDB creates new MultiTSDB.
 // NOTE: Passed labels must be sorted lexicographically (alphabetically).
 func NewMultiTSDB(
@@ -141,7 +164,7 @@ func NewMultiTSDB(
 		reg:                   reg,
 		tsdbOpts:              tsdbOpts,
 		mtx:                   &sync.RWMutex{},
-		tenants:               map[string]*tenant{},
+		tenants:               map[tsdbID]*tenant{},
 		labels:                labels,
 		tsdbClients:           make([]store.Client, 0),
 		exemplarClients:       map[string]*exemplars.TSDB{},
@@ -158,14 +181,108 @@ func NewMultiTSDB(
 		option(mt)
 	}
 
+	// All TSDB metrics registered in one registry need the same label names. Per-replica TSDBs are
+	// told apart by an extra label, so add it to every TSDB whenever there can be per-replica TSDBs:
+	// when they are enabled, or when some are left on disk (they are loaded even when disabled).
+	mt.seriesReplicaMetricLabel = mt.seriesReplicaLabelName != ""
+	if fi, err := os.Stat(filepath.Join(dataDir, seriesReplicasDir)); err == nil && fi.IsDir() {
+		mt.seriesReplicaMetricLabel = true
+	}
+
 	return mt
+}
+
+const (
+	// seriesReplicasDir is the directory, inside the data directory, holding the per-replica TSDBs
+	// at <seriesReplicasDir>/<tenant>/<label name>=<hex-encoded label value>. The name is reserved:
+	// it is never loaded as a tenant and writes for a tenant of that name are rejected.
+	seriesReplicasDir = "__series_replicas__"
+	// seriesReplicaMetricLabel is the metric label that holds the series replica label value of a
+	// per-replica TSDB next to the tenant label (empty for the tenant's own TSDB).
+	seriesReplicaMetricLabel = "series_replica"
+	// maxDirNameLength is the maximum length of a file name on common file systems.
+	maxDirNameLength = 255
+)
+
+// errInvalidTSDBName is returned for writes whose tenant or series replica label value cannot name a
+// TSDB directory. Such writes are rejected as conflicts, retrying them cannot succeed.
+var errInvalidTSDBName = errors.New("cannot store series in a TSDB of this name")
+
+// tsdbID identifies a TSDB of a MultiTSDB: either the TSDB of a tenant or, when a series replica
+// label is used, a per-replica TSDB of a tenant.
+type tsdbID struct {
+	tenant string
+	// replica is the series replica label (name and value) of a per-replica TSDB: it was removed from
+	// the TSDB's series and is one of its external labels. It is empty for the tenant's own TSDB.
+	replica labels.Label
+}
+
+func (id tsdbID) isReplica() bool {
+	return id.replica.Name != ""
+}
+
+// dir returns the TSDB directory relative to the data directory. It is unique per TSDB.
+func (id tsdbID) dir() string {
+	if !id.isReplica() {
+		return id.tenant
+	}
+	return seriesReplicasDir + "/" + id.tenant + "/" + seriesReplicaDirName(id.replica)
+}
+
+// String returns a human readable name of the TSDB, e.g. `tenant` or `tenant{replica="r0"}`.
+func (id tsdbID) String() string {
+	if !id.isReplica() {
+		return id.tenant
+	}
+	return id.tenant + labels.New(id.replica).String()
+}
+
+// validate checks that id can be stored in its own directory without clashing with another TSDB.
+func (id tsdbID) validate() error {
+	if !id.isReplica() {
+		if d := path.Clean(id.tenant); d == seriesReplicasDir || strings.HasPrefix(d, seriesReplicasDir+"/") {
+			return errors.Wrapf(errInvalidTSDBName, "tenant name %q is reserved", id.tenant)
+		}
+		return nil
+	}
+	switch {
+	case id.tenant == "", id.tenant == ".", id.tenant == "..", strings.ContainsAny(id.tenant, "/\x00"), len(id.tenant) > maxDirNameLength:
+		return errors.Wrapf(errInvalidTSDBName, "tenant %q is not a valid directory name for its per-replica TSDBs", id.tenant)
+	case id.replica.Value == "":
+		return errors.Wrapf(errInvalidTSDBName, "empty value of series replica label %q", id.replica.Name)
+	case len(seriesReplicaDirName(id.replica)) > maxDirNameLength:
+		return errors.Wrapf(errInvalidTSDBName, "value of series replica label %q is too long (%d bytes, at most %d)",
+			id.replica.Name, len(id.replica.Value), (maxDirNameLength-len(id.replica.Name)-1)/2)
+	}
+	return nil
+}
+
+// seriesReplicaDirName returns the directory name of a per-replica TSDB. The value is hex-encoded so
+// that any label value gives a valid name, also on case-insensitive file systems.
+func seriesReplicaDirName(replica labels.Label) string {
+	return replica.Name + "=" + hex.EncodeToString([]byte(replica.Value))
+}
+
+func parseSeriesReplicaDirName(name string) (labels.Label, error) {
+	n, v, ok := strings.Cut(name, "=")
+	if !ok || !model.LegacyValidation.IsValidLabelName(n) {
+		return labels.Label{}, errors.Errorf("%q is not of the form <label name>=<hex-encoded label value>", name)
+	}
+	value, err := hex.DecodeString(v)
+	if err != nil {
+		return labels.Label{}, errors.Wrapf(err, "decode label value of %q", name)
+	}
+	if len(value) == 0 {
+		return labels.Label{}, errors.Errorf("empty label value in %q", name)
+	}
+	return labels.Label{Name: n, Value: string(value)}, nil
 }
 
 // testGetTenant returns the tenant with the given tenantID for testing purposes.
 func (t *MultiTSDB) testGetTenant(tenantID string) *tenant {
 	t.mtx.RLock()
 	defer t.mtx.RUnlock()
-	return t.tenants[tenantID]
+	return t.tenants[tsdbID{tenant: tenantID}]
 }
 
 func (t *MultiTSDB) updateTSDBClients() {
@@ -178,30 +295,38 @@ func (t *MultiTSDB) updateTSDBClients() {
 	}
 }
 
-func (t *MultiTSDB) addTenantUnlocked(tenantID string, newTenant *tenant) {
-	t.tenants[tenantID] = newTenant
+func (t *MultiTSDB) addTenantUnlocked(id tsdbID, newTenant *tenant) {
+	t.tenants[id] = newTenant
 	t.updateTSDBClients()
 	if newTenant.exemplars() != nil {
-		t.exemplarClients[tenantID] = newTenant.exemplars()
+		t.exemplarClients[id.dir()] = newTenant.exemplars()
 	}
 }
 
-func (t *MultiTSDB) addTenantLocked(tenantID string, newTenant *tenant) {
+func (t *MultiTSDB) addTenantLocked(id tsdbID, newTenant *tenant) {
 	t.mtx.Lock()
 	defer t.mtx.Unlock()
-	t.addTenantUnlocked(tenantID, newTenant)
+	t.addTenantUnlocked(id, newTenant)
 }
 
-func (t *MultiTSDB) removeTenantUnlocked(tenantID string) {
-	delete(t.tenants, tenantID)
-	delete(t.exemplarClients, tenantID)
+func (t *MultiTSDB) removeTenantUnlocked(id tsdbID) {
+	delete(t.tenants, id)
+	delete(t.exemplarClients, id.dir())
 	t.updateTSDBClients()
 }
 
-func (t *MultiTSDB) removeTenantLocked(tenantID string) {
+func (t *MultiTSDB) removeTenantLocked(id tsdbID) {
 	t.mtx.Lock()
 	defer t.mtx.Unlock()
-	t.removeTenantUnlocked(tenantID)
+	t.removeTenantUnlocked(id)
+}
+
+// tsdbLogger returns a logger with the tenant and, for a per-replica TSDB, the series replica label.
+func (t *MultiTSDB) tsdbLogger(id tsdbID) log.Logger {
+	if !id.isReplica() {
+		return log.With(t.logger, "tenant", id.tenant)
+	}
+	return log.With(t.logger, "tenant", id.tenant, "series_replica", labels.New(id.replica).String())
 }
 
 type localClient struct {
@@ -297,14 +422,12 @@ type tenant struct {
 	blocksToDeleteFn func(db *tsdb.DB) tsdb.BlocksToDeleteFunc
 }
 
-func (m *MultiTSDB) initTSDBIfNeeded(tenantID string, t *tenant) error {
-	_, err, _ := m.initSingleFlight.Do(tenantID, func() (interface{}, error) {
+func (m *MultiTSDB) initTSDBIfNeeded(id tsdbID, t *tenant) error {
+	_, err, _ := m.initSingleFlight.Do(id.dir(), func() (interface{}, error) {
 		if t.readyS.Get() != nil {
 			return nil, nil
 		}
-		logger := log.With(m.logger, "tenant", tenantID)
-
-		return nil, m.startTSDB(logger, tenantID, t)
+		return nil, m.startTSDB(m.tsdbLogger(id), id, t)
 	})
 
 	return err
@@ -389,29 +512,90 @@ func (t *tenant) setComponents(storeTSDB *store.TSDBStore, ship *shipper.Shipper
 	t.tsdb = tenantTSDB
 }
 
+// setExtLabels changes the external labels of the TSDB's StoreAPI, exemplars and future uploads.
+func (t *tenant) setExtLabels(lset labels.Labels) {
+	t.mtx.RLock()
+	defer t.mtx.RUnlock()
+
+	if t.ship != nil {
+		t.ship.SetLabels(lset)
+	}
+	if t.storeTSDB != nil {
+		t.storeTSDB.SetExtLset(lset)
+	}
+	if t.exemplarsTSDB != nil {
+		t.exemplarsTSDB.SetExtLabels(lset)
+	}
+}
+
 func (t *MultiTSDB) Open() error {
 	if err := os.MkdirAll(t.dataDir, 0750); err != nil {
 		return err
 	}
 
-	files, err := os.ReadDir(t.dataDir)
+	ids, err := t.discoverTSDBs()
 	if err != nil {
 		return err
 	}
 
 	var g errgroup.Group
-	for _, f := range files {
-		if !f.IsDir() {
-			continue
-		}
-
+	for _, id := range ids {
 		g.Go(func() error {
-			_, err := t.getOrLoadTenant(f.Name())
+			_, err := t.getOrLoadTenant(id)
 			return err
 		})
 	}
 
 	return g.Wait()
+}
+
+// discoverTSDBs returns the TSDBs found in the data directory: every directory is the TSDB of the
+// tenant it is named after, except seriesReplicasDir, which holds per-replica TSDBs. Per-replica
+// TSDBs are found even if the series replica label is no longer configured, so their data keeps
+// being uploaded and served until they are pruned.
+func (t *MultiTSDB) discoverTSDBs() ([]tsdbID, error) {
+	entries, err := os.ReadDir(t.dataDir)
+	if err != nil {
+		return nil, err
+	}
+
+	var ids []tsdbID
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if e.Name() != seriesReplicasDir {
+			ids = append(ids, tsdbID{tenant: e.Name()})
+			continue
+		}
+
+		root := filepath.Join(t.dataDir, seriesReplicasDir)
+		tenantDirs, err := os.ReadDir(root)
+		if err != nil {
+			return nil, err
+		}
+		for _, td := range tenantDirs {
+			if !td.IsDir() {
+				continue
+			}
+			replicaDirs, err := os.ReadDir(filepath.Join(root, td.Name()))
+			if err != nil {
+				return nil, err
+			}
+			for _, rd := range replicaDirs {
+				if !rd.IsDir() {
+					continue
+				}
+				replica, err := parseSeriesReplicaDirName(rd.Name())
+				if err != nil {
+					level.Warn(t.logger).Log("msg", "ignoring unexpected directory among per-replica TSDBs", "dir", filepath.Join(root, td.Name(), rd.Name()), "err", err)
+					continue
+				}
+				ids = append(ids, tsdbID{tenant: td.Name(), replica: replica})
+			}
+		}
+	}
+	return ids, nil
 }
 
 func (t *MultiTSDB) Flush() error {
@@ -488,7 +672,7 @@ func (t *MultiTSDB) Prune(ctx context.Context) error {
 		prunedTenants []string
 		pmtx          sync.Mutex
 
-		tenants = make(map[string]*tenant)
+		tenants = make(map[tsdbID]*tenant)
 	)
 
 	t.mtx.RLock()
@@ -496,12 +680,12 @@ func (t *MultiTSDB) Prune(ctx context.Context) error {
 	t.mtx.RUnlock()
 
 	begin := time.Now()
-	for tenantID, tenantInstance := range tenants {
+	for id, tenantInstance := range tenants {
 		wg.Add(1)
-		go func(tenantID string, tenantInstance *tenant) {
+		go func(id tsdbID, tenantInstance *tenant) {
 			defer wg.Done()
 
-			pruned, err := t.pruneTSDB(ctx, log.With(t.logger, "tenant", tenantID), tenantInstance, tenantID)
+			pruned, err := t.pruneTSDB(ctx, t.tsdbLogger(id), tenantInstance, id)
 			if err != nil {
 				merr.Add(err)
 				return
@@ -510,9 +694,9 @@ func (t *MultiTSDB) Prune(ctx context.Context) error {
 			if pruned {
 				pmtx.Lock()
 				defer pmtx.Unlock()
-				prunedTenants = append(prunedTenants, tenantID)
+				prunedTenants = append(prunedTenants, id.String())
 			}
-		}(tenantID, tenantInstance)
+		}(id, tenantInstance)
 	}
 	wg.Wait()
 
@@ -523,7 +707,7 @@ func (t *MultiTSDB) Prune(ctx context.Context) error {
 
 // pruneTSDB removes a TSDB if its past the retention period.
 // It compacts the TSDB head, sends all remaining blocks to S3 and removes the TSDB from disk.
-func (t *MultiTSDB) pruneTSDB(ctx context.Context, logger log.Logger, tenantInstance *tenant, tenantID string) (pruned bool, rerr error) {
+func (t *MultiTSDB) pruneTSDB(ctx context.Context, logger log.Logger, tenantInstance *tenant, id tsdbID) (pruned bool, rerr error) {
 	tenantTSDB := tenantInstance.readyStorage()
 	if tenantTSDB == nil {
 		return false, nil
@@ -615,7 +799,7 @@ func (t *MultiTSDB) pruneTSDB(ctx context.Context, logger log.Logger, tenantInst
 	tenantInstance.mtx.Unlock()
 
 	t.mtx.Lock()
-	t.removeTenantUnlocked(tenantID)
+	t.removeTenantUnlocked(id)
 	t.mtx.Unlock()
 
 	return true, nil
@@ -636,8 +820,8 @@ func (t *MultiTSDB) Sync(ctx context.Context) (int, error) {
 		uploaded atomic.Int64
 	)
 
-	for tenantID, tenant := range t.tenants {
-		level.Debug(t.logger).Log("msg", "uploading block for tenant", "tenant", tenantID)
+	for id, tenant := range t.tenants {
+		level.Debug(t.logger).Log("msg", "uploading block for tenant", "tenant", id)
 		s := tenant.shipper()
 		if s == nil {
 			continue
@@ -657,7 +841,7 @@ func (t *MultiTSDB) Sync(ctx context.Context) (int, error) {
 }
 
 func (t *MultiTSDB) RemoveLockFilesIfAny() error {
-	fis, err := os.ReadDir(t.dataDir)
+	ids, err := t.discoverTSDBs()
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -666,18 +850,15 @@ func (t *MultiTSDB) RemoveLockFilesIfAny() error {
 	}
 
 	merr := errutil.MultiError{}
-	for _, fi := range fis {
-		if !fi.IsDir() {
-			continue
-		}
-		if err := os.Remove(filepath.Join(t.defaultTenantDataDir(fi.Name()), "lock")); err != nil {
+	for _, id := range ids {
+		if err := os.Remove(filepath.Join(t.defaultTenantDataDir(id.dir()), "lock")); err != nil {
 			if os.IsNotExist(err) {
 				continue
 			}
 			merr.Add(err)
 			continue
 		}
-		level.Info(t.logger).Log("msg", "a leftover lockfile found and removed", "tenant", fi.Name())
+		level.Info(t.logger).Log("msg", "a leftover lockfile found and removed", "tenant", id)
 	}
 	return merr.Err()
 }
@@ -696,28 +877,24 @@ func (t *MultiTSDB) TSDBExemplars() map[string]*exemplars.TSDB {
 	return t.exemplarClients
 }
 
+// TenantStats returns the stats of each TSDB of the given tenants (all tenants if none given). The
+// stats of a per-replica TSDB are named like `tenant{replica_label="value"}`.
 func (t *MultiTSDB) TenantStats(limit int, statsByLabelName string, tenantIDs ...string) []api.TenantStats {
 	t.mtx.RLock()
 	defer t.mtx.RUnlock()
-	if len(tenantIDs) == 0 {
-		for tenantID := range t.tenants {
-			tenantIDs = append(tenantIDs, tenantID)
-		}
-	}
 
 	var (
 		mu     sync.Mutex
 		wg     sync.WaitGroup
 		result = make([]api.TenantStats, 0, len(t.tenants))
 	)
-	for _, tenantID := range tenantIDs {
-		tenantInstance, ok := t.tenants[tenantID]
-		if !ok {
+	for id, tenantInstance := range t.tenants {
+		if len(tenantIDs) > 0 && !slices.Contains(tenantIDs, id.tenant) {
 			continue
 		}
 
 		wg.Add(1)
-		go func(tenantID string, tenantInstance *tenant) {
+		go func(id tsdbID, tenantInstance *tenant) {
 			defer wg.Done()
 			db := tenantInstance.readyS.Get()
 			if db == nil {
@@ -728,10 +905,10 @@ func (t *MultiTSDB) TenantStats(limit int, statsByLabelName string, tenantIDs ..
 			mu.Lock()
 			defer mu.Unlock()
 			result = append(result, api.TenantStats{
-				Tenant: tenantID,
+				Tenant: id.String(),
 				Stats:  stats,
 			})
-		}(tenantID, tenantInstance)
+		}(id, tenantInstance)
 	}
 	wg.Wait()
 
@@ -741,13 +918,12 @@ func (t *MultiTSDB) TenantStats(limit int, statsByLabelName string, tenantIDs ..
 	return result
 }
 
-func (t *MultiTSDB) startTSDB(logger log.Logger, tenantID string, tenant *tenant) error {
-	reg := prometheus.WrapRegistererWith(prometheus.Labels{"tenant": tenantID}, t.reg)
+func (t *MultiTSDB) startTSDB(logger log.Logger, id tsdbID, tenant *tenant) error {
+	reg := prometheus.WrapRegistererWith(t.metricLabels(id), t.reg)
 	reg = NewUnRegisterer(reg)
 
-	initialLset := labelpb.ExtendSortedLabels(t.labels, labels.FromStrings(t.tenantLabelName, tenantID))
-	lset := t.extractTenantsLabels(tenantID, initialLset)
-	dataDir := t.defaultTenantDataDir(tenantID)
+	lset, _ := t.externalLabels(id)
+	dataDir := t.defaultTenantDataDir(id.dir())
 
 	level.Info(logger).Log("msg", "opening TSDB")
 
@@ -791,7 +967,7 @@ func (t *MultiTSDB) startTSDB(logger log.Logger, tenantID string, tenant *tenant
 		nil,
 	)
 	if err != nil {
-		t.removeTenantLocked(tenantID)
+		t.removeTenantLocked(id)
 		return err
 	}
 	var ship *shipper.Shipper
@@ -818,7 +994,7 @@ func (t *MultiTSDB) startTSDB(logger log.Logger, tenantID string, tenant *tenant
 		options = append(options, store.WithMatcherCacheInstance(t.matcherCache))
 	}
 	tenant.set(store.NewTSDBStore(logger, s, component.Receive, lset, options...), s, ship, exemplars.NewTSDB(s, lset), reg.(*UnRegisterer))
-	t.addTenantLocked(tenantID, tenant) // need to update the client list once store is ready & client != nil
+	t.addTenantLocked(id, tenant) // need to update the client list once store is ready & client != nil
 	level.Info(logger).Log("msg", "TSDB is now ready")
 	return nil
 }
@@ -827,34 +1003,60 @@ func (t *MultiTSDB) defaultTenantDataDir(tenantID string) string {
 	return path.Join(t.dataDir, tenantID)
 }
 
-func (t *MultiTSDB) getOrLoadTenant(tenantID string) (*tenant, error) {
+func (t *MultiTSDB) getOrLoadTenant(id tsdbID) (*tenant, error) {
 	// Fast path, as creating tenants is a very rare operation.
 	t.mtx.RLock()
-	tenant, exist := t.tenants[tenantID]
+	tenant, exist := t.tenants[id]
 	t.mtx.RUnlock()
 	if exist {
-		return tenant, t.initTSDBIfNeeded(tenantID, tenant)
+		return tenant, t.initTSDBIfNeeded(id, tenant)
+	}
+
+	if err := id.validate(); err != nil {
+		return nil, err
 	}
 
 	// Slow path needs to lock fully and attempt to read again to prevent race
 	// conditions, where since the fast path was tried, there may have actually
 	// been the same tenant inserted in the map.
 	t.mtx.Lock()
-	tenant, exist = t.tenants[tenantID]
+	tenant, exist = t.tenants[id]
 	if exist {
 		t.mtx.Unlock()
-		return tenant, t.initTSDBIfNeeded(tenantID, tenant)
+		return tenant, t.initTSDBIfNeeded(id, tenant)
 	}
 
 	tenant = newTenant()
-	t.addTenantUnlocked(tenantID, tenant)
+	t.addTenantUnlocked(id, tenant)
 	t.mtx.Unlock()
 
-	return tenant, t.initTSDBIfNeeded(tenantID, tenant)
+	return tenant, t.initTSDBIfNeeded(id, tenant)
 }
 
 func (t *MultiTSDB) TenantAppendable(tenantID string) (Appendable, error) {
-	tenant, err := t.getOrLoadTenant(tenantID)
+	tenant, err := t.getOrLoadTenant(tsdbID{tenant: tenantID})
+	if err != nil {
+		return nil, err
+	}
+	return tenant.readyStorage(), nil
+}
+
+// SeriesReplicaLabelName returns the series replica label name set by WithSeriesReplicaLabelName.
+func (t *MultiTSDB) SeriesReplicaLabelName() string {
+	return t.seriesReplicaLabelName
+}
+
+// TenantReplicaAppendable returns the Appendable of the per-replica TSDB of the tenant for the given
+// value of the series replica label, or of the tenant's own TSDB if the value is empty. The caller
+// removes the series replica label from the series it appends.
+func (t *MultiTSDB) TenantReplicaAppendable(tenantID, replica string) (Appendable, error) {
+	if t.seriesReplicaLabelName == "" {
+		return nil, errors.New("no series replica label configured")
+	}
+	if replica == "" {
+		return t.TenantAppendable(tenantID)
+	}
+	tenant, err := t.getOrLoadTenant(tsdbID{tenant: tenantID, replica: labels.Label{Name: t.seriesReplicaLabelName, Value: replica}})
 	if err != nil {
 		return nil, err
 	}
@@ -862,31 +1064,19 @@ func (t *MultiTSDB) TenantAppendable(tenantID string) (Appendable, error) {
 }
 
 func (t *MultiTSDB) SetHashringConfig(cfg []HashringConfig) error {
+	t.hashringConfigsMtx.Lock()
 	t.hashringConfigs = cfg
+	t.hashringConfigsMtx.Unlock()
 
-	// If a tenant's already existed in MultiTSDB, update its label set
-	// from the latest []HashringConfig.
-	// In case one tenant appears in multiple hashring configs,
-	// only the label set from the first hashring config is applied.
-	// This is the same logic as startTSDB.
-	updatedTenants := make([]string, 0)
-	for _, hc := range t.hashringConfigs {
-		for _, tenantID := range hc.Tenants {
-			if slices.Contains(updatedTenants, tenantID) {
-				continue
-			}
-			if t.tenants[tenantID] != nil {
-				updatedTenants = append(updatedTenants, tenantID)
+	t.mtx.RLock()
+	tenants := maps.Clone(t.tenants)
+	t.mtx.RUnlock()
 
-				lset := labelpb.ExtendSortedLabels(t.labels, labels.FromStrings(t.tenantLabelName, tenantID))
-				lset = labelpb.ExtendSortedLabels(hc.ExternalLabels, lset)
-
-				if t.tenants[tenantID].ship != nil {
-					t.tenants[tenantID].ship.SetLabels(lset)
-				}
-				t.tenants[tenantID].storeTSDB.SetExtLset(lset)
-				t.tenants[tenantID].exemplarsTSDB.SetExtLabels(lset)
-			}
+	// If a tenant's already existed in MultiTSDB, update the label set of its TSDBs
+	// from the latest []HashringConfig, the same way as startTSDB does.
+	for id, tenant := range tenants {
+		if lset, inHashring := t.externalLabels(id); inHashring {
+			tenant.setExtLabels(lset)
 		}
 	}
 
@@ -1062,17 +1252,41 @@ func (u *UnRegisterer) MustRegister(cs ...prometheus.Collector) {
 	u.collectors = append(u.collectors, cs...)
 }
 
-// extractTenantsLabels extracts tenant's external labels from hashring configs.
+// hashringExternalLabels returns the external labels of the tenant from the hashring configs.
 // If one tenant appears in multiple hashring configs,
 // only the external label set from the first hashring config is applied.
-func (t *MultiTSDB) extractTenantsLabels(tenantID string, initialLset labels.Labels) labels.Labels {
+func (t *MultiTSDB) hashringExternalLabels(tenantID string) (labels.Labels, bool) {
+	t.hashringConfigsMtx.RLock()
+	defer t.hashringConfigsMtx.RUnlock()
+
 	for _, hc := range t.hashringConfigs {
-		for _, tenant := range hc.Tenants {
-			if tenant != tenantID {
-				continue
-			}
-			return labelpb.ExtendSortedLabels(hc.ExternalLabels, initialLset)
+		if slices.Contains(hc.Tenants, tenantID) {
+			return hc.ExternalLabels, true
 		}
 	}
-	return initialLset
+	return labels.EmptyLabels(), false
+}
+
+// externalLabels returns the external labels of a TSDB: the receive labels, the tenant label and
+// the tenant's hashring external labels (which the former two override) and, for a per-replica
+// TSDB, the series replica label. It also tells whether the tenant is in a hashring config.
+func (t *MultiTSDB) externalLabels(id tsdbID) (labels.Labels, bool) {
+	lset := labelpb.ExtendSortedLabels(t.labels, labels.FromStrings(t.tenantLabelName, id.tenant))
+	hashringLset, inHashring := t.hashringExternalLabels(id.tenant)
+	if inHashring {
+		lset = labelpb.ExtendSortedLabels(hashringLset, lset)
+	}
+	if id.isReplica() {
+		lset = labelpb.ExtendSortedLabels(lset, labels.New(id.replica))
+	}
+	return lset, inHashring
+}
+
+// metricLabels returns the labels added to the metrics of a TSDB.
+func (t *MultiTSDB) metricLabels(id tsdbID) prometheus.Labels {
+	l := prometheus.Labels{"tenant": id.tenant}
+	if t.seriesReplicaMetricLabel {
+		l[seriesReplicaMetricLabel] = id.replica.Value
+	}
+	return l
 }

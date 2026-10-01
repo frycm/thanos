@@ -103,6 +103,19 @@ A Receiver will automatically decommission a tenant once new samples have not be
 
 Note that because of the built-in decommissioning process, the semantic of the `--tsdb.retention` flag in the Receiver is different than the one in Prometheus. For Receivers, `--tsdb.retention=t` indicates that the data for a tenant will be kept for `t` amount of time, whereas in Prometheus, `--tsdb.retention=t` denotes that the last `t` duration of data will be maintained in TSDB. In other words, Prometheus will keep the last `t` duration of data even when it stops getting new samples.
 
+## HA replicas inside the series
+
+Highly available Prometheus pairs (or agents, collectors) that remote write to Receivers tell their copies apart by a label such as `prometheus_replica`, which arrives inside every series. Receivers store it like any other series label, so every block holds the series of all replicas, and neither the compactor (`--deduplication.replica-label`) nor the querier (`--query.replica-label`) deduplicates them: both act on external labels.
+
+With `--receive.series-replica-label-name=prometheus_replica`, a Receiver removes that label from each series that carries it and writes the series to a TSDB dedicated to the tenant and the label's value. The external labels of that TSDB are those of the tenant's TSDB (the `--label` flags, `<receive.tenant-label-name>=<tenant>` and the tenant's hashring `external_labels`) plus `prometheus_replica=<value>`; its StoreAPI, exemplars and uploaded blocks carry them. Series without the label are written to the tenant's TSDB. The tenant is determined as without the flag, so it stays the real tenant and tenancy enforcement keeps working. Series are routed by their labels without the replica label, so all replicas of a series go to the same Receivers. Set the flag on routers and ingestors, and deduplicate the replicas with:
+
+- the compactor: `--deduplication.replica-label=prometheus_replica` next to the Receivers' own replica label (e.g. `--deduplication.replica-label=receive_replica`), `--compact.enable-vertical-compaction` and `--deduplication.func=penalty`. The blocks of all replicas of a tenant are compacted into blocks of that tenant without `prometheus_replica`.
+- the querier: `--query.replica-label=prometheus_replica` next to e.g. `--query.replica-label=receive_replica`.
+
+Per-replica TSDBs are stored in `<tsdb.path>/__series_replicas__/<tenant>/<label name>=<hex-encoded label value>`, so `__series_replicas__` cannot be used as a tenant name and label values are limited to about 118 bytes for `prometheus_replica` (directory names are limited to 255 bytes). They are loaded again on restart, also when the flag has been removed so that their data is still served and uploaded, and decommissioned like tenants. Each of them is a full TSDB (head, WAL, blocks): expect one TSDB per tenant and replica. While the flag is set or per-replica TSDBs exist, the TSDB metrics carry a `series_replica` label next to `tenant`, empty for the tenants' own TSDBs, so per-tenant sums such as the active series limit still add up per tenant.
+
+`--receive.split-tenant-label-name=prometheus_replica` is not an alternative: it makes each replica a tenant of its own and drops the real tenant. Different tenants that send the same replica value (e.g. `prometheus-k8s-0`) are written to the same TSDB, deduplicating by `tenant_id` in the compactor merges the series of different tenants, and queries that enforce the real tenant no longer find the data. Both flags can be combined: the split tenant label then determines the tenant, and the series replica label one of its TSDBs.
+
 ## Example
 
 ```bash
@@ -372,7 +385,7 @@ Please see the metric `thanos_receive_forward_delay_seconds` to see if you need 
 
 The following formula is used for calculating quorum:
 
-```go mdox-exec="sed -n '1052,1062p' pkg/receive/handler.go"
+```go mdox-exec="sed -n '1064,1074p' pkg/receive/handler.go"
 // writeQuorum returns minimum number of replicas that has to confirm write success before claiming replication success.
 func (h *Handler) writeQuorum() int {
 	// NOTE(GiedriusS): this is here because otherwise RF=2 doesn't make sense as all writes
@@ -556,6 +569,24 @@ Flags:
       --receive.tenant-label-name="tenant_id"
                                  Label name through which the tenant will be
                                  announced.
+      --receive.series-replica-label-name=""
+                                 Name of a series label identifying the HA
+                                 replica (e.g. Prometheus) that sent the series.
+                                 A series with a non-empty value of this
+                                 label is written, without the label,
+                                 to a TSDB dedicated to its tenant and that
+                                 value, whose external labels are those
+                                 of the tenant's TSDB plus this label.
+                                 The tenant is determined as without this
+                                 flag (from the tenant header, the default
+                                 tenant or receive.split-tenant-label-name,
+                                 which is applied first); series without the
+                                 label go to the tenant's TSDB. Series are
+                                 routed by their labels without this label.
+                                 Set it on routers and ingestors, and
+                                 deduplicate the replicas with the compactor's
+                                 deduplication.replica-label and the querier's
+                                 query.replica-label.
       --receive.replica-header="THANOS-REPLICA"
                                  HTTP header specifying the replica number of a
                                  write request.
