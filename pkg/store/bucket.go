@@ -793,11 +793,17 @@ func (s *BucketStore) SyncBlocks(ctx context.Context) error {
 		s.metrics.blockDrops.Inc()
 	}
 
-	// Sync advertise labels.
+	// Sync advertise labels. The block sets of the shards of a split stream advertise the stream's labels once.
 	s.mtx.Lock()
 	s.advLabelSets = make([]labelpb.ZLabelSet, 0, len(s.advLabelSets))
+	advertised := make(map[uint64]struct{}, len(s.blockSets))
 	for _, bs := range s.blockSets {
-		s.advLabelSets = append(s.advLabelSets, labelpb.ZLabelSet{Labels: labelpb.ZLabelsFromPromLabels(bs.labels.Copy())})
+		h := bs.extLset.Hash()
+		if _, ok := advertised[h]; ok {
+			continue
+		}
+		advertised[h] = struct{}{}
+		s.advLabelSets = append(s.advLabelSets, labelpb.ZLabelSet{Labels: labelpb.ZLabelsFromPromLabels(bs.extLset.Copy())})
 	}
 	sort.Slice(s.advLabelSets, func(i, j int) bool {
 		return strings.Compare(s.advLabelSets[i].String(), s.advLabelSets[j].String()) < 0
@@ -991,7 +997,8 @@ func (s *BucketStore) TSDBInfos() []infopb.TSDBInfo {
 
 	infoMap := make(map[uint64][]infopb.TSDBInfo, len(s.blocks))
 	for _, b := range s.blocks {
-		lbls := labels.FromMap(b.meta.Thanos.Labels)
+		// The shards of a split stream are advertised as the stream.
+		lbls := b.extLset
 		hash := lbls.Hash()
 		infoMap[hash] = append(infoMap[hash], infopb.TSDBInfo{
 			Labels: labelpb.ZLabelSet{
@@ -1014,7 +1021,8 @@ func (s *BucketStore) TSDBInfos() []infopb.TSDBInfo {
 				cur = info
 				continue
 			}
-			cur.MaxTime = info.MaxTime
+			// Blocks of one label set can overlap, e.g. the shards of a split stream.
+			cur.MaxTime = max(cur.MaxTime, info.MaxTime)
 		}
 		res = append(res, cur)
 	}
@@ -2318,8 +2326,17 @@ func (s *BucketStore) LabelValues(ctx context.Context, req *storepb.LabelValuesR
 
 // bucketBlockSet holds all blocks of an equal label set. It internally splits
 // them up by downsampling resolution and allows querying.
+//
+// The blocks of each shard of a split stream (metadata.CompactorShardIDLabel)
+// form their own set: the shards of a stream are compacted and downsampled
+// independently, so each one picks its own resolution for a time range. Their
+// series are disjoint, so querying the sets of all shards returns each series
+// of the stream once.
 type bucketBlockSet struct {
-	labels      labels.Labels
+	labels labels.Labels
+	// extLset are the external labels the set serves: its labels without the
+	// compactor's shard label.
+	extLset     labels.Labels
 	mtx         sync.RWMutex
 	resolutions []int64          // Available resolution, high to low (in milliseconds).
 	blocks      [][]*bucketBlock // Ordered buckets for the existing resolutions.
@@ -2330,6 +2347,7 @@ type bucketBlockSet struct {
 func newBucketBlockSet(lset labels.Labels) *bucketBlockSet {
 	return &bucketBlockSet{
 		labels:      lset,
+		extLset:     withoutShardLabel(lset),
 		resolutions: []int64{downsample.ResLevel2, downsample.ResLevel1, downsample.ResLevel0},
 		blocks:      make([][]*bucketBlock, 3),
 	}
@@ -2433,13 +2451,26 @@ func (s *bucketBlockSet) getFor(mint, maxt, maxResolutionMillis int64, blockMatc
 	return bs
 }
 
+// withoutShardLabel returns the labels without a valid compactor shard label, the
+// labels a block of a shard serves.
+func withoutShardLabel(lset labels.Labels) labels.Labels {
+	v := lset.Get(metadata.CompactorShardIDLabel)
+	if v == "" {
+		return lset
+	}
+	if _, _, err := metadata.ParseShardID(v); err != nil {
+		return lset
+	}
+	return labels.NewBuilder(lset).Del(metadata.CompactorShardIDLabel).Labels()
+}
+
 // labelMatchers verifies whether the block set matches the given matchers and returns a new
 // set of matchers that is equivalent when querying data within the block.
 func (s *bucketBlockSet) labelMatchers(matchers ...*labels.Matcher) ([]*labels.Matcher, bool) {
 	res := make([]*labels.Matcher, 0, len(matchers))
 
 	for _, m := range matchers {
-		v := s.labels.Get(m.Name)
+		v := s.extLset.Get(m.Name)
 		if v == "" {
 			res = append(res, m)
 			continue
@@ -2500,8 +2531,9 @@ func newBucketBlock(
 		maxChunkSize = int(maxChunkSizeFunc(*meta))
 	}
 	// Translate the block's labels and inject the block ID as a label
-	// to allow to match blocks also by ID.
-	extLset := labels.FromMap(meta.Thanos.Labels)
+	// to allow to match blocks also by ID. The shard label of a block split by
+	// the compactor is not served: the shards of a stream are one stream.
+	extLset := labels.FromMap(meta.Thanos.StreamLabels())
 	relabelLabels := labels.NewBuilder(extLset).Set(block.BlockIDLabel, meta.ULID.String()).Labels()
 	b = &bucketBlock{
 		metrics:                metrics,

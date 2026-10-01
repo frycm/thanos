@@ -131,6 +131,44 @@ Once these compactions are done, the compactor syncs the bucket and plans again.
 
 Each compaction running at the same time needs its own disk space, memory and network bandwidth, see [Resources](#resources).
 
+### Splitting large streams into shards (experimental)
+
+A stream with tens of millions of series grows blocks whose index approaches the 64 GiB limit of the TSDB index (see [#1424](https://github.com/thanos-io/thanos/issues/1424)): the compactor then marks them for no compaction (`no-compact-mark.json` with reason `index-size-exceeding`), and they are never merged with their replicas, compacted to the full range nor downsampled. Splitting keeps such a stream in a fixed number of shards from its first compaction on, so that no block holds all of its series, and the shards compact and downsample independently and in parallel.
+
+**How it works.**
+
+* A stream is split into `M` shards, `M` a power of two set with `--compact.split.shards` for all streams and with `--compact.split.config` for some of them. Series `s` belongs to shard `(labels.StableHash(s) mod M) + 1`, the hash leaving out the series labels given with `--compact.split.ignore-labels`.
+* Each window of the smallest compaction range (2h) of fresh blocks is split by `M` jobs, one per shard. A job compacts all blocks of the window, replicas included, into one block holding only the series of its shard: replicas are deduplicated inside the shard by vertical compaction. The block carries the stream's external labels plus `__compactor_shard_id__="<i>_of_<M>"` (the label and format Grafana Mimir uses).
+* The split jobs of all windows and shards are independent groups, run up to `--compact.concurrency` at a time. The newest window of a stream is not split until a newer block arrives, as its replicas may still be uploading. A window is not split either when one of its blocks is marked for no compaction.
+* The shards of a stream are then compacted (8h, 2d, 14d) and downsampled like separate streams: one compaction group per shard, also with [concurrent jobs](#concurrent-jobs-experimental). A shard that holds no series of a window is an empty block, so that every shard of a split exists.
+* A block uploaded late for a window that was already split is split alone; vertical compaction merges its shards into the shard blocks of that window.
+
+**Choosing the number of shards.** Pick `M` so that the 14d block of a shard stays well below the index limit: estimate the index size of the stream's 14d block (for example the sum of the index sizes of its 2d blocks, or of the blocks that were marked for no compaction), divide it by a comfortable target such as 16 GiB, and round up to a power of two. Each window is downloaded once per shard, and each shard multiplies the number of blocks of the stream that store gateways load, so do not split streams that do not need it. Use `shards: 1` in the configuration to keep a stream unsplit.
+
+```yaml
+# --compact.split.config-file
+- match: '{tenant_id="big"}'
+  shards: 16
+- match: '{tenant_id=~"large-.*"}'
+  shards: 4
+```
+
+The first entry that matches the external labels of a stream applies; the other streams use `--compact.split.shards` (default 1: no splitting).
+
+**Requirements and rollout.**
+
+1. Upgrade the Store Gateways first. They remove the `__compactor_shard_id__` label from what they serve (series, label names and values) and advertise the shards of a stream as the stream itself, so queriers see one stream. A Store Gateway without this change, including one downgraded after splitting started, exposes the label: queries then see one stream per shard.
+2. Enable vertical compaction on the compactor, normally with `--deduplication.replica-label`. The compactor refuses to start with splitting configured and vertical compaction disabled: replicas and late blocks are merged into the shards by vertical compaction. `__compactor_shard_id__` cannot be a replica label.
+3. Configure the streams to split.
+
+**How the unsplit blocks are retired.** Split jobs never mark the blocks they split for deletion. An unsplit block is retired, by the deduplication filter that the compactor's garbage collection and the Store Gateways share, only once every shard of its stream's split exists with sources containing its own (a complete shard family). A split that fails part-way, or a compactor that restarts in the middle of one, therefore never loses data: the unsplit blocks stay visible and the missing shards are split again in the next pass. Until they are retired, queries may see the same samples in the unsplit blocks and in the finished shards, like with the sources of any compaction.
+
+**Transition from unsplit history.** Blocks of the stream that were compacted beyond the smallest range before splitting was enabled are not split: they keep compacting among themselves the way they always did, and so do the windows they overlap. Splitting starts with the first windows of fresh blocks; while a window is being split, its blocks are kept out of the stream's normal compactions, so that they are never merged into a block no shard family could retire.
+
+**Changing the configuration.** The number of shards and the ignored labels are recorded in every shard block (`thanos.extensions.compactor_split` in `meta.json`) and kept through further compactions. Splits of a window use the scheme of the shard blocks that already exist in its 14d compaction range, and the configuration only for ranges without shard blocks: a change, including `shards: 1` to stop splitting a stream, applies from the next 14d range, and the shards of one range never mix counts or hashes. When a stream moves to another number of shards, the shards of the old number still compact their last range fully and are downsampled. The compactor halts rather than split a window whose range has shard blocks that record different schemes, no scheme or a hash it does not know; for a stream it is not configured to split, it leaves such a window to normal compaction instead.
+
+The metrics `thanos_compact_split_planned_jobs`, `thanos_compact_split_excluded_blocks` and `thanos_compact_split_closed_shard_groups` show the split jobs and blocks of the last compaction pass.
+
 ## Enforcing Retention of Data
 
 By default, there is NO retention set for object storage data. This means that you store data forever, which is a valid and recommended way of running Thanos.
@@ -270,7 +308,7 @@ You should horizontally scale Compactor to cope with this using [label sharding]
 
 2. TSDB blocks from single stream is too big, it takes too much time or resources.
 
-This is rare as first you would need to ingest that amount of data into Prometheus and it's usually not recommended to have bigger than 10 millions series in the 2 hours blocks. However, with 2 weeks blocks, potential [Vertical Compaction](#vertical-compactions) enabled and other producers than Prometheus (e.g backfilling) this scalability concern can appear as well. See [Limit size of blocks](https://github.com/thanos-io/thanos/issues/3068) ticket to track progress of solution if you are hitting this. If a single stream has a large backlog of blocks to compact, the experimental [concurrent jobs](#concurrent-jobs-experimental) compact its independent time ranges in parallel.
+This is rare as first you would need to ingest that amount of data into Prometheus and it's usually not recommended to have bigger than 10 millions series in the 2 hours blocks. However, with 2 weeks blocks, potential [Vertical Compaction](#vertical-compactions) enabled and other producers than Prometheus (e.g backfilling) this scalability concern can appear as well. See [Limit size of blocks](https://github.com/thanos-io/thanos/issues/3068) ticket to track progress of solution if you are hitting this. If a single stream has a large backlog of blocks to compact, the experimental [concurrent jobs](#concurrent-jobs-experimental) compact its independent time ranges in parallel. If its blocks approach the index size limit, the experimental [splitting into shards](#splitting-large-streams-into-shards-experimental) keeps each block to a share of its series.
 
 ## Eventual Consistency
 
@@ -411,6 +449,46 @@ Flags:
                                 a time, instead of one compaction per stream
                                 and pass. The resulting blocks are the same as
                                 without it.
+      --compact.split.shards=1  Experimental. Number of shards, a power of two,
+                                to split each stream (blocks with the same
+                                external labels) into at the first compaction
+                                level; 1 does not split. Each shard holds
+                                the series whose hash falls into it,
+                                and is compacted and downsampled on its own.
+                                --compact.split.config can set another number
+                                for some streams. A 14d compaction range that
+                                already has shard blocks keeps their number:
+                                changes apply from the next range. Requires
+                                vertical compaction, and Store Gateways
+                                that remove the __compactor_shard_id__
+                                label: upgrade them first. See
+                                https://thanos.io/tip/components/compact.md/#splitting-large-streams-into-shards-experimental
+      --compact.split.config-file=<file-path>
+                                Path to YAML file with the number of shards of
+                                some streams (experimental): a list of entries,
+                                each with a 'match' selector over the external
+                                labels of a stream, e.g. '{tenant_id="big"}',
+                                and its number of 'shards', a power of two (1 to
+                                not split). The first matching entry applies;
+                                other streams use --compact.split.shards.
+      --compact.split.config=<content>
+                                Alternative to 'compact.split.config-file'
+                                flag (mutually exclusive). Content of YAML
+                                file with the number of shards of some streams
+                                (experimental): a list of entries, each with a
+                                'match' selector over the external labels of a
+                                stream, e.g. '{tenant_id="big"}', and its number
+                                of 'shards', a power of two (1 to not split).
+                                The first matching entry applies; other streams
+                                use --compact.split.shards.
+      --compact.split.ignore-labels=COMPACT.SPLIT.IGNORE-LABELS ...
+                                Experimental. Series label to leave out of the
+                                hash that assigns series to shards (repeated
+                                flag), e.g. a replica label inside the series,
+                                so that the replicas of a series share a shard.
+                                A 14d compaction range that already has shard
+                                blocks keeps the labels they were split with:
+                                changes apply from the next range.
       --compact.blocks-fetch-concurrency=1
                                 Number of goroutines to use when download block
                                 during compaction.

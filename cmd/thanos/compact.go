@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -268,6 +269,10 @@ func runCompact(
 			"msg", "vertical compaction is enabled", "compact.enable-vertical-compaction", fmt.Sprintf("%v", conf.enableVerticalCompaction),
 		)
 	}
+	splitConf, err := conf.split.splitConfig(dedupReplicaLabels, enableVerticalCompaction)
+	if err != nil {
+		return err
+	}
 	var (
 		api = blocksAPI.NewBlocksAPI(logger, conf.webConf.disableCORS, conf.label, flagsMap, insBkt)
 		sy  *compact.Syncer
@@ -378,45 +383,16 @@ func runCompact(
 		conf.blockFilesConcurrency,
 		conf.compactBlocksFetchConcurrency,
 	)
-	var planner compact.Planner
-
-	tsdbPlanner := compact.NewPlanner(logger, levels, noCompactMarkerFilter)
-	largeIndexFilterPlanner := compact.WithLargeTotalIndexSizeFilter(
-		tsdbPlanner,
-		insBkt,
-		int64(conf.maxBlockIndexSize),
-		compactMetrics.blocksMarked.WithLabelValues(metadata.NoCompactMarkFilename, metadata.IndexSizeExceedingNoCompactReason),
-	)
-	// The progress calculators below keep using the default grouper and planner: with concurrent jobs, the compactions
-	// left to do are the same, they only take fewer passes.
-	var compactionGrouper compact.Grouper = grouper
 	if conf.enableConcurrentJobs {
 		level.Info(logger).Log("msg", "concurrent compaction jobs are enabled", "compact.concurrency", conf.compactionConcurrency)
-		compactionGrouper = compact.NewConcurrentJobsGrouper(grouper, levels, noCompactMarkerFilter)
-		largeIndexFilterPlanner = compact.WithLargeTotalIndexSizeFilter(
-			compact.NewConcurrentJobsPlanner(logger, noCompactMarkerFilter),
-			insBkt,
-			int64(conf.maxBlockIndexSize),
-			compactMetrics.blocksMarked.WithLabelValues(metadata.NoCompactMarkFilename, metadata.IndexSizeExceedingNoCompactReason),
-		)
 	}
-	if enableVerticalCompaction {
-		planner = compact.WithVerticalCompactionDownsampleFilter(largeIndexFilterPlanner, insBkt, compactMetrics.blocksMarked.WithLabelValues(metadata.NoCompactMarkFilename, metadata.DownsampleVerticalCompactionNoCompactReason))
-	} else {
-		planner = largeIndexFilterPlanner
+	if splitConf.Enabled() {
+		level.Info(logger).Log("msg", "splitting of streams into shards is enabled", "default_shards", splitConf.Shards, "overrides", len(splitConf.Overrides), "ignore_labels", strings.Join(splitConf.IgnoreLabels, ","))
 	}
 	blocksCleaner := compact.NewBlocksCleaner(logger, insBkt, ignoreDeletionMarkFilter, deleteDelay, compactMetrics.blocksCleaned, compactMetrics.blockCleanupFailures)
-	compactor, err := compact.NewBucketCompactor(
-		logger,
-		sy,
-		compactionGrouper,
-		planner,
-		comp,
-		compactDir,
-		insBkt,
-		conf.compactionConcurrency,
-		conf.skipBlockWithOutOfOrderChunks,
-		blocksCleaner,
+	compactor, splitGrouper, err := newBucketCompactor(
+		logger, reg, insBkt, sy, grouper, noCompactMarkerFilter, comp, levels, splitConf, conf, enableVerticalCompaction,
+		compactMetrics.blocksMarked, compactDir, blocksCleaner,
 	)
 	if err != nil {
 		return errors.Wrap(err, "create bucket compactor")
@@ -656,7 +632,7 @@ func runCompact(
 		// Periodically calculate the progress of compaction, downsampling and retention.
 		if conf.progressCalculateInterval > 0 {
 			g.Add(func() error {
-				ps := compact.NewCompactionProgressCalculator(reg, tsdbPlanner)
+				ps := compact.NewCompactionProgressCalculator(reg, compact.NewPlanner(logger, levels, splitGrouper))
 				rs := compact.NewRetentionProgressCalculator(reg, retentionByResolution)
 				var ds *compact.DownsampleProgressCalculator
 				if !conf.disableDownsampling {
@@ -740,6 +716,7 @@ type compactConfig struct {
 	cleanupBlocksInterval                          time.Duration
 	compactionConcurrency                          int
 	enableConcurrentJobs                           bool
+	split                                          splitFlags
 	downsampleConcurrency                          int
 	compactBlocksFetchConcurrency                  int
 	deleteDelay                                    model.Duration
@@ -815,6 +792,7 @@ func (cc *compactConfig) registerFlag(cmd extkingpin.FlagClause) {
 		Default("1").IntVar(&cc.compactionConcurrency)
 	cmd.Flag("compact.concurrent-jobs", "Experimental. When set to true, the compactor plans, in each pass, all compactions of a stream (blocks with the same external labels and resolution) that do not depend on each other: sets of overlapping blocks and time-aligned ranges that do not overlap. They run concurrently, up to --compact.concurrency at a time, instead of one compaction per stream and pass. The resulting blocks are the same as without it.").
 		Default("false").BoolVar(&cc.enableConcurrentJobs)
+	cc.split.registerFlag(cmd)
 	cmd.Flag("compact.blocks-fetch-concurrency", "Number of goroutines to use when download block during compaction.").
 		Default("1").IntVar(&cc.compactBlocksFetchConcurrency)
 	cmd.Flag("downsample.concurrency", "Number of goroutines to use when downsampling blocks.").
@@ -872,4 +850,109 @@ func (cc *compactConfig) registerFlag(cmd extkingpin.FlagClause) {
 	cmd.Flag("bucket-web-label", "External block label to use as group title in the bucket web UI").StringVar(&cc.label)
 
 	cmd.Flag("disable-admin-operations", "Disable UI/API admin operations like marking blocks for deletion and no compaction.").Default("false").BoolVar(&cc.disableAdminOperations)
+}
+
+// splitFlags are the flags of the splitting of large streams into shards.
+type splitFlags struct {
+	shards       int
+	overrides    extflag.PathOrContent
+	ignoreLabels []string
+}
+
+func (sf *splitFlags) registerFlag(cmd extkingpin.FlagClause) {
+	cmd.Flag("compact.split.shards", "Experimental. Number of shards, a power of two, to split each stream (blocks with the same external labels) into at the first compaction level; 1 does not split. Each shard holds the series whose hash falls into it, and is compacted and downsampled on its own. --compact.split.config can set another number for some streams. A 14d compaction range that already has shard blocks keeps their number: changes apply from the next range. Requires vertical compaction, and Store Gateways that remove the "+metadata.CompactorShardIDLabel+" label: upgrade them first. See https://thanos.io/tip/components/compact.md/#splitting-large-streams-into-shards-experimental").
+		Default("1").IntVar(&sf.shards)
+	sf.overrides = *extflag.RegisterPathOrContent(cmd, "compact.split.config", "YAML file with the number of shards of some streams (experimental): a list of entries, each with a 'match' selector over the external labels of a stream, e.g. '{tenant_id=\"big\"}', and its number of 'shards', a power of two (1 to not split). The first matching entry applies; other streams use --compact.split.shards.", extflag.WithEnvSubstitution())
+	cmd.Flag("compact.split.ignore-labels", "Experimental. Series label to leave out of the hash that assigns series to shards (repeated flag), e.g. a replica label inside the series, so that the replicas of a series share a shard. A 14d compaction range that already has shard blocks keeps the labels they were split with: changes apply from the next range.").
+		StringsVar(&sf.ignoreLabels)
+}
+
+// splitConfig returns the split configuration, checked against the other compactor settings.
+func (sf *splitFlags) splitConfig(dedupReplicaLabels []string, enableVerticalCompaction bool) (compact.SplitConfig, error) {
+	conf := compact.SplitConfig{Shards: sf.shards, IgnoreLabels: strutil.ParseFlagLabels(sf.ignoreLabels)}
+	content, err := sf.overrides.Content()
+	if err != nil {
+		return conf, errors.Wrap(err, "get content of split configuration")
+	}
+	if len(content) > 0 {
+		if conf.Overrides, err = compact.ParseSplitOverrides(content); err != nil {
+			return conf, err
+		}
+	}
+	if err := conf.Validate(); err != nil {
+		return conf, errors.Wrap(err, "invalid split configuration")
+	}
+	if slices.Contains(dedupReplicaLabels, metadata.CompactorShardIDLabel) {
+		return conf, errors.Errorf("%s cannot be a replica label: it tells the shards of a split stream apart", metadata.CompactorShardIDLabel)
+	}
+	if conf.Enabled() && !enableVerticalCompaction {
+		return conf, errors.New("splitting streams into shards requires vertical compaction (--deduplication.replica-label or --compact.enable-vertical-compaction): replicas, and blocks uploaded late for a window that was already split, are merged into the shard blocks by vertical compaction")
+	}
+	return conf, nil
+}
+
+// newBucketCompactor returns the BucketCompactor of the compactor command, and its split grouper, which lists the
+// blocks the planners must leave out.
+func newBucketCompactor(
+	logger log.Logger,
+	reg prometheus.Registerer,
+	bkt objstore.Bucket,
+	sy *compact.Syncer,
+	grouper *compact.DefaultGrouper,
+	noCompactMarkerFilter *compact.GatherNoCompactionMarkFilter,
+	comp compact.Compactor,
+	levels []int64,
+	splitConf compact.SplitConfig,
+	conf compactConfig,
+	enableVerticalCompaction bool,
+	blocksMarked *prometheus.CounterVec,
+	compactDir string,
+	blocksCleaner *compact.BlocksCleaner,
+) (*compact.BucketCompactor, *compact.SplitGrouper, error) {
+	// The split grouper wraps the default grouper (split into concurrent jobs if enabled). Without shard blocks in the
+	// bucket and without streams to split, it returns the wrapped groups unchanged. The planners get the blocks it keeps
+	// out of normal planning through it.
+	splitGrouper, err := compact.NewSplitGrouper(logger, grouper, conf.enableConcurrentJobs, levels, splitConf, noCompactMarkerFilter, reg)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "create split grouper")
+	}
+	tsdbPlanner := compact.NewPlanner(logger, levels, splitGrouper)
+	largeIndexFilterPlanner := compact.WithLargeTotalIndexSizeFilter(
+		tsdbPlanner,
+		bkt,
+		int64(conf.maxBlockIndexSize),
+		blocksMarked.WithLabelValues(metadata.NoCompactMarkFilename, metadata.IndexSizeExceedingNoCompactReason),
+	)
+	// The progress calculators keep using the default grouper and planner: with concurrent jobs, the compactions left
+	// to do are the same, they only take fewer passes.
+	if conf.enableConcurrentJobs {
+		largeIndexFilterPlanner = compact.WithLargeTotalIndexSizeFilter(
+			compact.NewConcurrentJobsPlanner(logger, splitGrouper),
+			bkt,
+			int64(conf.maxBlockIndexSize),
+			blocksMarked.WithLabelValues(metadata.NoCompactMarkFilename, metadata.IndexSizeExceedingNoCompactReason),
+		)
+	}
+	var planner compact.Planner = largeIndexFilterPlanner
+	if enableVerticalCompaction {
+		planner = compact.WithVerticalCompactionDownsampleFilter(largeIndexFilterPlanner, bkt, blocksMarked.WithLabelValues(metadata.NoCompactMarkFilename, metadata.DownsampleVerticalCompactionNoCompactReason))
+	}
+	compactor, err := compact.NewBucketCompactorWithCheckerAndCallback(
+		logger,
+		sy,
+		splitGrouper,
+		splitGrouper.Planner(planner),
+		splitGrouper.Compactor(comp),
+		splitGrouper.BlockDeletableChecker(compact.DefaultBlockDeletableChecker{}),
+		splitGrouper.CompactionLifecycleCallback(compact.DefaultCompactionLifecycleCallback{}),
+		compactDir,
+		bkt,
+		conf.compactionConcurrency,
+		conf.skipBlockWithOutOfOrderChunks,
+		blocksCleaner,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	return compactor, splitGrouper, nil
 }

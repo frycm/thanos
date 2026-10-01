@@ -62,7 +62,7 @@ var _ Grouper = &ConcurrentJobsGrouper{}
 
 // NewConcurrentJobsGrouper returns a ConcurrentJobsGrouper that splits the groups of the given Grouper (normally the
 // DefaultGrouper) into compaction jobs. The ranges must be the ones the planner and compactor use.
-func NewConcurrentJobsGrouper(streams Grouper, ranges []int64, noCompBlocks *GatherNoCompactionMarkFilter) *ConcurrentJobsGrouper {
+func NewConcurrentJobsGrouper(streams Grouper, ranges []int64, noCompBlocks NoCompactMarks) *ConcurrentJobsGrouper {
 	return &ConcurrentJobsGrouper{
 		streams:          streams,
 		ranges:           ranges,
@@ -358,7 +358,7 @@ var _ noCompactAwarePlanner = &concurrentJobsPlanner{}
 // split it: the first remaining set of overlapping blocks for a vertical compaction job, the first run of at least
 // two blocks otherwise. The rest is planned again in the next pass.
 // It must not be used with groups of other groupers: it would compact all of their blocks at once.
-func NewConcurrentJobsPlanner(logger log.Logger, noCompBlocks *GatherNoCompactionMarkFilter) *concurrentJobsPlanner {
+func NewConcurrentJobsPlanner(logger log.Logger, noCompBlocks NoCompactMarks) *concurrentJobsPlanner {
 	return &concurrentJobsPlanner{logger: logger, noCompBlocksFunc: noCompBlocks.NoCompactMarkedBlocks}
 }
 

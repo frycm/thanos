@@ -57,9 +57,17 @@ func NewTSDBBasedPlanner(logger log.Logger, ranges []int64) *tsdbBasedPlanner {
 	}
 }
 
+// NoCompactMarks lists the blocks that planners must leave out of compactions. GatherNoCompactionMarkFilter lists the
+// blocks marked for no compaction in the bucket; SplitGrouper adds the blocks it keeps out of normal planning.
+type NoCompactMarks interface {
+	NoCompactMarkedBlocks() map[ulid.ULID]*metadata.NoCompactMark
+}
+
+var _ NoCompactMarks = &GatherNoCompactionMarkFilter{}
+
 // NewPlanner is a default Thanos planner with the same functionality as Prometheus' TSDB plus special handling of excluded blocks.
 // It's the same functionality just without accessing filesystem, and special handling of excluded blocks.
-func NewPlanner(logger log.Logger, ranges []int64, noCompBlocks *GatherNoCompactionMarkFilter) *tsdbBasedPlanner {
+func NewPlanner(logger log.Logger, ranges []int64, noCompBlocks NoCompactMarks) *tsdbBasedPlanner {
 	return &tsdbBasedPlanner{logger: logger, ranges: ranges, noCompBlocksFunc: noCompBlocks.NoCompactMarkedBlocks}
 }
 

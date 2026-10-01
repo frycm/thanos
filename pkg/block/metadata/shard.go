@@ -5,6 +5,7 @@ package metadata
 
 import (
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -96,4 +97,62 @@ func (m *Thanos) StreamLabels() map[string]string {
 // made from. For a block without a valid CompactorShardIDLabel it equals GroupKey.
 func (m *Thanos) StreamGroupKey() string {
 	return fmt.Sprintf("%d@%v", m.Downsample.Resolution, labels.FromMap(m.StreamLabels()).Hash())
+}
+
+const (
+	// CompactorSplitExtensionKey is the key, in the Thanos extensions of a block's meta.json, of the SplitScheme the
+	// block's shard was computed with. The compactor writes it into every block it splits, and keeps it when it
+	// compacts shard blocks further, so that a stream is never split again with a different scheme in a time range
+	// that already holds shard blocks.
+	CompactorSplitExtensionKey = "compactor_split"
+
+	// SplitHashStable is the SplitScheme.Hash of shards computed with labels.StableHash of the series labels, less
+	// the SplitScheme.IgnoreLabels: series s belongs to shard (hash(s) mod count) + 1.
+	SplitHashStable = "stable_hash"
+)
+
+// SplitScheme records how the series of a split were distributed among its shards. Two shard blocks only hold
+// disjoint series for the same index if they were computed with equal schemes.
+type SplitScheme struct {
+	// Hash names the hash function; only SplitHashStable is known.
+	Hash string `json:"hash"`
+	// Shards is the number of shards, the count of the blocks' CompactorShardIDLabel.
+	Shards int `json:"shards"`
+	// IgnoreLabels are the series labels left out of the hash, sorted and without repetition.
+	IgnoreLabels []string `json:"ignore_labels,omitempty"`
+}
+
+// Equal tells whether both schemes distribute series the same way.
+func (s SplitScheme) Equal(o SplitScheme) bool {
+	return s.Hash == o.Hash && s.Shards == o.Shards && slices.Equal(s.IgnoreLabels, o.IgnoreLabels)
+}
+
+func (s SplitScheme) String() string {
+	return fmt.Sprintf("%s over %d shards ignoring labels %v", s.Hash, s.Shards, s.IgnoreLabels)
+}
+
+// SplitScheme returns the scheme recorded in the block's extensions under CompactorSplitExtensionKey, or nil when
+// there is none. An error means a record exists but cannot be read.
+func (m *Thanos) SplitScheme() (*SplitScheme, error) {
+	ext, ok := m.Extensions.(map[string]any)
+	if !ok {
+		if m.Extensions == nil {
+			return nil, nil
+		}
+		// Typed extensions, e.g. set in memory before the meta is written: read them through their JSON form.
+		var generic map[string]any
+		if _, err := ConvertExtensions(m.Extensions, &generic); err != nil {
+			return nil, nil
+		}
+		ext = generic
+	}
+	v, ok := ext[CompactorSplitExtensionKey]
+	if !ok {
+		return nil, nil
+	}
+	var s SplitScheme
+	if _, err := ConvertExtensions(v, &s); err != nil {
+		return nil, errors.Wrapf(err, "parse %s extension", CompactorSplitExtensionKey)
+	}
+	return &s, nil
 }
