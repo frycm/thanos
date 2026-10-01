@@ -196,6 +196,28 @@ Flags:
                                  in RFC3339 format or time duration relative
                                  to current time, such as -1d or 2h45m. Valid
                                  duration units are ms, s, m, h, d, w, y.
+      --min-block-resolution=0s  Minimum downsampling resolution of blocks to
+                                 serve, one of 0s, 5m or 1h. A block of a finer
+                                 resolution is hidden only while blocks at this
+                                 resolution in its block stream hold all of its
+                                 sources over its whole time range; otherwise
+                                 it is still served, as hiding it would drop its
+                                 data. A query asking for finer data than this
+                                 (max_source_resolution) gets nothing from the
+                                 hidden blocks. 0s hides nothing.
+      --max-block-resolution=1h  Maximum downsampling resolution of blocks to
+                                 serve, one of 0s, 5m or 1h. Blocks of a coarser
+                                 resolution are not served; make sure another
+                                 store serves them, or the finer blocks they
+                                 were made from.
+      --[no-]store.warn-hidden-resolution
+                                 If true, a Series request asking for finer data
+                                 than --min-block-resolution gets a warning when
+                                 blocks hidden behind coarser ones overlap its
+                                 time range and external labels. Off by default:
+                                 under the strict partial response strategy,
+                                 which rulers use, the warning fails the request
+                                 even when another store answered it completely.
       --selector.relabel-config-file=<file-path>
                                  Path to YAML file with relabeling
                                  configuration that allows selecting blocks
@@ -328,6 +350,42 @@ Filtering is done on a [Chunk](../design.md#chunk) level, so Thanos Store might 
 ### External Label Partitioning (Sharding)
 
 Check more [here](../sharding.md).
+
+## Resolution filtering and failures
+
+`--min-block-resolution` lets a store gateway serve downsampled blocks instead of the finer blocks they were made from, for example for older time ranges together with `--min-time`/`--max-time`, without hiding finer data that has no downsampled equivalent. `--max-block-resolution` is a hard upper bound: blocks coarser than it are not served, so another store gateway has to serve them or the finer blocks they were made from. Both accept only the resolutions the compactor produces, `0s`, `5m` and `1h`. The defaults, `0s` and `1h`, install no filter.
+
+With a minimum, a block of a finer resolution is hidden only while blocks at exactly the minimum resolution in its block stream hold all of its sources (`compaction.sources` in `meta.json`) over its whole time range. Otherwise it stays served: a block not downsampled yet, a raw block that gained sources after its 5m block was made, or a block without recorded sources. Coverage at a resolution coarser than the minimum does not count, as a query asking for exactly the minimum cannot reach it. Only blocks the other filters keep count as covers: a block too fresh for `--consistency-delay`, marked for deletion past `--ignore-deletion-marks-delay`, a duplicate or migrated to Parquet hides nothing.
+
+`thanos_store_resolution_filter_uncovered_blocks` counts the blocks served below the minimum, and the store logs them whenever that set changes. `thanos_blocks_meta_synced{state="resolution-excluded"}` counts the blocks hidden by either bound.
+
+### Block streams and the compactor shard label
+
+Coverage is judged per block stream: the blocks with the same external labels, apart from the compactor shard label `__compactor_shard_id__`. A compactor splitting compactions by series labels each resulting block with `<i>_of_<M>`, shard `i` (1-based) of `M`, a power of two, and the shards of a compaction hold its series between them. A block is therefore covered through blocks of its own shard, through a coarser or unsplit block holding it, or through a complete set of finer shards - `1_of_4` and `3_of_4` together cover `1_of_2` - but never by one shard alone, and never by another stream's blocks. A block whose shard label does not parse is a stream of its own.
+
+### Sharding store gateways
+
+A store gateway has to see a block's covers to hide it. Shard store gateways using `--min-block-resolution` by external labels only, and keep all shards of a stream on the same gateway by leaving `__compactor_shard_id__` out of the `hashmod` source labels. Sharding by `__block_id` separates covers from the finer blocks they cover: nothing gets hidden, and the uncovered blocks gauge counts every finer block. The store gateway logs a warning at startup when its selector relabeling uses `__block_id` together with a minimum resolution.
+
+A cover outside the gateway's `--min-time`/`--max-time` window does count: the time partition runs after the resolution filter, so a finer block straddling the boundary stays hidden where covers on both sides hold it, the far side being the job of the gateway serving that window. The price is that the filters before the time partition look at the whole bucket instead of the window: one deletion mark lookup per block and sync, as the compactor does.
+
+### When a cover fails
+
+Metadata alone does not retire a finer block. On every sync the store gateway first loads the covers, then checks each cover that hides a finer block: its `meta.json` and `index` objects exist and are not empty, and the index has the size `meta.json` records. The checks run `--block-sync-concurrency` at a time, and a cover that passes is not checked again while it stays a cover. A cover that fails to load or fails the check is not served, and the finer blocks it would hide are loaded back, also with `--block-sync-concurrency`, until a later sync finds the cover usable. This applies on a cold start too, without loading every finer block when the covers load. A finer block that cannot be loaded is logged and retried on the next sync like any other block, and blocks loaded back obey the same time partition.
+
+The check does not read the cover's index, so with `--store.enable-index-header-lazy-reader` and `--store.index-header-lazy-download-strategy=lazy` covers stay lazy. The trade-off: with lazy downloading, a cover whose index exists with the recorded size but cannot be read is not noticed at sync time. Queries reading it fail, or get a warning under the warn partial response strategy, as for any other unreadable block; its data does not silently go missing. Deleting the cover or marking it for deletion brings the finer blocks back on the next sync after it leaves the store's view. Without lazy downloading, the index header is built when the cover is loaded, and a failure brings the finer blocks back right away.
+
+None of this can restore blocks already deleted by retention, or answer queries during an object storage outage.
+
+### Queries finer than the minimum
+
+A request asking for finer data than the minimum (`max_source_resolution` below it) is answered from the finer blocks the store gateway still serves; the ranges of the hidden blocks are missing from it unless another store serves them. Raise the query's `max_source_resolution`, enable `--query.auto-downsampling` on the querier, or route such queries to a store gateway serving finer blocks.
+
+With `--store.warn-hidden-resolution`, such a request gets a warning when hidden blocks overlap its time range and match its external labels and block matchers, and `thanos_bucket_store_hidden_resolution_warnings_total` counts these requests. The store gateway cannot tell whether a hidden block holds any of the requested series without reading it, so the warning can also fire for series it does not hold. The warning is off by default because under the strict partial response strategy it fails the request, even when another store answered it completely. Rule groups default to that strategy (`partial_response_strategy: abort`), so rulers evaluating, say, long-window SLO rules through a gateway with the warning on fail their evaluations. Enable it only on gateways whose finer-than-minimum queries are mistakes worth failing.
+
+### Migrating from an unconditional hide
+
+Replacing a setup that hides a resolution unconditionally, so that raw or 5m blocks of older ranges need not be deleted, makes the blocks without a downsampled equivalent visible again: blocks never downsampled, raw blocks that gained sources after downsampling and blocks whose downsampling lags behind. That is the point of the coverage check, but it can raise the gateway's block count, memory and disk use. `thanos_store_resolution_filter_uncovered_blocks` shows how many such blocks are served; a value that keeps growing points at downsampling lag or failures.
 
 ## Probes
 

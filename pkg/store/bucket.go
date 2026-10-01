@@ -458,6 +458,10 @@ type BucketStore struct {
 	requestLoggerFunc RequestLoggerFunc
 
 	blockLifecycleCallback BlockLifecycleCallback
+
+	// resolution, if set, restores the finer blocks the resolution filter hid
+	// while their covers are not usable. See bucket_resolution_filter.go.
+	resolution *resolutionFallbacks
 }
 
 func (s *BucketStore) validate() error {
@@ -702,6 +706,7 @@ func NewBucketStore(
 	indexReaderPoolMetrics := indexheader.NewReaderPoolMetrics(extprom.WrapRegistererWithPrefix("thanos_bucket_store_", s.reg))
 	s.indexReaderPool = indexheader.NewReaderPool(s.logger, lazyIndexReaderEnabled, lazyIndexReaderIdleTimeout, indexReaderPoolMetrics, s.indexHeaderLazyDownloadStrategy)
 	s.metrics = newBucketStoreMetrics(s.reg) // TODO(metalmatze): Might be possible via Option too
+	s.initResolutionFallbacks()
 
 	if err := s.validate(); err != nil {
 		return nil, errors.Wrap(err, "validate config")
@@ -740,35 +745,18 @@ func (s *BucketStore) SyncBlocks(ctx context.Context) error {
 		return metaFetchErr
 	}
 
-	var wg sync.WaitGroup
-	blockc := make(chan *metadata.Meta)
+	s.loadBlocks(ctx, metas)
 
-	for i := 0; i < s.blockSyncConcurrency; i++ {
-		wg.Go(func() {
-			for meta := range blockc {
-				if preAddErr := s.blockLifecycleCallback.PreAdd(*meta); preAddErr != nil {
-					continue
-				}
-				if err := s.addBlock(ctx, meta); err != nil {
-					continue
-				}
-			}
-		})
-	}
-
-	for id, meta := range metas {
-		if b := s.getBlock(id); b != nil {
-			continue
+	// Fallbacks whose cover is not usable are restored from a partial view
+	// too: restoring only adds blocks, and waiting for a clean sync would
+	// leave their ranges unserved meanwhile.
+	defer s.publishHiddenResolution()
+	if err := s.syncResolutionFallbacks(ctx, metas); err != nil {
+		if metaFetchErr == nil {
+			return err
 		}
-		select {
-		case <-ctx.Done():
-		case blockc <- meta:
-		}
+		level.Warn(s.logger).Log("msg", "restoring resolution fallbacks from a partial metadata view failed; returning the metadata fetch error, the next sync retries both", "err", err)
 	}
-
-	close(blockc)
-	wg.Wait()
-
 	if metaFetchErr != nil {
 		return metaFetchErr
 	}
@@ -804,6 +792,40 @@ func (s *BucketStore) SyncBlocks(ctx context.Context) error {
 	})
 	s.mtx.Unlock()
 	return nil
+}
+
+// loadBlocks adds the blocks of metas the store does not serve yet, with the
+// store's block sync concurrency. A block that fails to load is logged and
+// left for the next sync.
+func (s *BucketStore) loadBlocks(ctx context.Context, metas map[ulid.ULID]*metadata.Meta) {
+	var wg sync.WaitGroup
+	blockc := make(chan *metadata.Meta)
+
+	for i := 0; i < s.blockSyncConcurrency; i++ {
+		wg.Go(func() {
+			for meta := range blockc {
+				if preAddErr := s.blockLifecycleCallback.PreAdd(*meta); preAddErr != nil {
+					continue
+				}
+				if err := s.addBlock(ctx, meta); err != nil {
+					continue
+				}
+			}
+		})
+	}
+
+	for id, meta := range metas {
+		if b := s.getBlock(id); b != nil {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+		case blockc <- meta:
+		}
+	}
+
+	close(blockc)
+	wg.Wait()
 }
 
 // InitialSync perform blocking sync with extra step at the end to delete locally saved blocks that are no longer
@@ -1627,6 +1649,12 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, seriesSrv storepb.Store
 		extLsetToRemove = make(map[string]struct{})
 		for _, l := range req.WithoutReplicaLabels {
 			extLsetToRemove[l] = struct{}{}
+		}
+	}
+
+	if warning := s.hiddenResolutionWarning(req, matchers, reqBlockMatchers); warning != nil {
+		if err := srv.Send(storepb.NewWarnSeriesResponse(warning)); err != nil {
+			return status.Error(codes.Unknown, errors.Wrap(err, "send series response").Error())
 		}
 	}
 

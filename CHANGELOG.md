@@ -16,8 +16,11 @@ It is recommend to upgrade the storage components first (Receive, Store, etc.) a
 
 - [#8667](https://github.com/thanos-io/thanos/pull/8667): Query: fix data race in GetStoreClients by making endpointRef mutex a pointer
 - [#XXXX](https://github.com/thanos-io/thanos/pull/XXXX) Store: select a finer block alongside an overlapping coarser block whose sources do not cover it, so queries do not miss data.
+- [#XXXX](https://github.com/thanos-io/thanos/pull/XXXX) Tools: the shell completion hints of `tools bucket replicate --resolution` list `0s`, `5m` and `1h` instead of `0s`, `300µs` and `3.6ms`.
 
 ### Added
+
+- [#XXXX](https://github.com/thanos-io/thanos/pull/XXXX) Store: `--min-block-resolution`/`--max-block-resolution` hide finer blocks only where coarser blocks cover all their sources over their whole range, so a gateway can serve downsampled data without hiding data that has no downsampled equivalent.
 
 ### Changed
 

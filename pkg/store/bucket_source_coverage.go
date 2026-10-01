@@ -9,6 +9,8 @@ import (
 
 	"github.com/oklog/ulid/v2"
 	"github.com/prometheus/prometheus/model/labels"
+
+	"github.com/thanos-io/thanos/pkg/block/metadata"
 )
 
 // The time-only selection of getForTimeRange reads a finer block only where
@@ -64,7 +66,7 @@ type coarserBlock struct {
 
 // holds reports whether the block holds sources[i] of the finer block.
 func (c coarserBlock) holds(i int) bool {
-	return c.held == nil || c.held[i/64]&(1<<(i%64)) != 0
+	return metadata.Holds(c.held, i)
 }
 
 // selectUncovered appends to bs, the time-only selection of the request,
@@ -228,7 +230,7 @@ func (s *bucketBlockSet) addLineage(b *bucketBlock, level int) {
 		// The same block added twice keeps one lineage.
 		s.countOverlapped(old, -1)
 	}
-	s.lineages[b] = &blockLineage{level: level, sources: sortedSources(b.meta.Compaction.Sources), finestCoarser: -1}
+	s.lineages[b] = &blockLineage{level: level, sources: metadata.SortedSources(b.meta.Compaction.Sources), finestCoarser: -1}
 	s.refreshLineage(b)
 	s.refreshFinerLineages(b, level)
 }
@@ -288,7 +290,7 @@ func (s *bucketBlockSet) refreshLineage(b *bucketBlock) {
 			if c.meta.MaxTime <= b.meta.MinTime {
 				continue
 			}
-			lin.coarser = append(lin.coarser, coarserBlock{block: c, level: k, held: heldSources(s.lineages[c].sources, lin.sources)})
+			lin.coarser = append(lin.coarser, coarserBlock{block: c, level: k, held: metadata.HeldSources(s.lineages[c].sources, lin.sources)})
 			lin.finestCoarser = k
 		}
 	}
@@ -310,44 +312,4 @@ func (s *bucketBlockSet) countOverlapped(lin *blockLineage, delta int) {
 	if lin.finestCoarser >= 0 {
 		s.overlapped[lin.level][lin.finestCoarser] += delta
 	}
-}
-
-// sortedSources returns the sources sorted and without duplicates. Compaction
-// writes them so, and then they are returned as they are.
-func sortedSources(sources []ulid.ULID) []ulid.ULID {
-	for i := 1; i < len(sources); i++ {
-		if sources[i-1].Compare(sources[i]) >= 0 {
-			sorted := slices.Clone(sources)
-			slices.SortFunc(sorted, ulid.ULID.Compare)
-			return slices.Compact(sorted)
-		}
-	}
-	return sources
-}
-
-// heldSources returns a bitset of the finer block's sources that the coarser
-// block holds, or nil if it holds them all. Both must be sorted and unique.
-func heldSources(coarser, finer []ulid.ULID) []uint64 {
-	var held []uint64
-	j := 0
-	for i, src := range finer {
-		for j < len(coarser) && coarser[j].Compare(src) < 0 {
-			j++
-		}
-		if j < len(coarser) && coarser[j] == src {
-			j++
-			if held != nil {
-				held[i/64] |= 1 << (i % 64)
-			}
-			continue
-		}
-		if held == nil {
-			// The first source the coarser block lacks; it holds all before.
-			held = make([]uint64, (len(finer)+63)/64)
-			for k := range i {
-				held[k/64] |= 1 << (k % 64)
-			}
-		}
-	}
-	return held
 }

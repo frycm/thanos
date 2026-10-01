@@ -8,11 +8,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"math/rand"
 	"os"
 	"path"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"testing"
 	"time"
@@ -1522,4 +1524,407 @@ func TestRecursiveLister_MetaJsonOrderIsIrrelevant(t *testing.T) {
 	if isPartial {
 		t.Errorf("Block %s has meta.json but was incorrectly marked as partial", blockID)
 	}
+}
+
+// resFilterMeta builds a test meta for the resolution filter tests.
+func resFilterMeta(id ulid.ULID, resolution int64, lset map[string]string, sources ...ulid.ULID) *metadata.Meta {
+	m := &metadata.Meta{}
+	m.ULID = id
+	m.MinTime, m.MaxTime = 0, 1000
+	m.Compaction.Sources = sources
+	m.Thanos.Labels = lset
+	m.Thanos.Downsample.Resolution = resolution
+	return m
+}
+
+// timedMeta sets the meta's time range.
+func timedMeta(m *metadata.Meta, mint, maxt int64) *metadata.Meta {
+	m.MinTime, m.MaxTime = mint, maxt
+	return m
+}
+
+func resFilterMetas(metas ...*metadata.Meta) map[ulid.ULID]*metadata.Meta {
+	out := make(map[ulid.ULID]*metadata.Meta, len(metas))
+	for _, m := range metas {
+		out[m.ULID] = m
+	}
+	return out
+}
+
+const (
+	testRes5m = int64(300000)
+	testRes1h = int64(3600000)
+)
+
+func TestResolutionMetaFilter_Filter(t *testing.T) {
+	ctx := t.Context()
+	t1 := map[string]string{"tenant": "1"}
+	t2 := map[string]string{"tenant": "2"}
+
+	// Serve only the 5m resolution.
+	f := NewResolutionMetaFilter(log.NewNopLogger(), testRes5m, testRes5m, nil)
+
+	input := resFilterMetas(
+		// Kept: in range, and covers tenant 1 sources 1-3.
+		resFilterMeta(ULID(1), testRes5m, t1, ULIDs(1, 2, 3)...),
+		// Hidden: raw, fully covered by the 5m block above.
+		resFilterMeta(ULID(2), 0, t1, ULIDs(1, 2)...),
+		// Kept although raw: source 7 is not covered by any retained block.
+		resFilterMeta(ULID(3), 0, t1, ULIDs(3, 7)...),
+		// Kept although raw: the sources are covered, but only under other labels.
+		resFilterMeta(ULID(4), 0, t2, ULIDs(1, 2)...),
+		// Hidden: coarser than the maximum, no coverage guard on that side.
+		resFilterMeta(ULID(5), testRes1h, t1, ULIDs(1, 2, 3, 7)...),
+	)
+	expected := map[ulid.ULID]*metadata.Meta{
+		ULID(1): input[ULID(1)],
+		ULID(3): input[ULID(3)],
+		ULID(4): input[ULID(4)],
+	}
+	hidden := input[ULID(2)]
+
+	m := newTestFetcherMetrics()
+	testutil.Ok(t, f.Filter(ctx, input, m.Synced, nil))
+
+	testutil.Equals(t, 2.0, promtest.ToFloat64(m.Synced.WithLabelValues(resolutionExcludedMeta)))
+	testutil.Equals(t, expected, input)
+	// Only the raw block hides behind a cover; the 1h block is out of range.
+	testutil.Equals(t, []*metadata.Meta{hidden}, f.HiddenBlocks())
+	testutil.Equals(t, []*metadata.Meta{input[ULID(1)]}, f.Covers())
+}
+
+// TestResolutionMetaFilter_CoverageFromSeveralBlocks: coverage may be
+// assembled from several blocks at the minimum resolution, each holding part
+// of the sources or part of the range, but every source has to be held over
+// the whole range.
+func TestResolutionMetaFilter_CoverageFromSeveralBlocks(t *testing.T) {
+	t1 := map[string]string{"tenant": "1"}
+	for _, tc := range []struct {
+		name    string
+		covers  []*metadata.Meta
+		covered bool
+	}{
+		{
+			name: "each source by its own block",
+			covers: []*metadata.Meta{
+				resFilterMeta(ULID(10), testRes5m, t1, ULIDs(1)...),
+				resFilterMeta(ULID(11), testRes5m, t1, ULIDs(2)...),
+			},
+			covered: true,
+		},
+		{
+			name: "the range split in two",
+			covers: []*metadata.Meta{
+				timedMeta(resFilterMeta(ULID(10), testRes5m, t1, ULIDs(1, 2)...), 0, 400),
+				timedMeta(resFilterMeta(ULID(11), testRes5m, t1, ULIDs(1, 2)...), 400, 1000),
+			},
+			covered: true,
+		},
+		{
+			name: "a gap in time",
+			covers: []*metadata.Meta{
+				timedMeta(resFilterMeta(ULID(10), testRes5m, t1, ULIDs(1, 2)...), 0, 400),
+				timedMeta(resFilterMeta(ULID(11), testRes5m, t1, ULIDs(1, 2)...), 401, 1000),
+			},
+			covered: false,
+		},
+		{
+			// Source 2 was compacted in after the first half was downsampled.
+			name: "a source missing from part of the range",
+			covers: []*metadata.Meta{
+				timedMeta(resFilterMeta(ULID(10), testRes5m, t1, ULIDs(1)...), 0, 400),
+				timedMeta(resFilterMeta(ULID(11), testRes5m, t1, ULIDs(1, 2)...), 400, 1000),
+			},
+			covered: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := resFilterMeta(ULID(1), 0, t1, ULIDs(1, 2)...)
+			metas := resFilterMetas(append([]*metadata.Meta{raw}, tc.covers...)...)
+			f := NewResolutionMetaFilter(log.NewNopLogger(), testRes5m, testRes1h, nil)
+			testutil.Ok(t, f.Filter(t.Context(), metas, newTestFetcherMetrics().Synced, nil))
+			_, served := metas[raw.ULID]
+			testutil.Equals(t, tc.covered, !served)
+			if tc.covered {
+				testutil.Equals(t, len(tc.covers), len(f.Covers()))
+			}
+		})
+	}
+}
+
+// TestResolutionMetaFilter_CoveringBlockRemovedByOtherFilter asserts the
+// contract behind running the resolution filter after every filter that drops
+// blocks for good: a block another filter removed (too fresh, marked for
+// deletion, parquet-migrated) must not count as coverage, so the finer block
+// it was made from stays served.
+func TestResolutionMetaFilter_CoveringBlockRemovedByOtherFilter(t *testing.T) {
+	ctx := t.Context()
+	raw := ULID(1)
+	covering := ULID(2)
+	t1 := map[string]string{"tenant": "1"}
+	input := resFilterMetas(
+		resFilterMeta(raw, 0, t1, ULIDs(1)...),
+		resFilterMeta(covering, testRes5m, t1, ULIDs(1)...),
+	)
+
+	m := newTestFetcherMetrics()
+	// E.g. the 5m block is younger than the consistency delay.
+	testutil.Ok(t, (&ulidFilter{ulidToDelete: &covering}).Filter(ctx, input, m.Synced, nil))
+
+	f := NewResolutionMetaFilter(log.NewNopLogger(), testRes5m, testRes5m, nil)
+	testutil.Ok(t, f.Filter(ctx, input, m.Synced, nil))
+
+	testutil.Equals(t, 0.0, promtest.ToFloat64(m.Synced.WithLabelValues(resolutionExcludedMeta)))
+	testutil.Equals(t, map[ulid.ULID]*metadata.Meta{raw: input[raw]}, input)
+}
+
+// TestResolutionMetaFilter_CoverageMustBeAtTheMinimumResolution pins down the
+// reachability rule: the query path substitutes finer blocks for missing
+// coarser ones but never the other way around, so only a block AT the minimum
+// resolution can cover a hidden finer block.
+func TestResolutionMetaFilter_CoverageMustBeAtTheMinimumResolution(t *testing.T) {
+	t1 := map[string]string{"tenant": "1"}
+	// Covered only by a 1h block: a max_source_resolution=5m query could
+	// never reach the 1h data, so hiding the raw block would drop the range.
+	input := resFilterMetas(
+		resFilterMeta(ULID(1), 0, t1, ULIDs(1)...),
+		resFilterMeta(ULID(2), testRes1h, t1, ULIDs(1)...),
+	)
+	expected := maps.Clone(input)
+
+	f := NewResolutionMetaFilter(log.NewNopLogger(), testRes5m, testRes1h, nil)
+	testutil.Ok(t, f.Filter(t.Context(), input, newTestFetcherMetrics().Synced, nil))
+	testutil.Equals(t, expected, input)
+}
+
+// TestResolutionMetaFilter_EmptySourcesIsNeverCovered pins down that a block
+// without sources fails open: nothing proves where its data went.
+func TestResolutionMetaFilter_EmptySourcesIsNeverCovered(t *testing.T) {
+	t1 := map[string]string{"tenant": "1"}
+	input := resFilterMetas(
+		resFilterMeta(ULID(1), 0, t1),
+		resFilterMeta(ULID(2), testRes5m, t1, ULIDs(1, 2)...),
+	)
+
+	f := NewResolutionMetaFilter(log.NewNopLogger(), testRes5m, testRes1h, nil)
+	testutil.Ok(t, f.Filter(t.Context(), input, newTestFetcherMetrics().Synced, nil))
+
+	testutil.Equals(t, 2, len(input))
+}
+
+// TestResolutionMetaFilter_NoOpRangeShortCircuits pins down that a filter
+// admitting every resolution does no work.
+func TestResolutionMetaFilter_NoOpRangeShortCircuits(t *testing.T) {
+	// A block that would be hidden as vacuously covered if the passes ran.
+	input := resFilterMetas(resFilterMeta(ULID(1), 0, map[string]string{"tenant": "1"}))
+
+	m := newTestFetcherMetrics()
+	f := NewResolutionMetaFilter(log.NewNopLogger(), 0, testRes1h, nil)
+	testutil.Ok(t, f.Filter(t.Context(), input, m.Synced, nil))
+	testutil.Equals(t, 1, len(input))
+	testutil.Equals(t, 0.0, promtest.ToFloat64(m.Synced.WithLabelValues(resolutionExcludedMeta)))
+}
+
+// TestResolutionMetaFilter_UncoveredGauge pins down the operational surface:
+// the number of served-though-below-minimum blocks is exported through a
+// gauge, and it tracks the set as it shrinks back to zero.
+func TestResolutionMetaFilter_UncoveredGauge(t *testing.T) {
+	ctx := t.Context()
+	gauge := promauto.With(nil).NewGauge(prometheus.GaugeOpts{Name: "test_uncovered"})
+	f := NewResolutionMetaFilter(log.NewNopLogger(), testRes5m, testRes1h, gauge)
+	report := f.Reporter()
+
+	t1 := map[string]string{"tenant": "1"}
+	m := newTestFetcherMetrics()
+	input := resFilterMetas(resFilterMeta(ULID(1), 0, t1, ULIDs(1)...))
+	testutil.Ok(t, f.Filter(ctx, input, m.Synced, nil))
+	testutil.Ok(t, report.Filter(ctx, input, m.Synced, nil))
+	testutil.Equals(t, 1.0, promtest.ToFloat64(gauge))
+
+	// Once coverage exists, the gauge falls back to zero.
+	input[ULID(2)] = resFilterMeta(ULID(2), testRes5m, t1, ULIDs(1)...)
+	testutil.Ok(t, f.Filter(ctx, input, m.Synced, nil))
+	testutil.Ok(t, report.Filter(ctx, input, m.Synced, nil))
+	testutil.Equals(t, 0.0, promtest.ToFloat64(gauge))
+}
+
+// TestResolutionMetaFilter_FallbacksTrustCoversBeyondTheView pins down what
+// FallbacksFor counts as coverage: a retained cover only once the store
+// gateway confirms it usable, and a cover a later filter dropped from the
+// view - the far side of the time partition - unconditionally, as another
+// store gateway's to serve. Only the blocks that hid something are covers.
+func TestResolutionMetaFilter_FallbacksTrustCoversBeyondTheView(t *testing.T) {
+	ctx := t.Context()
+	t1 := map[string]string{"tenant": "1"}
+	f := NewResolutionMetaFilter(log.NewNopLogger(), testRes5m, testRes1h, nil)
+	mint := time.Unix(0, 0)
+	maxt := time.Unix(0, 100*time.Millisecond.Nanoseconds())
+	partition := NewTimePartitionMetaFilter(model.TimeOrDurationValue{Time: &mint}, model.TimeOrDurationValue{Time: &maxt})
+
+	input := resFilterMetas(
+		// Raw block straddling --max-time, hidden by the two covers below.
+		timedMeta(resFilterMeta(ULID(1), 0, t1, ULIDs(1, 2)...), 50, 150),
+		timedMeta(resFilterMeta(ULID(2), testRes5m, t1, ULIDs(1, 2)...), 50, 101),
+		timedMeta(resFilterMeta(ULID(3), testRes5m, t1, ULIDs(1, 2)...), 101, 150),
+		// A 5m block hiding nothing is not a cover and is never verified.
+		timedMeta(resFilterMeta(ULID(4), testRes5m, t1, ULIDs(7)...), 0, 50),
+	)
+	raw := input[ULID(1)]
+	m := newTestFetcherMetrics()
+	testutil.Ok(t, f.Filter(ctx, input, m.Synced, nil))
+	testutil.Ok(t, partition.Filter(ctx, input, m.Synced, nil))
+	testutil.Equals(t, map[ulid.ULID]*metadata.Meta{ULID(2): input[ULID(2)], ULID(4): input[ULID(4)]}, input)
+	// Block 4 hides nothing and is no cover.
+	var covers []ulid.ULID
+	for _, c := range f.Covers() {
+		covers = append(covers, c.ULID)
+	}
+	slices.SortFunc(covers, ulid.ULID.Compare)
+	testutil.Equals(t, []ulid.ULID{ULID(2), ULID(3)}, covers)
+
+	var asked []ulid.ULID
+	usable := func(ok bool) func(*metadata.Meta) bool {
+		return func(meta *metadata.Meta) bool {
+			asked = append(asked, meta.ULID)
+			return ok
+		}
+	}
+	// The in-window cover is usable: nothing falls back, and only that cover
+	// was asked about - the far-side cover is out of view and trusted, block
+	// 4 hides nothing.
+	testutil.Equals(t, 0, len(f.FallbacksFor(input, usable(true))))
+	testutil.Equals(t, []ulid.ULID{ULID(2)}, asked)
+	// The in-window cover is not usable: the raw block comes back.
+	asked = nil
+	testutil.Equals(t, map[ulid.ULID]*metadata.Meta{ULID(1): raw}, f.FallbacksFor(input, usable(false)))
+	testutil.Equals(t, []ulid.ULID{ULID(2)}, asked)
+}
+
+// TestResolutionMetaFilter_CoverageAcrossTheTimePartition pins the store
+// gateway's filter order: the resolution filter runs before the time
+// partition, so a raw block straddling --max-time is still proven covered by
+// the 5m block on the far side of it, and the reporter runs after the
+// partition, so a raw block that is uncovered but not served (out of the
+// window) raises no alarm.
+func TestResolutionMetaFilter_CoverageAcrossTheTimePartition(t *testing.T) {
+	ctx := t.Context()
+	t1 := map[string]string{"tenant": "1"}
+
+	// The store serves [0, 100].
+	mint := time.Unix(0, 0)
+	maxt := time.Unix(0, 100*time.Millisecond.Nanoseconds())
+	gauge := promauto.With(nil).NewGauge(prometheus.GaugeOpts{Name: "test_uncovered"})
+	resolution := NewResolutionMetaFilter(log.NewNopLogger(), testRes5m, testRes1h, gauge)
+	chain := []MetadataFilter{
+		resolution,
+		NewTimePartitionMetaFilter(model.TimeOrDurationValue{Time: &mint}, model.TimeOrDurationValue{Time: &maxt}),
+		resolution.Reporter(),
+	}
+
+	straddling := func() map[ulid.ULID]*metadata.Meta {
+		return resFilterMetas(
+			// Raw block straddling --max-time, made from sources 1-4.
+			timedMeta(resFilterMeta(ULID(1), 0, t1, ULIDs(1, 2, 3, 4)...), 50, 150),
+			// Split 5m cover with shared ancestry: one block inside the window,
+			// one beyond it. The two ranges must meet without a gap.
+			timedMeta(resFilterMeta(ULID(2), testRes5m, t1, ULIDs(1, 2, 3, 4)...), 50, 101),
+			timedMeta(resFilterMeta(ULID(3), testRes5m, t1, ULIDs(1, 2, 3, 4)...), 101, 150),
+		)
+	}
+	input := straddling()
+	// Raw block beyond the window nobody downsampled yet.
+	input[ULID(4)] = timedMeta(resFilterMeta(ULID(4), 0, t1, ULIDs(5)...), 200, 250)
+	// Raw block inside the window nobody downsampled yet: the one alert.
+	input[ULID(5)] = timedMeta(resFilterMeta(ULID(5), 0, t1, ULIDs(6)...), 0, 50)
+	m := newTestFetcherMetrics()
+	for _, f := range chain {
+		testutil.Ok(t, f.Filter(ctx, input, m.Synced, nil))
+	}
+	testutil.Equals(t, map[ulid.ULID]*metadata.Meta{ULID(2): input[ULID(2)], ULID(5): input[ULID(5)]}, input)
+	testutil.Equals(t, 1.0, promtest.ToFloat64(gauge))
+
+	// Partition first: the straddling block loses its far-side cover, cannot
+	// be proven covered and is served in full, duplicating the range block 2
+	// serves - the order this test guards against.
+	input = straddling()
+	for _, f := range []MetadataFilter{chain[1], chain[0], chain[2]} {
+		testutil.Ok(t, f.Filter(ctx, input, m.Synced, nil))
+	}
+	testutil.Equals(t, 2, len(input))
+	testutil.Equals(t, 1.0, promtest.ToFloat64(gauge))
+}
+
+// TestResolutionMetaFilter_ShardsCoverTheirStream: a compactor splitting
+// compactions by series labels each shard block with __compactor_shard_id__,
+// one label set per shard. A block is covered through its own shard, through
+// a coarser shard holding it, or through finer shards that together hold all
+// of it - never through part of its series, and never through another stream.
+func TestResolutionMetaFilter_ShardsCoverTheirStream(t *testing.T) {
+	stream := func(shard string) map[string]string {
+		if shard == "" {
+			return map[string]string{"tenant": "1"}
+		}
+		return map[string]string{"tenant": "1", CompactorShardIDLabel: shard}
+	}
+	raw := func(shard string) *metadata.Meta {
+		return resFilterMeta(ULID(1), 0, stream(shard), ULIDs(1, 2)...)
+	}
+	covers := func(shards ...string) map[ulid.ULID]*metadata.Meta {
+		metas := map[ulid.ULID]*metadata.Meta{}
+		for i, s := range shards {
+			// A shard of a compaction lists every source of the plan.
+			m := resFilterMeta(ULID(100+i), testRes5m, stream(s), ULIDs(1, 2, 3)...)
+			metas[m.ULID] = m
+		}
+		return metas
+	}
+	for _, tc := range []struct {
+		name    string
+		block   *metadata.Meta
+		covers  map[ulid.ULID]*metadata.Meta
+		covered bool
+	}{
+		{name: "unsplit by unsplit", block: raw(""), covers: covers(""), covered: true},
+		{name: "unsplit by every shard", block: raw(""), covers: covers("1_of_2", "2_of_2"), covered: true},
+		{name: "unsplit by shards of mixed counts", block: raw(""), covers: covers("1_of_2", "2_of_4", "4_of_4"), covered: true},
+		{name: "unsplit by one shard of two", block: raw(""), covers: covers("1_of_2"), covered: false},
+		{name: "unsplit by shards missing one", block: raw(""), covers: covers("1_of_2", "2_of_4"), covered: false},
+		{name: "a shard by the same shard", block: raw("1_of_4"), covers: covers("1_of_4"), covered: true},
+		{name: "a shard by the unsplit block", block: raw("1_of_4"), covers: covers(""), covered: true},
+		{name: "a shard by a coarser shard holding it", block: raw("3_of_4"), covers: covers("1_of_2"), covered: true},
+		{name: "a shard by a coarser shard not holding it", block: raw("2_of_4"), covers: covers("1_of_2"), covered: false},
+		{name: "a shard by its finer shards", block: raw("1_of_2"), covers: covers("1_of_4", "3_of_4"), covered: true},
+		{name: "a shard by finer shards of its sibling", block: raw("1_of_2"), covers: covers("2_of_4", "4_of_4"), covered: false},
+		{name: "a malformed shard label is a stream of its own", block: raw("x"), covers: covers(""), covered: false},
+		{name: "a malformed shard label covers only itself", block: raw("x"), covers: covers("x"), covered: true},
+		{name: "a shard count that is not a power of two is malformed", block: raw("1_of_3"), covers: covers(""), covered: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := NewResolutionMetaFilter(log.NewNopLogger(), testRes5m, testRes5m, nil)
+			metas := maps.Clone(tc.covers)
+			metas[ULID(1)] = tc.block
+			testutil.Ok(t, f.Filter(t.Context(), metas, newTestFetcherMetrics().Synced, nil))
+			_, served := metas[ULID(1)]
+			testutil.Equals(t, tc.covered, !served)
+			if tc.covered {
+				// The covers it hides behind are the ones checked before it
+				// is retired.
+				testutil.Assert(t, len(f.Covers()) > 0, "some cover must be recorded as replacing the block")
+				// Once no cover is usable, the block comes back.
+				testutil.Equals(t, 1, len(f.FallbacksFor(metas, func(*metadata.Meta) bool { return false })))
+				testutil.Equals(t, 0, len(f.FallbacksFor(metas, func(*metadata.Meta) bool { return true })))
+			}
+		})
+	}
+
+	// Another stream's shards cover nothing here.
+	f := NewResolutionMetaFilter(log.NewNopLogger(), testRes5m, testRes5m, nil)
+	metas := resFilterMetas(
+		raw(""),
+		resFilterMeta(ULID(100), testRes5m, map[string]string{"tenant": "2", CompactorShardIDLabel: "1_of_2"}, ULIDs(1, 2)...),
+		resFilterMeta(ULID(101), testRes5m, map[string]string{"tenant": "2", CompactorShardIDLabel: "2_of_2"}, ULIDs(1, 2)...),
+	)
+	testutil.Ok(t, f.Filter(t.Context(), metas, newTestFetcherMetrics().Synced, nil))
+	_, served := metas[ULID(1)]
+	testutil.Equals(t, true, served)
 }
