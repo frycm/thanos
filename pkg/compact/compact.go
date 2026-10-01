@@ -456,6 +456,10 @@ type Group struct {
 	blockFilesConcurrency         int
 	compactBlocksFetchConcurrency int
 	extensions                    any
+	// outputLabels are the external labels of the blocks the group produces: its labels, unless set otherwise.
+	outputLabels labels.Labels
+	// planSingleBlock makes BucketCompactor hand the group to the planner even when it holds a single block.
+	planSingleBlock bool
 }
 
 // NewGroup returns a new compaction group.
@@ -492,6 +496,7 @@ func NewGroup(
 		bkt:                           bkt,
 		key:                           key,
 		labels:                        lset,
+		outputLabels:                  lset,
 		resolution:                    resolution,
 		acceptMalformedIndex:          acceptMalformedIndex,
 		enableVerticalCompaction:      enableVerticalCompaction,
@@ -589,6 +594,35 @@ func (cg *Group) MaxTime() int64 {
 // Labels returns the labels that all blocks in the group share.
 func (cg *Group) Labels() labels.Labels {
 	return cg.labels
+}
+
+// OutputLabels returns the external labels of the blocks the group produces. They are the group's labels unless
+// SetOutputLabels set others.
+func (cg *Group) OutputLabels() labels.Labels {
+	return cg.outputLabels
+}
+
+// SetOutputLabels sets the external labels of the blocks the group produces. They must hold every label of the group
+// with the same value, and may add others: for example the label of the shard a group writes, when it compacts only
+// part of the series of its blocks.
+func (cg *Group) SetOutputLabels(lset labels.Labels) error {
+	var err error
+	cg.labels.Range(func(l labels.Label) {
+		if err == nil && lset.Get(l.Name) != l.Value {
+			err = errors.Errorf("output labels %s do not extend the group labels %s", lset, cg.labels)
+		}
+	})
+	if err != nil {
+		return err
+	}
+	cg.outputLabels = lset
+	return nil
+}
+
+// SetPlanSingleBlock sets whether BucketCompactor hands the group to the planner even when the group holds a single
+// block. By default it does not, since a single block has nothing to be compacted with.
+func (cg *Group) SetPlanSingleBlock(v bool) {
+	cg.planSingleBlock = v
 }
 
 // Resolution returns the common downsampling resolution of blocks in the group.
@@ -717,27 +751,14 @@ func NewDownsampleProgressCalculator(reg prometheus.Registerer) *DownsampleProgr
 
 // ProgressCalculate calculates the number of blocks to be downsampled for the given groups.
 func (ds *DownsampleProgressCalculator) ProgressCalculate(ctx context.Context, groups []*Group) error {
-	sources5m := map[ulid.ULID]struct{}{}
-	sources1h := map[ulid.ULID]struct{}{}
+	coverage := downsample.NewCoverage()
 	groupBlocks := make(map[string]int, len(groups))
 
 	for _, group := range groups {
 		for _, m := range group.metasByMinTime {
-			switch m.Thanos.Downsample.Resolution {
-			case downsample.ResLevel0:
-				continue
-			case downsample.ResLevel1:
-				for _, id := range m.Compaction.Sources {
-					sources5m[id] = struct{}{}
-				}
-			case downsample.ResLevel2:
-				for _, id := range m.Compaction.Sources {
-					sources1h[id] = struct{}{}
-				}
-			default:
-				return errors.Errorf("unexpected downsampling resolution %d", m.Thanos.Downsample.Resolution)
+			if err := coverage.Add(m); err != nil {
+				return err
 			}
-
 		}
 	}
 
@@ -745,14 +766,7 @@ func (ds *DownsampleProgressCalculator) ProgressCalculate(ctx context.Context, g
 		for _, m := range group.metasByMinTime {
 			switch m.Thanos.Downsample.Resolution {
 			case downsample.ResLevel0:
-				missing := false
-				for _, id := range m.Compaction.Sources {
-					if _, ok := sources5m[id]; !ok {
-						missing = true
-						break
-					}
-				}
-				if !missing {
+				if coverage.Covers(m, downsample.ResLevel1) {
 					continue
 				}
 
@@ -761,14 +775,7 @@ func (ds *DownsampleProgressCalculator) ProgressCalculate(ctx context.Context, g
 				}
 				groupBlocks[group.key]++
 			case downsample.ResLevel1:
-				missing := false
-				for _, id := range m.Compaction.Sources {
-					if _, ok := sources1h[id]; !ok {
-						missing = true
-						break
-					}
-				}
-				if !missing {
+				if coverage.Covers(m, downsample.ResLevel2) {
 					continue
 				}
 
@@ -1324,7 +1331,7 @@ func (cg *Group) compact(ctx context.Context, dir string, planner Planner, comp 
 		}
 
 		thanosMeta := metadata.Thanos{
-			Labels:       cg.labels.Map(),
+			Labels:       cg.outputLabels.Map(),
 			Downsample:   metadata.ThanosDownsample{Resolution: cg.resolution},
 			Source:       metadata.CompactorSource,
 			SegmentFiles: block.GetSegmentFiles(bdir),
@@ -1594,8 +1601,8 @@ func (c *BucketCompactor) Compact(ctx context.Context) (rerr error) {
 		var groupErrs errutil.MultiError
 	groupLoop:
 		for _, g := range groups {
-			// Ignore groups with only one block because there is nothing to compact.
-			if len(g.IDs()) == 1 {
+			// Ignore groups with only one block because there is nothing to compact, unless the group asks for it.
+			if len(g.IDs()) == 1 && !g.planSingleBlock {
 				continue
 			}
 			select {
