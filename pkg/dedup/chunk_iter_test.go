@@ -503,7 +503,7 @@ func TestDedupChunkSeriesMerger_MatchesQuerier(t *testing.T) {
 		for ts := phase; ts < to; ts += interval {
 			if ts >= from {
 				s := value(ts / interval)
-				out = append(out, withT(s, ts))
+				out = append(out, sampleAtTime(s, ts))
 			}
 		}
 		return out
@@ -683,8 +683,8 @@ func TestDedupChunkSeriesMerger_InputError(t *testing.T) {
 	testutil.NotOk(t, err)
 }
 
-// withT returns the sample at the given time.
-func withT(s chunks.Sample, t int64) chunks.Sample {
+// sampleAtTime returns the sample at the given time.
+func sampleAtTime(s chunks.Sample, t int64) chunks.Sample {
 	hs := s.(histoSample)
 	hs.t = t
 	return hs
