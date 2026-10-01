@@ -2323,16 +2323,25 @@ type bucketBlockSet struct {
 	mtx         sync.RWMutex
 	resolutions []int64          // Available resolution, high to low (in milliseconds).
 	blocks      [][]*bucketBlock // Ordered buckets for the existing resolutions.
+
+	// lineages holds, for each block, what getFor needs to know about the
+	// coarser blocks overlapping it. See bucket_source_coverage.go.
+	lineages map[*bucketBlock]*blockLineage
+	// overlapped[j][k] counts the blocks of resolution index j whose finest
+	// overlapping coarser block has resolution index k.
+	overlapped [][]int
 }
 
 // newBucketBlockSet initializes a new set with the known downsampling windows hard-configured.
 // The set currently does not support arbitrary ranges.
 func newBucketBlockSet(lset labels.Labels) *bucketBlockSet {
-	return &bucketBlockSet{
+	s := &bucketBlockSet{
 		labels:      lset,
 		resolutions: []int64{downsample.ResLevel2, downsample.ResLevel1, downsample.ResLevel0},
 		blocks:      make([][]*bucketBlock, 3),
 	}
+	s.initLineages()
+	return s
 }
 
 func (s *bucketBlockSet) add(b *bucketBlock) error {
@@ -2356,6 +2365,7 @@ func (s *bucketBlockSet) add(b *bucketBlock) error {
 		}
 		return bs[j].meta.MinTime < bs[k].meta.MinTime
 	})
+	s.addLineage(b, i)
 	return nil
 }
 
@@ -2369,6 +2379,7 @@ func (s *bucketBlockSet) remove(id ulid.ULID) {
 				continue
 			}
 			s.blocks[i] = append(bs[:j], bs[j+1:]...)
+			s.removeLineage(b, i)
 			return
 		}
 	}
@@ -2387,14 +2398,30 @@ func int64index(s []int64, x int64) int {
 // Blocks with the biggest resolution possible but not bigger than the given max resolution are returned.
 // It supports overlapping blocks.
 //
+// A finer block that coarser blocks overlap in time is also returned, after
+// that list, unless they hold all its sources over its whole part of the
+// range; see selectUncovered.
+//
 // NOTE: s.blocks are expected to be sorted in minTime order.
-func (s *bucketBlockSet) getFor(mint, maxt, maxResolutionMillis int64, blockMatchers []*labels.Matcher) (bs []*bucketBlock) {
+func (s *bucketBlockSet) getFor(mint, maxt, maxResolutionMillis int64, blockMatchers []*labels.Matcher) []*bucketBlock {
 	if mint > maxt {
 		return nil
 	}
 
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
+
+	bs := s.getForTimeRange(mint, maxt, maxResolutionMillis, blockMatchers)
+	return s.selectUncovered(bs, mint, maxt, maxResolutionMillis, blockMatchers)
+}
+
+// getForTimeRange fills the range with the coarsest blocks the resolution
+// allows and fills only the time gaps between them with finer blocks.
+// It must be called under s.mtx.
+func (s *bucketBlockSet) getForTimeRange(mint, maxt, maxResolutionMillis int64, blockMatchers []*labels.Matcher) (bs []*bucketBlock) {
+	if mint > maxt {
+		return nil
+	}
 
 	// Find first matching resolution.
 	i := 0
@@ -2415,7 +2442,7 @@ func (s *bucketBlockSet) getFor(mint, maxt, maxResolutionMillis int64, blockMatc
 		}
 
 		if i+1 < len(s.resolutions) {
-			bs = append(bs, s.getFor(start, b.meta.MinTime-1, s.resolutions[i+1], blockMatchers)...)
+			bs = append(bs, s.getForTimeRange(start, b.meta.MinTime-1, s.resolutions[i+1], blockMatchers)...)
 		}
 
 		// Include the block in the list of matching ones only if there are no block-level matchers
@@ -2428,7 +2455,7 @@ func (s *bucketBlockSet) getFor(mint, maxt, maxResolutionMillis int64, blockMatc
 	}
 
 	if i+1 < len(s.resolutions) {
-		bs = append(bs, s.getFor(start, maxt, s.resolutions[i+1], blockMatchers)...)
+		bs = append(bs, s.getForTimeRange(start, maxt, s.resolutions[i+1], blockMatchers)...)
 	}
 	return bs
 }
