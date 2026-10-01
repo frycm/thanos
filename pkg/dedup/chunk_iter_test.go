@@ -4,14 +4,22 @@
 package dedup
 
 import (
+	"bytes"
+	"cmp"
+	"fmt"
+	"math"
+	"slices"
 	"testing"
 
 	"github.com/efficientgo/core/testutil"
+	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
+	"github.com/prometheus/prometheus/tsdb/tsdbutil"
+	"github.com/prometheus/prometheus/util/annotations"
 
 	"github.com/thanos-io/thanos/pkg/compact/downsample"
 )
@@ -106,8 +114,10 @@ func TestDedupChunkSeriesMerger(t *testing.T) {
 				storage.NewListChunkSeriesFromSamples(labels.FromStrings("bar", "baz"), []chunks.Sample{sample{2, 2}, sample{20, 20}}, []chunks.Sample{sample{25, 25}, sample{30, 30}}),
 				storage.NewListChunkSeriesFromSamples(labels.FromStrings("bar", "baz"), []chunks.Sample{sample{18, 18}, sample{26, 26}}, []chunks.Sample{sample{31, 31}, sample{35, 35}}),
 			},
+			// The second chunk of the first series continues the first one rather than being
+			// another replica, so it is kept. The last chunk overlaps nothing and is kept as is.
 			expected: storage.NewListChunkSeriesFromSamples(labels.FromStrings("bar", "baz"),
-				[]chunks.Sample{sample{0, 0}, sample{5, 5}},
+				[]chunks.Sample{sample{0, 0}, sample{5, 5}, sample{10, 10}, sample{15, 15}},
 				[]chunks.Sample{sample{31, 31}, sample{35, 35}},
 			),
 		},
@@ -288,10 +298,11 @@ func TestDedupChunkSeriesMergerDownsampledChunks(t *testing.T) {
 			expected: &storage.ChunkSeriesEntry{
 				Lset: defaultLabels,
 				ChunkIteratorFn: func(chunks.Iterator) chunks.Iterator {
+					// Where both series have a sample at the same time, the first one is preferred.
 					samples := [][]chunks.Sample{
-						{sample{299999, 3}, sample{540000, 5}},
-						{sample{299999, 540000}, sample{540000, 2100000}},
-						{sample{299999, 120000}, sample{540000, 300000}},
+						{sample{299999, 5}, sample{540000, 5}},
+						{sample{299999, 600000}, sample{540000, 2100000}},
+						{sample{299999, 0}, sample{540000, 300000}},
 						{sample{299999, 240000}, sample{540000, 540000}},
 						{sample{299999, 240000}, sample{299999, 240000}},
 					}
@@ -474,3 +485,366 @@ func createSamplesWithStep(start, numOfSamples, step int) []chunks.Sample {
 
 	return res
 }
+
+// TestDedupChunkSeriesMerger_MatchesQuerier checks the merger against the
+// querier's penalty deduplication of the same replicas. The merger
+// deduplicates each group of overlapping chunks on its own, so for every
+// group it must return exactly what the querier returns for that group's
+// time range.
+func TestDedupChunkSeriesMerger_MatchesQuerier(t *testing.T) {
+	const (
+		sec        = int64(1000)
+		interval   = 15 * sec
+		blockRange = 7200 * sec
+	)
+	// scrape returns a sample every interval at phase+k*interval within [from, to).
+	scrape := func(from, to, phase int64, value func(k int64) chunks.Sample) []chunks.Sample {
+		var out []chunks.Sample
+		for ts := phase; ts < to; ts += interval {
+			if ts >= from {
+				s := value(ts / interval)
+				out = append(out, withT(s, ts))
+			}
+		}
+		return out
+	}
+	float := func(v float64) func(int64) chunks.Sample {
+		return func(int64) chunks.Sample { return histoSample{f: v} }
+	}
+	hist := func(offset int64) func(int64) chunks.Sample {
+		return func(k int64) chunks.Sample { return histoSample{h: tsdbutil.GenerateTestHistogram(k + offset)} }
+	}
+	floatHist := func(offset int64) func(int64) chunks.Sample {
+		return func(k int64) chunks.Sample {
+			return histoSample{fh: tsdbutil.GenerateTestFloatHistogram(k + offset)}
+		}
+	}
+	without := func(samples []chunks.Sample, from, to int64) []chunks.Sample {
+		return slices.DeleteFunc(slices.Clone(samples), func(s chunks.Sample) bool { return s.T() >= from && s.T() < to })
+	}
+
+	complete := scrape(0, blockRange, 0, float(1))
+	for _, tc := range []struct {
+		name     string
+		replicas [][]chunks.Sample
+		// If set, the merger must return exactly the first replica.
+		keepsFirst bool
+	}{
+		{
+			name:       "lockstep, aligned chunks",
+			replicas:   [][]chunks.Sample{complete, scrape(0, blockRange, 0, float(2))},
+			keepsFirst: true,
+		},
+		{
+			name:       "lockstep, second replica starts 600s later",
+			replicas:   [][]chunks.Sample{complete, scrape(600*sec, blockRange, 0, float(2))},
+			keepsFirst: true,
+		},
+		{
+			name:       "lockstep, second replica starts 1234s later",
+			replicas:   [][]chunks.Sample{complete, scrape(1234*sec, blockRange, 0, float(2))},
+			keepsFirst: true,
+		},
+		{
+			name:       "lockstep, first replica starts 600s later",
+			replicas:   [][]chunks.Sample{scrape(600*sec, blockRange, 0, float(1)), complete},
+			keepsFirst: false,
+		},
+		{
+			name:     "lockstep, gap in the first replica",
+			replicas: [][]chunks.Sample{without(complete, 3000*sec, 3600*sec), scrape(600*sec, blockRange, 0, float(2))},
+		},
+		{
+			name:     "lockstep, gap in the second replica",
+			replicas: [][]chunks.Sample{scrape(600*sec, blockRange, 0, float(1)), without(scrape(0, blockRange, 0, float(2)), 3000*sec, 3600*sec)},
+		},
+		{
+			name:     "scraped 6s apart",
+			replicas: [][]chunks.Sample{complete, scrape(0, blockRange, 6*sec, float(2))},
+		},
+		{
+			name:     "scraped 6s apart, second replica starts 600s later",
+			replicas: [][]chunks.Sample{complete, scrape(600*sec, blockRange, 6*sec, float(2))},
+		},
+		{
+			name:     "scraped 9s apart, first replica starts 600s later",
+			replicas: [][]chunks.Sample{scrape(600*sec, blockRange, 9*sec, float(1)), complete},
+		},
+		{
+			name: "three replicas",
+			replicas: [][]chunks.Sample{
+				without(complete, 3000*sec, 3600*sec),
+				scrape(600*sec, blockRange, 5*sec, float(2)),
+				scrape(1234*sec, blockRange, 11*sec, float(3)),
+			},
+		},
+		{
+			name: "floats and native histograms",
+			replicas: [][]chunks.Sample{
+				scrape(0, 600*sec, 0, float(1)),
+				scrape(300*sec, 1200*sec, 1*sec, hist(0)),
+			},
+		},
+		{
+			// Switching to the second replica looks like a counter reset.
+			name: "native histograms",
+			replicas: [][]chunks.Sample{
+				without(scrape(0, blockRange, 0, hist(1)), 3000*sec, 3600*sec),
+				scrape(600*sec, blockRange, 0, hist(0)),
+			},
+		},
+		{
+			name: "native histograms scraped 6s apart",
+			replicas: [][]chunks.Sample{
+				scrape(0, blockRange, 0, hist(0)),
+				scrape(600*sec, blockRange, 6*sec, hist(1)),
+			},
+		},
+		{
+			name: "float native histograms",
+			replicas: [][]chunks.Sample{
+				without(scrape(0, blockRange, 0, floatHist(1)), 3000*sec, 3600*sec),
+				scrape(600*sec, blockRange, 0, floatHist(0)),
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			lset := labels.FromStrings("__name__", "up")
+			var (
+				input    []storage.ChunkSeries
+				inChunks []chunks.Meta
+			)
+			for _, r := range tc.replicas {
+				s := storage.NewListChunkSeriesFromSamples(lset, headChunks(r, blockRange)...)
+				chks, err := storage.ExpandChunks(s.Iterator(nil))
+				testutil.Ok(t, err)
+				inChunks = append(inChunks, chks...)
+				input = append(input, s)
+			}
+
+			merged := NewChunkSeriesMerger()(input...)
+			testutil.Equals(t, lset, merged.Labels())
+			out, err := storage.ExpandChunks(merged.Iterator(nil))
+			testutil.Ok(t, err)
+			got := expandCheckedChunks(t, out, inChunks)
+
+			var exp []string
+			for _, g := range overlapGroups(inChunks) {
+				exp = append(exp, querierPenaltyDedup(t, lset, g[0], g[1], tc.replicas)...)
+			}
+			testutil.Equals(t, len(exp), len(got), "number of samples")
+			testutil.Equals(t, exp, got)
+
+			if tc.keepsFirst {
+				testutil.Equals(t, formatSamples(t, storage.NewListSeries(lset, tc.replicas[0]).Iterator(nil)), got)
+			}
+		})
+	}
+}
+
+// TestDedupChunkSeriesMerger_OverlappingChunksOfOneSeries checks that the
+// chunks an input series has that overlap each other are merged without loss,
+// rather than deduplicated as if they were replicas.
+func TestDedupChunkSeriesMerger_OverlappingChunksOfOneSeries(t *testing.T) {
+	lset := labels.FromStrings("bar", "baz")
+	merged := NewChunkSeriesMerger()(
+		storage.NewListChunkSeriesFromSamples(lset,
+			[]chunks.Sample{sample{0, 0}, sample{10000, 10}, sample{20000, 20}, sample{30000, 30}},
+			[]chunks.Sample{sample{5000, 5}, sample{15000, 15}, sample{25000, 25}},
+		),
+		storage.NewListChunkSeriesFromSamples(lset,
+			[]chunks.Sample{sample{100000, 100}, sample{110000, 110}},
+		),
+	)
+	act, err := storage.ExpandChunks(merged.Iterator(nil))
+	testutil.Ok(t, err)
+	exp, err := storage.ExpandChunks(storage.NewListChunkSeriesFromSamples(lset,
+		[]chunks.Sample{sample{0, 0}, sample{5000, 5}, sample{10000, 10}, sample{15000, 15}, sample{20000, 20}, sample{25000, 25}, sample{30000, 30}},
+		[]chunks.Sample{sample{100000, 100}, sample{110000, 110}},
+	).Iterator(nil))
+	testutil.Ok(t, err)
+	testutil.Equals(t, exp, act)
+}
+
+func TestDedupChunkSeriesMerger_InputError(t *testing.T) {
+	lset := labels.FromStrings("bar", "baz")
+	merged := NewChunkSeriesMerger()(
+		storage.NewListChunkSeriesFromSamples(lset, []chunks.Sample{sample{0, 0}, sample{10000, 10}}),
+		&storage.ChunkSeriesEntry{
+			Lset: lset,
+			ChunkIteratorFn: func(chunks.Iterator) chunks.Iterator {
+				return errChunksIterator{err: errors.New("chunk read failed")}
+			},
+		},
+	)
+	_, err := storage.ExpandChunks(merged.Iterator(nil))
+	testutil.NotOk(t, err)
+}
+
+// withT returns the sample at the given time.
+func withT(s chunks.Sample, t int64) chunks.Sample {
+	hs := s.(histoSample)
+	hs.t = t
+	return hs
+}
+
+// headChunks cuts samples into chunks the way the TSDB head does: aiming at
+// 120 samples per chunk and spreading the samples evenly over the chunks of
+// the chunk range, so the chunks of replicas that started at different times
+// do not line up.
+func headChunks(samples []chunks.Sample, chunkRange int64) [][]chunks.Sample {
+	const samplesPerChunk = 120
+	var (
+		chks   [][]chunks.Sample
+		curr   []chunks.Sample
+		nextAt int64
+	)
+	for _, s := range samples {
+		if len(curr) > 0 {
+			if len(curr) == samplesPerChunk/4 {
+				nextAt = computeChunkEndTime(curr[0].T(), curr[len(curr)-1].T(), nextAt)
+			}
+			if s.T() >= nextAt || len(curr) >= 2*samplesPerChunk || s.Type() != curr[0].Type() {
+				chks = append(chks, curr)
+				curr = nil
+			}
+		}
+		if len(curr) == 0 {
+			nextAt = (s.T()/chunkRange + 1) * chunkRange
+		}
+		curr = append(curr, s)
+	}
+	if len(curr) > 0 {
+		chks = append(chks, curr)
+	}
+	return chks
+}
+
+// computeChunkEndTime is the TSDB head's estimate of when to cut a chunk
+// that is a quarter full.
+func computeChunkEndTime(start, cur, maxT int64) int64 {
+	n := float64(maxT-start) / (float64(cur-start+1) * 4)
+	if n <= 1 {
+		return maxT
+	}
+	return int64(float64(start) + float64(maxT-start)/math.Floor(n))
+}
+
+// overlapGroups returns the time ranges of the groups of chunks that overlap,
+// directly or through a chain of overlaps.
+func overlapGroups(chks []chunks.Meta) [][2]int64 {
+	chks = slices.Clone(chks)
+	slices.SortFunc(chks, func(a, b chunks.Meta) int { return cmp.Compare(a.MinTime, b.MinTime) })
+	var groups [][2]int64
+	for _, c := range chks {
+		if n := len(groups); n > 0 && c.MinTime <= groups[n-1][1] {
+			groups[n-1][1] = max(groups[n-1][1], c.MaxTime)
+			continue
+		}
+		groups = append(groups, [2]int64{c.MinTime, c.MaxTime})
+	}
+	return groups
+}
+
+// querierPenaltyDedup returns what the querier's penalty deduplication returns
+// for the replicas' samples within [mint, maxt], offered in the given order.
+func querierPenaltyDedup(t *testing.T, lset labels.Labels, mint, maxt int64, replicas [][]chunks.Sample) []string {
+	t.Helper()
+	var set testSeriesSet
+	for _, r := range replicas {
+		var in []chunks.Sample
+		for _, s := range r {
+			if s.T() >= mint && s.T() <= maxt {
+				in = append(in, s)
+			}
+		}
+		if len(in) > 0 {
+			set.series = append(set.series, storage.NewListSeries(lset, in))
+		}
+	}
+	dedupSet := NewSeriesSet(&set, "", AlgorithmPenalty)
+	var out []string
+	for dedupSet.Next() {
+		out = append(out, formatSamples(t, dedupSet.At().Iterator(nil))...)
+	}
+	testutil.Ok(t, dedupSet.Err())
+	return out
+}
+
+// expandCheckedChunks checks that the chunks are well-formed and sorted, and
+// returns their samples. Chunks that are not input chunks passed through must
+// not hold more samples than chunks are encoded with.
+func expandCheckedChunks(t *testing.T, chks, inChunks []chunks.Meta) []string {
+	t.Helper()
+	var (
+		out   []string
+		lastT = int64(math.MinInt64)
+	)
+	for i, c := range chks {
+		testutil.Assert(t, c.MinTime <= c.MaxTime, "chunk %d: min time %d after max time %d", i, c.MinTime, c.MaxTime)
+		testutil.Assert(t, c.MinTime > lastT, "chunk %d: starts at %d, before the previous chunk ends at %d", i, c.MinTime, lastT)
+
+		passedThrough := slices.ContainsFunc(inChunks, func(in chunks.Meta) bool {
+			return in.MinTime == c.MinTime && in.MaxTime == c.MaxTime && bytes.Equal(in.Chunk.Bytes(), c.Chunk.Bytes())
+		})
+		n := c.Chunk.NumSamples()
+		testutil.Assert(t, n > 0, "chunk %d: no samples", i)
+		testutil.Assert(t, passedThrough || n <= 120, "chunk %d: %d samples", i, n)
+
+		it := c.Chunk.Iterator(nil)
+		samples := formatSamples(t, it)
+		testutil.Equals(t, n, len(samples), "chunk %d: number of samples", i)
+		it = c.Chunk.Iterator(it)
+		for it.Next() != chunkenc.ValNone {
+			ts := it.AtT()
+			testutil.Assert(t, ts > lastT, "chunk %d: sample at %d after one at %d", i, ts, lastT)
+			testutil.Assert(t, ts >= c.MinTime && ts <= c.MaxTime, "chunk %d: sample at %d outside [%d, %d]", i, ts, c.MinTime, c.MaxTime)
+			if lastT < c.MinTime {
+				testutil.Equals(t, c.MinTime, ts, "chunk %d: first sample", i)
+			}
+			lastT = ts
+		}
+		testutil.Ok(t, it.Err())
+		testutil.Equals(t, c.MaxTime, lastT, "chunk %d: last sample", i)
+		out = append(out, samples...)
+	}
+	return out
+}
+
+// formatSamples returns the samples as strings, ignoring counter reset hints
+// and the layout of histogram buckets.
+func formatSamples(t *testing.T, it chunkenc.Iterator) []string {
+	t.Helper()
+	var out []string
+	for vt := it.Next(); vt != chunkenc.ValNone; vt = it.Next() {
+		switch vt {
+		case chunkenc.ValFloat:
+			ts, v := it.At()
+			out = append(out, fmt.Sprintf("%d float %v", ts, v))
+		case chunkenc.ValHistogram:
+			ts, h := it.AtHistogram(nil)
+			out = append(out, fmt.Sprintf("%d histogram %s", ts, h.String()))
+		case chunkenc.ValFloatHistogram:
+			ts, fh := it.AtFloatHistogram(nil)
+			out = append(out, fmt.Sprintf("%d float histogram %s", ts, fh.String()))
+		}
+	}
+	testutil.Ok(t, it.Err())
+	return out
+}
+
+type testSeriesSet struct {
+	series []storage.Series
+	i      int
+}
+
+func (s *testSeriesSet) Next() bool {
+	s.i++
+	return s.i <= len(s.series)
+}
+
+func (s *testSeriesSet) At() storage.Series                { return s.series[s.i-1] }
+func (s *testSeriesSet) Err() error                        { return nil }
+func (s *testSeriesSet) Warnings() annotations.Annotations { return nil }
