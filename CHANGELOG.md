@@ -14,9 +14,13 @@ It is recommend to upgrade the storage components first (Receive, Store, etc.) a
 
 ### Fixed
 
+- [#8667](https://github.com/thanos-io/thanos/pull/8667): Query: fix data race in GetStoreClients by making endpointRef mutex a pointer
+
 ### Added
 
 ### Changed
+
+- [#XXXX](https://github.com/thanos-io/thanos/pull/XXXX) Compact, Store: blocks labelled with `__compactor_shard_id__` supersede the unsplit blocks they were made from only once every shard of the split exists; shards are downsampled independently.
 
 ### Removed
 

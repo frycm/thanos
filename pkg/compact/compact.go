@@ -717,27 +717,14 @@ func NewDownsampleProgressCalculator(reg prometheus.Registerer) *DownsampleProgr
 
 // ProgressCalculate calculates the number of blocks to be downsampled for the given groups.
 func (ds *DownsampleProgressCalculator) ProgressCalculate(ctx context.Context, groups []*Group) error {
-	sources5m := map[ulid.ULID]struct{}{}
-	sources1h := map[ulid.ULID]struct{}{}
+	coverage := downsample.NewCoverage()
 	groupBlocks := make(map[string]int, len(groups))
 
 	for _, group := range groups {
 		for _, m := range group.metasByMinTime {
-			switch m.Thanos.Downsample.Resolution {
-			case downsample.ResLevel0:
-				continue
-			case downsample.ResLevel1:
-				for _, id := range m.Compaction.Sources {
-					sources5m[id] = struct{}{}
-				}
-			case downsample.ResLevel2:
-				for _, id := range m.Compaction.Sources {
-					sources1h[id] = struct{}{}
-				}
-			default:
-				return errors.Errorf("unexpected downsampling resolution %d", m.Thanos.Downsample.Resolution)
+			if err := coverage.Add(m); err != nil {
+				return err
 			}
-
 		}
 	}
 
@@ -745,14 +732,7 @@ func (ds *DownsampleProgressCalculator) ProgressCalculate(ctx context.Context, g
 		for _, m := range group.metasByMinTime {
 			switch m.Thanos.Downsample.Resolution {
 			case downsample.ResLevel0:
-				missing := false
-				for _, id := range m.Compaction.Sources {
-					if _, ok := sources5m[id]; !ok {
-						missing = true
-						break
-					}
-				}
-				if !missing {
+				if coverage.Covers(m, downsample.ResLevel1) {
 					continue
 				}
 
@@ -761,14 +741,7 @@ func (ds *DownsampleProgressCalculator) ProgressCalculate(ctx context.Context, g
 				}
 				groupBlocks[group.key]++
 			case downsample.ResLevel1:
-				missing := false
-				for _, id := range m.Compaction.Sources {
-					if _, ok := sources1h[id]; !ok {
-						missing = true
-						break
-					}
-				}
-				if !missing {
+				if coverage.Covers(m, downsample.ResLevel2) {
 					continue
 				}
 
