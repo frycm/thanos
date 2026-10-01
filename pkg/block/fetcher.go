@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -807,6 +808,18 @@ type DeduplicateFilter interface {
 }
 
 // DefaultDeduplicateFilter is a BaseFetcher filter that filters out older blocks that have exactly the same data.
+//
+// Blocks are compared only within a stream: blocks of the same resolution and external labels, ignoring a valid
+// metadata.CompactorShardIDLabel (see metadata.Thanos.StreamGroupKey). Within a stream, the blocks without the shard
+// label (unsplit blocks) form one lane and the blocks of each shard label value form another lane.
+//   - Within a lane, a block is a duplicate when its sources are contained in the sources of another block of the
+//     lane; of blocks with equal sources, the one with the lowest ULID is kept.
+//   - A shard block holds only part of the series of its sources, so it never makes an unsplit block or a block of
+//     another shard a duplicate on its own, and it is never a duplicate of either.
+//   - An unsplit block is also a duplicate when its stream holds a complete shard family covering it: for some count
+//     M, for every index i in [1, M], a block labeled "<i>_of_<M>" whose sources contain its sources.
+//
+// Without shard labels, this is exactly the plain sources rule applied per compaction group.
 // Not go-routine safe.
 type DefaultDeduplicateFilter struct {
 	duplicateIDs []ulid.ULID
@@ -850,13 +863,15 @@ func (f *DefaultDeduplicateFilter) Filter(_ context.Context, metas map[ulid.ULID
 		})
 	}
 
-	// We need only look within a compaction group for duplicates, so splitting by group key gives us parallelizable streams.
-	metasByCompactionGroup := make(map[string][]*metadata.Meta)
+	// We need only look within a stream for duplicates, so splitting by stream gives us parallelizable groups.
+	// A stream is a compaction group whose key ignores the shard label, so the shards of a split are compared with
+	// the blocks they were made from; without shard labels, it is the compaction group.
+	metasByStream := make(map[string][]*metadata.Meta)
 	for _, meta := range metas {
-		groupKey := meta.Thanos.GroupKey()
-		metasByCompactionGroup[groupKey] = append(metasByCompactionGroup[groupKey], meta)
+		streamKey := meta.Thanos.StreamGroupKey()
+		metasByStream[streamKey] = append(metasByStream[streamKey], meta)
 	}
-	for _, group := range metasByCompactionGroup {
+	for _, group := range metasByStream {
 		groupChan <- group
 	}
 	close(groupChan)
@@ -868,7 +883,41 @@ func (f *DefaultDeduplicateFilter) Filter(_ context.Context, metas map[ulid.ULID
 	return nil
 }
 
+// filterGroup sends the duplicates among the blocks of one stream to dupsChan, each exactly once.
 func (f *DefaultDeduplicateFilter) filterGroup(metaSlice []*metadata.Meta, dupsChan chan ulid.ULID) {
+	var (
+		unsplit    []*metadata.Meta
+		shardLanes map[string][]*metadata.Meta
+	)
+	for _, m := range metaSlice {
+		shardID, ok := m.Thanos.ShardID()
+		if !ok {
+			unsplit = append(unsplit, m)
+			continue
+		}
+		if shardLanes == nil {
+			shardLanes = make(map[string][]*metadata.Meta)
+		}
+		shardLanes[shardID] = append(shardLanes[shardID], m)
+	}
+
+	duplicates := filterLane(unsplit)
+	if len(unsplit) > 0 && len(shardLanes) > 0 {
+		duplicates = append(duplicates, supersededByShardFamilies(unsplit, duplicates, shardLanes)...)
+	}
+	for _, lane := range shardLanes {
+		duplicates = append(duplicates, filterLane(lane)...)
+	}
+
+	for _, duplicate := range duplicates {
+		dupsChan <- duplicate
+	}
+}
+
+// filterLane returns the blocks of a lane whose sources are contained in the sources of another block of the lane.
+// Blocks are visited by decreasing number of sources, then increasing ULID, and a block is a duplicate of a block
+// visited before it: of blocks with equal sources, the one with the lowest ULID is kept.
+func filterLane(metaSlice []*metadata.Meta) []ulid.ULID {
 	sort.Slice(metaSlice, func(i, j int) bool {
 		ilen := len(metaSlice[i].Compaction.Sources)
 		jlen := len(metaSlice[j].Compaction.Sources)
@@ -898,10 +947,141 @@ childLoop:
 		// Child's sources not covered by any member of coveringSet, add it to coveringSet.
 		coveringSet = append(coveringSet, child)
 	}
+	return duplicates
+}
 
-	for _, duplicate := range duplicates {
-		dupsChan <- duplicate
+// shardBlock is a block of a shard of a split, with its sources sorted and without repetition.
+type shardBlock struct {
+	index, count int
+	sources      []ulid.ULID
+}
+
+// supersededByShardFamilies returns the unsplit blocks of a stream, except those already in unsplitDups, whose data
+// is held by a complete shard family of the stream: for some count M, for every index i in [1, M], a block of the
+// shard lane "<i>_of_<M>" whose sources contain the unsplit block's sources.
+func supersededByShardFamilies(unsplit []*metadata.Meta, unsplitDups []ulid.ULID, shardLanes map[string][]*metadata.Meta) []ulid.ULID {
+	type shardLane struct {
+		index, count int
+		metas        []*metadata.Meta
 	}
+
+	// Lane values are distinct, and each valid shard has exactly one value, so a count whose number of lanes equals
+	// the count has a lane for each of its indexes.
+	var (
+		lanes         = make([]shardLane, 0, len(shardLanes))
+		lanesPerCount = make(map[int]int)
+	)
+	for shardID, metas := range shardLanes {
+		index, count, err := metadata.ParseShardID(shardID)
+		if err != nil {
+			// Not a shard of a split we know of: its lane never supersedes another one.
+			continue
+		}
+		lanes = append(lanes, shardLane{index: index, count: count, metas: metas})
+		lanesPerCount[count]++
+	}
+
+	// Index the blocks of complete families by each of their sources: a block containing all sources of an unsplit
+	// block contains each of them, so the blocks listed under any one of them are the only candidates.
+	var (
+		bySource    = make(map[ulid.ULID][]*shardBlock)
+		anyComplete bool
+	)
+	for _, l := range lanes {
+		if lanesPerCount[l.count] != l.count {
+			continue
+		}
+		anyComplete = true
+		for _, m := range l.metas {
+			b := &shardBlock{index: l.index, count: l.count, sources: sortedUniqueSources(m.Compaction.Sources)}
+			for _, s := range b.sources {
+				bySource[s] = append(bySource[s], b)
+			}
+		}
+	}
+	if !anyComplete {
+		return nil
+	}
+
+	skip := make(map[ulid.ULID]struct{}, len(unsplitDups))
+	for _, id := range unsplitDups {
+		skip[id] = struct{}{}
+	}
+	var duplicates []ulid.ULID
+	for _, m := range unsplit {
+		if _, ok := skip[m.ULID]; ok {
+			continue
+		}
+		if coveredByShardFamily(sortedUniqueSources(m.Compaction.Sources), bySource) {
+			duplicates = append(duplicates, m.ULID)
+		}
+	}
+	return duplicates
+}
+
+// coveredByShardFamily tells whether, for some count M, each of the M shards has a block in bySource whose sources
+// contain sources, which must be sorted and without repetition. bySource must only hold blocks of complete families.
+func coveredByShardFamily(sources []ulid.ULID, bySource map[ulid.ULID][]*shardBlock) bool {
+	if len(sources) == 0 {
+		// Any block contains an empty set of sources, and bySource holds at least one complete family.
+		return true
+	}
+
+	// The candidates are the blocks listed under the rarest source.
+	var candidates []*shardBlock
+	for i, s := range sources {
+		blocks := bySource[s]
+		if len(blocks) == 0 {
+			return false
+		}
+		if i == 0 || len(blocks) < len(candidates) {
+			candidates = blocks
+		}
+	}
+
+	// Indexes, per count, having a block that contains sources.
+	covering := make(map[int]map[int]struct{})
+	for _, b := range candidates {
+		if len(b.sources) < len(sources) {
+			continue
+		}
+		indexes := covering[b.count]
+		if _, ok := indexes[b.index]; ok {
+			continue
+		}
+		if !containsSorted(b.sources, sources) {
+			continue
+		}
+		if indexes == nil {
+			indexes = make(map[int]struct{})
+			covering[b.count] = indexes
+		}
+		indexes[b.index] = struct{}{}
+		if len(indexes) == b.count {
+			return true
+		}
+	}
+	return false
+}
+
+// sortedUniqueSources returns a sorted copy of sources without repetition.
+func sortedUniqueSources(sources []ulid.ULID) []ulid.ULID {
+	sorted := slices.Clone(sources)
+	slices.SortFunc(sorted, func(a, b ulid.ULID) int { return a.Compare(b) })
+	return slices.Compact(sorted)
+}
+
+// containsSorted tells whether every element of sub is in super; both must be sorted.
+func containsSorted(super, sub []ulid.ULID) bool {
+	for _, s := range sub {
+		i, found := slices.BinarySearchFunc(super, s, func(a, b ulid.ULID) int { return a.Compare(b) })
+		if !found {
+			return false
+		}
+		// Elements of sub are increasing, so the rest of them can only be after s.
+		super = super[i+1:]
+	}
+	return true
 }
 
 // DuplicateIDs returns slice of block ids that are filtered out by DefaultDeduplicateFilter.

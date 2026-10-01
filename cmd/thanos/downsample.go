@@ -203,25 +203,11 @@ func downsampleBucket(
 		}
 	}()
 
-	// mapping from a hash over all source IDs to blocks. We don't need to downsample a block
-	// if a downsampled version with the same hash already exists.
-	sources5m := map[ulid.ULID]struct{}{}
-	sources1h := map[ulid.ULID]struct{}{}
-
+	// We don't need to downsample a block if its data is already present at the lower resolution.
+	coverage := downsample.NewCoverage()
 	for _, m := range metas {
-		switch m.Thanos.Downsample.Resolution {
-		case downsample.ResLevel0:
-			continue
-		case downsample.ResLevel1:
-			for _, id := range m.Compaction.Sources {
-				sources5m[id] = struct{}{}
-			}
-		case downsample.ResLevel2:
-			for _, id := range m.Compaction.Sources {
-				sources1h[id] = struct{}{}
-			}
-		default:
-			return errors.Errorf("unexpected downsampling resolution %d", m.Thanos.Downsample.Resolution)
+		if err := coverage.Add(m); err != nil {
+			return err
 		}
 	}
 
@@ -282,14 +268,7 @@ metaSendLoop:
 			continue
 
 		case downsample.ResLevel0:
-			missing := false
-			for _, id := range m.Compaction.Sources {
-				if _, ok := sources5m[id]; !ok {
-					missing = true
-					break
-				}
-			}
-			if !missing {
+			if coverage.Covers(m, downsample.ResLevel1) {
 				continue
 			}
 			// Only downsample blocks once we are sure to get roughly 2 chunks out of it.
@@ -300,14 +279,7 @@ metaSendLoop:
 			}
 
 		case downsample.ResLevel1:
-			missing := false
-			for _, id := range m.Compaction.Sources {
-				if _, ok := sources1h[id]; !ok {
-					missing = true
-					break
-				}
-			}
-			if !missing {
+			if coverage.Covers(m, downsample.ResLevel2) {
 				continue
 			}
 			// Only downsample blocks once we are sure to get roughly 2 chunks out of it.

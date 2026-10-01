@@ -533,6 +533,40 @@ func TestDownsampleProgressCalculate(t *testing.T) {
 			},
 			expected: 0.0,
 		},
+		{
+			// The 5m block of one shard covers neither the sibling shard nor the unsplit block they were made from:
+			// both still need downsampling.
+			testName: "shard_5m_block_covers_only_its_shard",
+			input: []*metadata.Meta{
+				createBlockMeta(20, 0, downsample.ResLevel1DownsampleRange, map[string]string{"a": "1"}, downsample.ResLevel0, []uint64{30}),
+				createBlockMeta(21, 0, downsample.ResLevel1DownsampleRange, map[string]string{"a": "1", metadata.CompactorShardIDLabel: "1_of_2"}, downsample.ResLevel0, []uint64{30}),
+				createBlockMeta(22, 0, downsample.ResLevel1DownsampleRange, map[string]string{"a": "1", metadata.CompactorShardIDLabel: "2_of_2"}, downsample.ResLevel0, []uint64{30}),
+				createBlockMeta(23, 0, downsample.ResLevel1DownsampleRange, map[string]string{"a": "1", metadata.CompactorShardIDLabel: "1_of_2"}, downsample.ResLevel1, []uint64{30}),
+			},
+			expected: 2.0,
+		},
+		{
+			// The 5m blocks of every shard cover the unsplit block they were made from.
+			testName: "complete_5m_shard_family_covers_the_unsplit_block",
+			input: []*metadata.Meta{
+				createBlockMeta(20, 0, downsample.ResLevel1DownsampleRange, map[string]string{"a": "1"}, downsample.ResLevel0, []uint64{30}),
+				createBlockMeta(21, 0, downsample.ResLevel1DownsampleRange, map[string]string{"a": "1", metadata.CompactorShardIDLabel: "1_of_2"}, downsample.ResLevel0, []uint64{30}),
+				createBlockMeta(22, 0, downsample.ResLevel1DownsampleRange, map[string]string{"a": "1", metadata.CompactorShardIDLabel: "2_of_2"}, downsample.ResLevel0, []uint64{30}),
+				createBlockMeta(23, 0, downsample.ResLevel1DownsampleRange, map[string]string{"a": "1", metadata.CompactorShardIDLabel: "1_of_2"}, downsample.ResLevel1, []uint64{30}),
+				createBlockMeta(24, 0, downsample.ResLevel1DownsampleRange, map[string]string{"a": "1", metadata.CompactorShardIDLabel: "2_of_2"}, downsample.ResLevel1, []uint64{30}),
+			},
+			expected: 0.0,
+		},
+		{
+			// An unsplit 5m block covers the shards made from its sources.
+			testName: "unsplit_5m_block_covers_the_shards",
+			input: []*metadata.Meta{
+				createBlockMeta(21, 0, downsample.ResLevel1DownsampleRange, map[string]string{"a": "1", metadata.CompactorShardIDLabel: "1_of_2"}, downsample.ResLevel0, []uint64{30}),
+				createBlockMeta(22, 0, downsample.ResLevel1DownsampleRange, map[string]string{"a": "1", metadata.CompactorShardIDLabel: "2_of_2"}, downsample.ResLevel0, []uint64{30}),
+				createBlockMeta(23, 0, downsample.ResLevel1DownsampleRange, map[string]string{"a": "1"}, downsample.ResLevel1, []uint64{30}),
+			},
+			expected: 0.0,
+		},
 	} {
 		if ok := t.Run(tcase.testName, func(t *testing.T) {
 			blocks := make(map[ulid.ULID]*metadata.Meta, len(tcase.input))
