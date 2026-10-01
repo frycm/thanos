@@ -118,6 +118,19 @@ On the next compaction, multiple streams' blocks will be compacted into one.
 
 If you need a different deduplication algorithm, use `--deduplication.func=FUNC` flag. The default value is the original `one-to-one` deduplication.
 
+### Concurrent Jobs (Experimental)
+
+By default, the compactor plans a single compaction per stream, runs it and syncs the bucket again before planning the next one. `--compact.concurrency` only lets different streams compact at the same time, so a single stream with a large backlog (a big tenant, weeks of backfilled blocks) is compacted one compaction after the other.
+
+With the experimental `--compact.concurrent-jobs` flag, the compactor plans, from the same view of the bucket, all compactions of a stream that do not depend on each other, and runs them concurrently, up to `--compact.concurrency` at a time:
+
+* each set of overlapping blocks, when [vertical compaction](#vertical-compactions) is enabled;
+* for each compaction range, from the smallest to the largest, each time-aligned range that the default planner would compact (the newest block is left out, the range must be complete or end before the second newest block starts, blocks marked for no compaction are excluded), unless it overlaps in time a compaction already planned in the same pass.
+
+Once these compactions are done, the compactor syncs the bucket and plans again. Each compaction is one the default planner would also do, with the same blocks, so the resulting blocks are the same; only the number of passes changes. For example, two weeks of 2h blocks are compacted in 3 passes instead of 50. Unlike the default planner, it never rewrites a single block because of its tombstones: Thanos does not upload tombstones to object storage, so that rewrite does not change any data.
+
+Each compaction running at the same time needs its own disk space, memory and network bandwidth, see [Resources](#resources).
+
 ## Enforcing Retention of Data
 
 By default, there is NO retention set for object storage data. This means that you store data forever, which is a valid and recommended way of running Thanos.
@@ -257,7 +270,7 @@ You should horizontally scale Compactor to cope with this using [label sharding]
 
 2. TSDB blocks from single stream is too big, it takes too much time or resources.
 
-This is rare as first you would need to ingest that amount of data into Prometheus and it's usually not recommended to have bigger than 10 millions series in the 2 hours blocks. However, with 2 weeks blocks, potential [Vertical Compaction](#vertical-compactions) enabled and other producers than Prometheus (e.g backfilling) this scalability concern can appear as well. See [Limit size of blocks](https://github.com/thanos-io/thanos/issues/3068) ticket to track progress of solution if you are hitting this.
+This is rare as first you would need to ingest that amount of data into Prometheus and it's usually not recommended to have bigger than 10 millions series in the 2 hours blocks. However, with 2 weeks blocks, potential [Vertical Compaction](#vertical-compactions) enabled and other producers than Prometheus (e.g backfilling) this scalability concern can appear as well. See [Limit size of blocks](https://github.com/thanos-io/thanos/issues/3068) ticket to track progress of solution if you are hitting this. If a single stream has a large backlog of blocks to compact, the experimental [concurrent jobs](#concurrent-jobs-experimental) compact its independent time ranges in parallel.
 
 ## Eventual Consistency
 
@@ -387,6 +400,17 @@ Flags:
                                 supported.
       --compact.concurrency=1   Number of goroutines to use when compacting
                                 groups.
+      --[no-]compact.concurrent-jobs
+                                Experimental. When set to true, the compactor
+                                plans, in each pass, all compactions of a
+                                stream (blocks with the same external labels and
+                                resolution) that do not depend on each other:
+                                sets of overlapping blocks and time-aligned
+                                ranges that do not overlap. They run
+                                concurrently, up to --compact.concurrency at
+                                a time, instead of one compaction per stream
+                                and pass. The resulting blocks are the same as
+                                without it.
       --compact.blocks-fetch-concurrency=1
                                 Number of goroutines to use when download block
                                 during compaction.

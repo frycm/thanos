@@ -18,6 +18,8 @@ It is recommend to upgrade the storage components first (Receive, Store, etc.) a
 
 ### Added
 
+- [#XXXX](https://github.com/thanos-io/thanos/pull/XXXX) Compact: experimental `--compact.concurrent-jobs` plans every independent, time-aligned compaction of a stream in one pass and runs them concurrently.
+
 ### Changed
 
 ### Removed

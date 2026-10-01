@@ -28,7 +28,21 @@ type tsdbBasedPlanner struct {
 	noCompBlocksFunc func() map[ulid.ULID]*metadata.NoCompactMark
 }
 
-var _ Planner = &tsdbBasedPlanner{}
+var _ noCompactAwarePlanner = &tsdbBasedPlanner{}
+
+// noCompactAwarePlanner is a Planner that can plan against an explicit set of blocks marked for no compaction.
+// The planner filters below (largeTotalIndexSizeFilter, verticalCompactionDownsampleFilter) wrap it: when they mark
+// a block for no compaction, they plan again with that block excluded.
+type noCompactAwarePlanner interface {
+	Planner
+
+	// plan returns the blocks to compact into a single block. It must never select a block in noCompactMarked.
+	plan(noCompactMarked map[ulid.ULID]*metadata.NoCompactMark, metasByMinTime []*metadata.Meta) ([]*metadata.Meta, error)
+	// noCompactMarkedBlocks returns the blocks currently marked for no compaction.
+	noCompactMarkedBlocks() map[ulid.ULID]*metadata.NoCompactMark
+	// plannerLogger returns the logger the planner filters log with.
+	plannerLogger() log.Logger
+}
 
 // NewTSDBBasedPlanner is planner with the same functionality as Prometheus' TSDB.
 // TODO(bwplotka): Consider upstreaming this to Prometheus.
@@ -52,6 +66,14 @@ func NewPlanner(logger log.Logger, ranges []int64, noCompBlocks *GatherNoCompact
 // TODO(bwplotka): Consider smarter algorithm, this prefers smaller iterative compactions vs big single one: https://github.com/thanos-io/thanos/issues/3405
 func (p *tsdbBasedPlanner) Plan(_ context.Context, metasByMinTime []*metadata.Meta, _ chan error, _ any) ([]*metadata.Meta, error) {
 	return p.plan(p.noCompBlocksFunc(), metasByMinTime)
+}
+
+func (p *tsdbBasedPlanner) noCompactMarkedBlocks() map[ulid.ULID]*metadata.NoCompactMark {
+	return p.noCompBlocksFunc()
+}
+
+func (p *tsdbBasedPlanner) plannerLogger() log.Logger {
+	return p.logger
 }
 
 func (p *tsdbBasedPlanner) plan(noCompactMarked map[ulid.ULID]*metadata.NoCompactMark, metasByMinTime []*metadata.Meta) ([]*metadata.Meta, error) {
@@ -195,11 +217,7 @@ func splitByRange(metasByMinTime []*metadata.Meta, tr int64) [][]*metadata.Meta 
 			m     = metasByMinTime[i]
 		)
 		// Compute start of aligned time range of size tr closest to the current block's start.
-		if m.MinTime >= 0 {
-			t0 = tr * (m.MinTime / tr)
-		} else {
-			t0 = tr * ((m.MinTime - tr + 1) / tr)
-		}
+		t0 = alignedRangeStart(m.MinTime, tr)
 
 		// Skip blocks that don't fall into the range. This can happen via misalignment or
 		// by being the multiple of the intended range.
@@ -225,8 +243,17 @@ func splitByRange(metasByMinTime []*metadata.Meta, tr int64) [][]*metadata.Meta 
 	return splitDirs
 }
 
+// alignedRangeStart returns the start of the aligned time range of size tr that contains t.
+func alignedRangeStart(t, tr int64) int64 {
+	if t >= 0 {
+		return tr * (t / tr)
+	}
+	return tr * ((t - tr + 1) / tr)
+}
+
 type largeTotalIndexSizeFilter struct {
-	*tsdbBasedPlanner
+	planner noCompactAwarePlanner
+	logger  log.Logger
 
 	bkt                    objstore.Bucket
 	markedForNoCompact     prometheus.Counter
@@ -300,20 +327,21 @@ PlanLoop:
 // When found, it marks block for no compaction by placing no-compact-mark.json and updating cache.
 // NOTE: The estimation is very rough as it assumes extreme cases of indexes sharing no bytes, thus summing all source index sizes.
 // Adjust limit accordingly reducing to some % of actual limit you want to give.
+// The wrapped planner is the one returned by NewPlanner, NewTSDBBasedPlanner or NewConcurrentJobsPlanner.
 // TODO(bwplotka): This is short term fix for https://github.com/thanos-io/thanos/issues/1424, replace with vertical block sharding https://github.com/thanos-io/thanos/pull/3390.
-func WithLargeTotalIndexSizeFilter(with *tsdbBasedPlanner, bkt objstore.Bucket, totalMaxIndexSizeBytes int64, markedForNoCompact prometheus.Counter) *largeTotalIndexSizeFilter {
-	return &largeTotalIndexSizeFilter{tsdbBasedPlanner: with, bkt: bkt, totalMaxIndexSizeBytes: totalMaxIndexSizeBytes, markedForNoCompact: markedForNoCompact}
+func WithLargeTotalIndexSizeFilter(with noCompactAwarePlanner, bkt objstore.Bucket, totalMaxIndexSizeBytes int64, markedForNoCompact prometheus.Counter) *largeTotalIndexSizeFilter {
+	return &largeTotalIndexSizeFilter{planner: with, logger: with.plannerLogger(), bkt: bkt, totalMaxIndexSizeBytes: totalMaxIndexSizeBytes, markedForNoCompact: markedForNoCompact}
 }
 
 func (t *largeTotalIndexSizeFilter) plan(ctx context.Context, extraNoCompactMarked map[ulid.ULID]*metadata.NoCompactMark, metasByMinTime []*metadata.Meta) ([]*metadata.Meta, error) {
-	noCompactMarked := t.noCompBlocksFunc()
+	noCompactMarked := t.planner.noCompactMarkedBlocks()
 	copiedNoCompactMarked := make(map[ulid.ULID]*metadata.NoCompactMark, len(noCompactMarked)+len(extraNoCompactMarked))
 	maps.Copy(copiedNoCompactMarked, noCompactMarked)
 	maps.Copy(copiedNoCompactMarked, extraNoCompactMarked)
 
 PlanLoop:
 	for {
-		plan, err := t.tsdbBasedPlanner.plan(copiedNoCompactMarked, metasByMinTime)
+		plan, err := t.planner.plan(copiedNoCompactMarked, metasByMinTime)
 		if err != nil {
 			return nil, err
 		}
