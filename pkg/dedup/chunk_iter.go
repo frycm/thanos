@@ -369,7 +369,11 @@ func (errChunksIterator) Next() bool      { return false }
 func (e errChunksIterator) Err() error    { return e.err }
 
 type aggrChunkIterator struct {
-	iters        [5]chunkenc.Iterator
+	iters [5]chunkenc.Iterator
+	// pending holds the value type of the sample each aggregate's iterator
+	// read past the end of the previous chunk, or ValNone. That sample is yet
+	// to be encoded.
+	pending      [5]chunkenc.ValueType
 	curr         chunks.Meta
 	countChkIter chunks.Iterator
 
@@ -443,14 +447,29 @@ func (a *aggrChunkIterator) toChunk(at downsample.AggrType, minTime, maxTime int
 		return nil, err
 	}
 
-	it := NewBoundedSeriesIterator(a.iters[at], minTime, maxTime)
+	it := a.iters[at]
 
 	var (
 		lastT int64
 		lastV float64
 	)
-	for it.Next() != chunkenc.ValNone {
-		lastT, lastV = it.At()
+	// Reading the previous chunk stopped at the first sample after it, which
+	// can be the first sample of this chunk.
+	vt := a.pending[at]
+	a.pending[at] = chunkenc.ValNone
+	if vt == chunkenc.ValNone {
+		vt = it.Next()
+	}
+	for ; vt != chunkenc.ValNone; vt = it.Next() {
+		t, v := it.At()
+		if t < minTime {
+			continue
+		}
+		if t > maxTime {
+			a.pending[at] = vt
+			break
+		}
+		lastT, lastV = t, v
 		appender.Append(lastT, lastV)
 	}
 	if err := it.Err(); err != nil {

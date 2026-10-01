@@ -683,6 +683,220 @@ func TestDedupChunkSeriesMerger_InputError(t *testing.T) {
 	testutil.NotOk(t, err)
 }
 
+// TestDedupChunkSeriesMerger_DownsampledChunkBoundaries checks downsampled
+// chunks whose deduplication yields more count samples than one chunk holds.
+// Every output chunk must hold, for each aggregate, the samples the penalty
+// deduplication of that aggregate returns within the chunk's time range, so
+// sum, min and max have a sample wherever count has one.
+func TestDedupChunkSeriesMerger_DownsampledChunkBoundaries(t *testing.T) {
+	const (
+		minute = int64(60 * 1000)
+		hour   = 60 * minute
+		step   = downsample.ResLevel1
+	)
+	all := []downsample.AggrType{downsample.AggrCount, downsample.AggrSum, downsample.AggrMin, downsample.AggrMax, downsample.AggrCounter}
+
+	// aggrChunk returns a downsampled chunk with the given aggregates, each
+	// with a sample every step for k in [from, to). The values tell the
+	// replica, the aggregate and k apart.
+	aggrChunk := func(replica, from, to int64, aggrs []downsample.AggrType) []chunks.Meta {
+		var chks [5]chunkenc.Chunk
+		for _, at := range aggrs {
+			c := chunkenc.NewXORChunk()
+			app, err := c.Appender()
+			testutil.Ok(t, err)
+			for k := from; k < to; k++ {
+				app.Append((k+1)*step, float64(replica*1000000+int64(at)*10000+k))
+			}
+			chks[at] = c
+		}
+		return []chunks.Meta{{MinTime: (from + 1) * step, MaxTime: to * step, Chunk: downsample.EncodeAggrChunk(chks)}}
+	}
+	// downsampled returns the chunks downsampled to step from a raw sample
+	// every 15s at phase within [from, to), leaving out [gapFrom, gapTo).
+	downsampled := func(from, to, phase, gapFrom, gapTo int64, offset float64) []chunks.Meta {
+		var raw []chunks.Sample
+		for ts := from + phase; ts < to; ts += 15 * 1000 {
+			if ts < gapFrom || ts >= gapTo {
+				raw = append(raw, sample{t: ts, f: offset + float64(ts)/1000})
+			}
+		}
+		return downsample.DownsampleRaw(downsample.SamplesFromTSDBSamples(raw), step)
+	}
+
+	for _, tc := range []struct {
+		name     string
+		replicas [][]chunks.Meta
+		// count is the number of count samples the deduplication returns.
+		count int
+	}{
+		{
+			// Each replica has three chunks of 90 to 96 count samples, which
+			// overlap the other replica's in a chain.
+			name: "replicas downsampled from raw samples, second one starts 10m later, gap in the first one",
+			replicas: [][]chunks.Meta{
+				downsampled(hour, 25*hour, 0, 10*hour, 11*hour, 0),
+				downsampled(hour+10*minute, 25*hour, 6*1000, 0, 0, 0.5),
+			},
+			count: 286,
+		},
+		// The second replica takes over two samples after the first one
+		// ends, so the deduplication returns to-2 samples.
+		{
+			name:     "120 count samples",
+			replicas: [][]chunks.Meta{aggrChunk(1, 0, 100, all), aggrChunk(2, 50, 122, all)},
+			count:    120,
+		},
+		{
+			name:     "121 count samples",
+			replicas: [][]chunks.Meta{aggrChunk(1, 0, 100, all), aggrChunk(2, 50, 123, all)},
+			count:    121,
+		},
+		{
+			name:     "240 count samples",
+			replicas: [][]chunks.Meta{aggrChunk(1, 0, 100, all), aggrChunk(2, 50, 242, all)},
+			count:    240,
+		},
+		{
+			name:     "241 count samples",
+			replicas: [][]chunks.Meta{aggrChunk(1, 0, 100, all), aggrChunk(2, 50, 243, all)},
+			count:    241,
+		},
+		{
+			name:     "241 count samples, no counter",
+			replicas: [][]chunks.Meta{aggrChunk(1, 0, 100, all[:4]), aggrChunk(2, 50, 243, all[:4])},
+			count:    241,
+		},
+		{
+			name:     "241 count samples, count and sum only",
+			replicas: [][]chunks.Meta{aggrChunk(1, 0, 100, all[:2]), aggrChunk(2, 50, 243, all[:2])},
+			count:    241,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lset := labels.FromStrings("__name__", "up")
+			var (
+				input    []storage.ChunkSeries
+				inChunks []chunks.Meta
+			)
+			for _, chks := range tc.replicas {
+				input = append(input, &storage.ChunkSeriesEntry{
+					Lset: lset,
+					ChunkIteratorFn: func(chunks.Iterator) chunks.Iterator {
+						return storage.NewListChunkSeriesIterator(chks...)
+					},
+				})
+				inChunks = append(inChunks, chks...)
+			}
+			// The merger deduplicates all input chunks together.
+			testutil.Equals(t, 1, len(overlapGroups(inChunks)), "overlap groups")
+
+			var exp [5][]sample
+			for _, at := range all {
+				exp[at] = querierAggrDedup(t, lset, tc.replicas, at)
+			}
+			testutil.Equals(t, tc.count, len(exp[downsample.AggrCount]), "count samples")
+
+			out, err := storage.ExpandChunks(NewChunkSeriesMerger()(input...).Iterator(nil))
+			testutil.Ok(t, err)
+			testutil.Equals(t, (tc.count+119)/120, len(out), "number of chunks")
+
+			var total [5]int
+			for i, c := range out {
+				count, _ := aggrSamples(t, c, downsample.AggrCount)
+				testutil.Assert(t, len(count) > 0 && len(count) <= 120, "chunk %d: %d count samples", i, len(count))
+				testutil.Equals(t, [2]int64{count[0].t, count[len(count)-1].t}, [2]int64{c.MinTime, c.MaxTime}, "chunk %d: time range", i)
+
+				for _, at := range all {
+					var want []sample
+					for _, s := range exp[at] {
+						if s.t >= c.MinTime && s.t <= c.MaxTime {
+							want = append(want, s)
+						}
+					}
+					if at == downsample.AggrCounter && len(want) > 0 {
+						// The counter ends with its last sample once more.
+						want = append(want, want[len(want)-1])
+					}
+					got, ok := aggrSamples(t, c, at)
+					testutil.Equals(t, len(want) > 0, ok, "chunk %d: has %s", i, at)
+					testutil.Equals(t, want, got, "chunk %d: %s", i, at)
+					// The counter also holds raw values at other times, so it
+					// is only checked against its deduplication.
+					if ok && at != downsample.AggrCounter {
+						testutil.Equals(t, sampleTimes(count), sampleTimes(got), "chunk %d: %s times", i, at)
+					}
+					total[at] += len(got)
+				}
+			}
+			for _, at := range all[:4] {
+				testutil.Equals(t, len(exp[at]), total[at], "%s samples in all chunks", at)
+			}
+		})
+	}
+}
+
+// querierAggrDedup returns what the querier's penalty deduplication returns
+// for an aggregate of the replicas' downsampled chunks.
+func querierAggrDedup(t *testing.T, lset labels.Labels, replicas [][]chunks.Meta, at downsample.AggrType) []sample {
+	t.Helper()
+	var set testSeriesSet
+	for _, chks := range replicas {
+		var in []chunks.Sample
+		for _, c := range chks {
+			samples, _ := aggrSamples(t, c, at)
+			for _, s := range samples {
+				in = append(in, s)
+			}
+		}
+		if len(in) > 0 {
+			set.series = append(set.series, storage.NewListSeries(lset, in))
+		}
+	}
+	dedupSet := NewSeriesSet(&set, "", AlgorithmPenalty)
+	var out []sample
+	for dedupSet.Next() {
+		it := dedupSet.At().Iterator(nil)
+		for it.Next() != chunkenc.ValNone {
+			ts, v := it.At()
+			out = append(out, sample{t: ts, f: v})
+		}
+		testutil.Ok(t, it.Err())
+	}
+	testutil.Ok(t, dedupSet.Err())
+	return out
+}
+
+// aggrSamples returns the samples of an aggregate of a downsampled chunk, and
+// whether the chunk has that aggregate.
+func aggrSamples(t *testing.T, c chunks.Meta, at downsample.AggrType) ([]sample, bool) {
+	t.Helper()
+	aggrChk, ok := c.Chunk.(*downsample.AggrChunk)
+	testutil.Assert(t, ok, "not a downsampled chunk: %T", c.Chunk)
+	chk, err := aggrChk.Get(at)
+	if err != nil {
+		// The chunk does not have the aggregate. Get reports it with
+		// ErrAggrNotExist, or with a size error for the last one.
+		return nil, false
+	}
+	var out []sample
+	it := chk.Iterator(nil)
+	for it.Next() != chunkenc.ValNone {
+		ts, v := it.At()
+		out = append(out, sample{t: ts, f: v})
+	}
+	testutil.Ok(t, it.Err())
+	return out, true
+}
+
+func sampleTimes(samples []sample) []int64 {
+	out := make([]int64, 0, len(samples))
+	for _, s := range samples {
+		out = append(out, s.t)
+	}
+	return out
+}
+
 // sampleAtTime returns the sample at the given time.
 func sampleAtTime(s chunks.Sample, t int64) chunks.Sample {
 	hs := s.(histoSample)
