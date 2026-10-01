@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -19,8 +20,10 @@ import (
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	commonmodel "github.com/prometheus/common/model"
 	"github.com/prometheus/common/route"
+	"github.com/prometheus/prometheus/model/relabel"
 	"gopkg.in/yaml.v2"
 
 	"github.com/thanos-io/objstore"
@@ -31,6 +34,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/indexheader"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
+	"github.com/thanos-io/thanos/pkg/compact/downsample"
 	"github.com/thanos-io/thanos/pkg/component"
 	hidden "github.com/thanos-io/thanos/pkg/extflag"
 	"github.com/thanos-io/thanos/pkg/exthttp"
@@ -88,6 +92,9 @@ type storeConfig struct {
 	blockSyncConcurrency          int
 	blockMetaFetchConcurrency     int
 	filterConf                    *store.FilterConfig
+	minBlockResolution            commonmodel.Duration
+	maxBlockResolution            commonmodel.Duration
+	warnHiddenResolution          bool
 	selectorRelabelConf           extflag.PathOrContent
 	advertiseCompatibilityLabel   bool
 	consistencyDelay              commonmodel.Duration
@@ -179,6 +186,15 @@ func (sc *storeConfig) registerFlag(cmd extkingpin.FlagClause) {
 	cmd.Flag("max-time", "End of time range limit to serve. Thanos Store will serve only blocks, which happened earlier than this value. Option can be a constant time in RFC3339 format or time duration relative to current time, such as -1d or 2h45m. Valid duration units are ms, s, m, h, d, w, y.").
 		Default("9999-12-31T23:59:59Z").SetValue(&sc.filterConf.MaxTime)
 
+	cmd.Flag("min-block-resolution", "Minimum downsampling resolution of blocks to serve, one of 0s, 5m or 1h. A block of a finer resolution is hidden only while blocks at this resolution in its block stream hold all of its sources over its whole time range; otherwise it is still served, as hiding it would drop its data. A query asking for finer data than this (max_source_resolution) gets nothing from the hidden blocks. 0s hides nothing.").
+		Default("0s").HintAction(listResLevel).SetValue(&sc.minBlockResolution)
+
+	cmd.Flag("max-block-resolution", "Maximum downsampling resolution of blocks to serve, one of 0s, 5m or 1h. Blocks of a coarser resolution are not served; make sure another store serves them, or the finer blocks they were made from.").
+		Default("1h").HintAction(listResLevel).SetValue(&sc.maxBlockResolution)
+
+	cmd.Flag("store.warn-hidden-resolution", "If true, a Series request asking for finer data than --min-block-resolution gets a warning when blocks hidden behind coarser ones overlap its time range and external labels. Off by default: under the strict partial response strategy, which rulers use, the warning fails the request even when another store answered it completely.").
+		Default("false").BoolVar(&sc.warnHiddenResolution)
+
 	cmd.Flag("debug.advertise-compatibility-label", "If true, Store Gateway in addition to other labels, will advertise special \"@thanos_compatibility_store_type=store\" label set. This makes store Gateway compatible with Querier before 0.8.0").
 		Hidden().Default("true").BoolVar(&sc.advertiseCompatibilityLabel)
 
@@ -235,6 +251,83 @@ func (sc *storeConfig) registerFlag(cmd extkingpin.FlagClause) {
 	sc.reqLogConfig = extkingpin.RegisterRequestLoggingFlags(cmd)
 }
 
+// validateBlockResolutions rejects resolution bounds that do not name a level
+// the compactor produces: an unknown minimum would hide nothing, load every
+// raw block and report all of them as uncovered, silently.
+func validateBlockResolutions(minResolution, maxResolution time.Duration) error {
+	levels := []int64{downsample.ResLevel0, downsample.ResLevel1, downsample.ResLevel2}
+	for _, bound := range []struct {
+		name  string
+		value time.Duration
+	}{{"--min-block-resolution", minResolution}, {"--max-block-resolution", maxResolution}} {
+		if bound.value%time.Millisecond != 0 || !slices.Contains(levels, bound.value.Milliseconds()) {
+			return errors.Errorf("invalid argument: %s '%s' is not a downsampling level; use one of %s", bound.name, commonmodel.Duration(bound.value), strings.Join(listResLevel(), ", "))
+		}
+	}
+	if minResolution > maxResolution {
+		return errors.Errorf("invalid argument: --min-block-resolution '%s' can't be greater than --max-block-resolution '%s'", commonmodel.Duration(minResolution), commonmodel.Duration(maxResolution))
+	}
+	return nil
+}
+
+// storeMetaFilters returns the store gateway's metadata filters in the order
+// the fetcher runs them, the resolution filter (nil unless the resolution
+// bounds exclude a level) and the filters following it, which the fallbacks
+// the store restores must pass too.
+//
+// The resolution filter may only count blocks the other filters retained as
+// coverage for a finer block it hides: a cover removed later (too fresh,
+// marked for deletion, a duplicate, parquet-migrated) would leave neither
+// resolution served. The time partition is the exception and runs after it,
+// so a finer block straddling the partition boundary still sees its cover on
+// the far side and is hidden rather than served in full; the partition then
+// drops that cover as it would anyway. The price is that the filters ahead of
+// it see the whole bucket rather than the window: one deletion-mark lookup per
+// out-of-window block per sync, as the compactor pays.
+func storeMetaFilters(
+	logger log.Logger,
+	reg prometheus.Registerer,
+	conf storeConfig,
+	relabelConfig []*relabel.Config,
+	ignoreDeletionMarkFilter *block.IgnoreDeletionMarkFilter,
+) (filters []block.MetadataFilter, resolution *block.ResolutionMetaFilter, following []block.MetadataFilter) {
+	timePartition := block.NewTimePartitionMetaFilter(conf.filterConf.MinTime, conf.filterConf.MaxTime)
+	filters = []block.MetadataFilter{
+		block.NewLabelShardedMetaFilter(relabelConfig),
+		block.NewConsistencyDelayMetaFilter(logger, time.Duration(conf.consistencyDelay), extprom.WrapRegistererWithPrefix("thanos_", reg)),
+		ignoreDeletionMarkFilter,
+		block.NewDeduplicateFilter(conf.blockMetaFetchConcurrency),
+		block.NewParquetMigratedMetaFilter(logger),
+	}
+
+	minResolution := time.Duration(conf.minBlockResolution).Milliseconds()
+	maxResolution := time.Duration(conf.maxBlockResolution).Milliseconds()
+	if minResolution <= 0 && maxResolution >= downsample.ResLevel2 {
+		return append([]block.MetadataFilter{timePartition}, filters...), nil, nil
+	}
+	if minResolution <= 0 {
+		// Without a minimum nothing is covered, and the window can go first.
+		resolution = block.NewResolutionMetaFilter(logger, minResolution, maxResolution, nil)
+		return append(append([]block.MetadataFilter{timePartition}, filters...), resolution), resolution, nil
+	}
+	resolution = block.NewResolutionMetaFilter(logger, minResolution, maxResolution, promauto.With(reg).NewGauge(prometheus.GaugeOpts{
+		Name: "thanos_store_resolution_filter_uncovered_blocks",
+		Help: "Number of blocks below --min-block-resolution being served because no block at the minimum resolution covers them.",
+	}))
+	return append(filters, resolution, timePartition), resolution, []block.MetadataFilter{timePartition}
+}
+
+// relabelUsesBlockID reports whether the selector relabeling looks at block
+// IDs, which shards a stream's blocks across store gateways.
+func relabelUsesBlockID(relabelConfig []*relabel.Config) bool {
+	for _, c := range relabelConfig {
+		if slices.Contains(c.SourceLabels, commonmodel.LabelName(block.BlockIDLabel)) {
+			return true
+		}
+	}
+	return false
+}
+
 // registerStore registers a store command.
 func registerStore(app *extkingpin.App) {
 	cmd := app.Command(component.Store.String(), "Store node giving access to blocks in a bucket provider. Now supported GCS, S3, Azure, Swift, Tencent COS and Aliyun OSS.")
@@ -246,6 +339,10 @@ func registerStore(app *extkingpin.App) {
 		if conf.filterConf.MinTime.PrometheusTimestamp() > conf.filterConf.MaxTime.PrometheusTimestamp() {
 			return errors.Errorf("invalid argument: --min-time '%s' can't be greater than --max-time '%s'",
 				conf.filterConf.MinTime, conf.filterConf.MaxTime)
+		}
+
+		if err := validateBlockResolutions(time.Duration(conf.minBlockResolution), time.Duration(conf.maxBlockResolution)); err != nil {
+			return err
 		}
 
 		httpLogOpts, err := logging.ParseHTTPOptions(conf.reqLogConfig)
@@ -393,14 +490,7 @@ func runStore(
 		return errors.Errorf("unknown sync strategy %s", conf.blockListStrategy)
 	}
 	ignoreDeletionMarkFilter := block.NewIgnoreDeletionMarkFilter(logger, insBkt, time.Duration(conf.ignoreDeletionMarksDelay), conf.blockMetaFetchConcurrency)
-	filters := []block.MetadataFilter{
-		block.NewTimePartitionMetaFilter(conf.filterConf.MinTime, conf.filterConf.MaxTime),
-		block.NewLabelShardedMetaFilter(relabelConfig),
-		block.NewConsistencyDelayMetaFilter(logger, time.Duration(conf.consistencyDelay), extprom.WrapRegistererWithPrefix("thanos_", reg)),
-		ignoreDeletionMarkFilter,
-		block.NewDeduplicateFilter(conf.blockMetaFetchConcurrency),
-		block.NewParquetMigratedMetaFilter(logger),
-	}
+	filters, resolutionFilter, resolutionFollowing := storeMetaFilters(logger, reg, conf, relabelConfig, ignoreDeletionMarkFilter)
 
 	metaFetcher, err := block.NewMetaFetcher(logger, conf.blockMetaFetchConcurrency, insBkt, blockLister, dataDir, extprom.WrapRegistererWithPrefix("thanos_", reg), filters)
 	if err != nil {
@@ -460,6 +550,16 @@ func runStore(
 
 	if conf.debugLogging {
 		options = append(options, store.WithDebugLogging())
+	}
+	if resolutionFilter != nil && resolutionFilter.MinimumResolution() > 0 {
+		options = append(options,
+			store.WithResolutionFilter(resolutionFilter, resolutionFollowing...),
+			store.WithHiddenResolutionWarning(conf.warnHiddenResolution),
+		)
+		level.Info(logger).Log("msg", "hiding blocks below the minimum resolution where coarser blocks cover them; queries asking for finer data need a store serving it", "minBlockResolution", conf.minBlockResolution)
+		if relabelUsesBlockID(relabelConfig) {
+			level.Warn(logger).Log("msg", "the selector relabeling shards blocks by "+block.BlockIDLabel+", which separates covers from the finer blocks they cover, so --min-block-resolution hides little or nothing; shard by external labels instead")
+		}
 	}
 
 	bs, err := store.NewBucketStore(

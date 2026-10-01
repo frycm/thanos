@@ -94,12 +94,26 @@ type sourceCoverageQuery struct {
 // queries through the strict StoreAPI proxy and the PromQL engine, at the raw
 // and the 5m resolution.
 func runSourceCoverageQueries(t *testing.T, bkt objstore.Bucket, deduplicate bool, replicaLabels []string, queries []sourceCoverageQuery) {
+	runSourceCoverageQueriesAbove(t, bkt, 0, deduplicate, replicaLabels, queries)
+}
+
+// runSourceCoverageQueriesAbove is runSourceCoverageQueries with a store
+// whose resolution filter hides finer blocks below minResolution where blocks
+// at minResolution cover them; 0 installs no filter.
+func runSourceCoverageQueriesAbove(t *testing.T, bkt objstore.Bucket, minResolution int64, deduplicate bool, replicaLabels []string, queries []sourceCoverageQuery) {
 	ctx := t.Context()
 	logger := log.NewNopLogger()
 	instrBkt := objstore.WithNoopInstr(bkt)
-	fetcher, err := block.NewMetaFetcher(logger, 1, instrBkt, block.NewConcurrentLister(logger, instrBkt), "", nil, nil)
+	var filters []block.MetadataFilter
+	opts := []store.BucketStoreOption{store.WithLogger(logger)}
+	if minResolution > 0 {
+		filter := block.NewResolutionMetaFilter(logger, minResolution, downsample.ResLevel2, nil)
+		filters = append(filters, filter)
+		opts = append(opts, store.WithResolutionFilter(filter))
+	}
+	fetcher, err := block.NewMetaFetcher(logger, 1, instrBkt, block.NewConcurrentLister(logger, instrBkt), "", nil, filters)
 	testutil.Ok(t, err)
-	bs, err := store.NewBucketStore(instrBkt, fetcher, t.TempDir(), store.NewChunksLimiterFactory(10000), store.NewSeriesLimiterFactory(0), store.NewBytesLimiterFactory(0), store.NewGapBasedPartitioner(store.PartitionerMaxGapSize), 1, false, store.DefaultPostingOffsetInMemorySampling, false, false, 0, store.WithLogger(logger))
+	bs, err := store.NewBucketStore(instrBkt, fetcher, t.TempDir(), store.NewChunksLimiterFactory(10000), store.NewSeriesLimiterFactory(0), store.NewBytesLimiterFactory(0), store.NewGapBasedPartitioner(store.PartitionerMaxGapSize), 1, false, store.DefaultPostingOffsetInMemorySampling, false, false, 0, opts...)
 	testutil.Ok(t, err)
 	t.Cleanup(func() { testutil.Ok(t, bs.Close()) })
 	testutil.Ok(t, bs.SyncBlocks(ctx))
