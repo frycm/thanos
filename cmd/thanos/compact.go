@@ -387,6 +387,19 @@ func runCompact(
 		int64(conf.maxBlockIndexSize),
 		compactMetrics.blocksMarked.WithLabelValues(metadata.NoCompactMarkFilename, metadata.IndexSizeExceedingNoCompactReason),
 	)
+	// The progress calculators below keep using the default grouper and planner: with concurrent jobs, the compactions
+	// left to do are the same, they only take fewer passes.
+	var compactionGrouper compact.Grouper = grouper
+	if conf.enableConcurrentJobs {
+		level.Info(logger).Log("msg", "concurrent compaction jobs are enabled", "compact.concurrency", conf.compactionConcurrency)
+		compactionGrouper = compact.NewConcurrentJobsGrouper(grouper, levels, noCompactMarkerFilter)
+		largeIndexFilterPlanner = compact.WithLargeTotalIndexSizeFilter(
+			compact.NewConcurrentJobsPlanner(logger, noCompactMarkerFilter),
+			insBkt,
+			int64(conf.maxBlockIndexSize),
+			compactMetrics.blocksMarked.WithLabelValues(metadata.NoCompactMarkFilename, metadata.IndexSizeExceedingNoCompactReason),
+		)
+	}
 	if enableVerticalCompaction {
 		planner = compact.WithVerticalCompactionDownsampleFilter(largeIndexFilterPlanner, insBkt, compactMetrics.blocksMarked.WithLabelValues(metadata.NoCompactMarkFilename, metadata.DownsampleVerticalCompactionNoCompactReason))
 	} else {
@@ -396,7 +409,7 @@ func runCompact(
 	compactor, err := compact.NewBucketCompactor(
 		logger,
 		sy,
-		grouper,
+		compactionGrouper,
 		planner,
 		comp,
 		compactDir,
@@ -726,6 +739,7 @@ type compactConfig struct {
 	blockViewerSyncBlockTimeout                    time.Duration
 	cleanupBlocksInterval                          time.Duration
 	compactionConcurrency                          int
+	enableConcurrentJobs                           bool
 	downsampleConcurrency                          int
 	compactBlocksFetchConcurrency                  int
 	deleteDelay                                    model.Duration
@@ -799,6 +813,8 @@ func (cc *compactConfig) registerFlag(cmd extkingpin.FlagClause) {
 
 	cmd.Flag("compact.concurrency", "Number of goroutines to use when compacting groups.").
 		Default("1").IntVar(&cc.compactionConcurrency)
+	cmd.Flag("compact.concurrent-jobs", "Experimental. When set to true, the compactor plans, in each pass, all compactions of a stream (blocks with the same external labels and resolution) that do not depend on each other: sets of overlapping blocks and time-aligned ranges that do not overlap. They run concurrently, up to --compact.concurrency at a time, instead of one compaction per stream and pass. The resulting blocks are the same as without it.").
+		Default("false").BoolVar(&cc.enableConcurrentJobs)
 	cmd.Flag("compact.blocks-fetch-concurrency", "Number of goroutines to use when download block during compaction.").
 		Default("1").IntVar(&cc.compactBlocksFetchConcurrency)
 	cmd.Flag("downsample.concurrency", "Number of goroutines to use when downsampling blocks.").
