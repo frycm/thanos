@@ -5,6 +5,7 @@ package receive
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/go-kit/log"
@@ -28,6 +29,146 @@ type Appendable interface {
 
 type TenantStorage interface {
 	TenantAppendable(string) (Appendable, error)
+}
+
+// seriesReplicaStorage is a TenantStorage that keeps the series of each value of a series replica
+// label in a separate TSDB of the tenant, see WithSeriesReplicaLabelName.
+type seriesReplicaStorage interface {
+	// SeriesReplicaLabelName returns the series replica label name, empty if there is none.
+	SeriesReplicaLabelName() string
+	// TenantReplicaAppendable returns the Appendable for the series of the tenant that carried the
+	// series replica label with the given value; the label is removed from the appended series.
+	TenantReplicaAppendable(tenantID, replica string) (Appendable, error)
+}
+
+// seriesReplicaLabelName returns the series replica label name of the storage, empty if it has none.
+func seriesReplicaLabelName(s TenantStorage) string {
+	if rs, ok := s.(seriesReplicaStorage); ok {
+		return rs.SeriesReplicaLabelName()
+	}
+	return ""
+}
+
+// tenantAppender is an appender of one TSDB of a tenant.
+type tenantAppender struct {
+	app    storage.Appender
+	getRef storage.GetRef
+}
+
+// tenantAppenders opens, on first use, an appender for each TSDB of a tenant that a write request
+// touches: the tenant's own TSDB and, with a series replica label, its per-replica TSDBs.
+type tenantAppenders struct {
+	ctx            context.Context
+	storage        TenantStorage
+	tenantID       string
+	tLogger        log.Logger
+	tooFarInFuture int64
+
+	tenant   *tenantAppender
+	replicas map[string]*tenantAppender
+}
+
+func newTenantAppenders(ctx context.Context, s TenantStorage, tenantID string, tLogger log.Logger, tooFarInFuture int64) *tenantAppenders {
+	return &tenantAppenders{ctx: ctx, storage: s, tenantID: tenantID, tLogger: tLogger, tooFarInFuture: tooFarInFuture}
+}
+
+// get returns the appender for series with the given series replica label value, or for series
+// without the label if the value is empty.
+func (a *tenantAppenders) get(replica string) (*tenantAppender, error) {
+	if replica == "" && a.tenant != nil {
+		return a.tenant, nil
+	}
+	if ta, ok := a.replicas[replica]; ok {
+		return ta, nil
+	}
+
+	var (
+		s   Appendable
+		err error
+	)
+	if replica == "" {
+		s, err = a.storage.TenantAppendable(a.tenantID)
+	} else {
+		// The value can point into the request buffer, which is reused.
+		replica = strings.Clone(replica)
+		s, err = a.storage.(seriesReplicaStorage).TenantReplicaAppendable(a.tenantID, replica)
+	}
+	if err != nil {
+		return nil, errors.Wrap(err, "get tenant appendable")
+	}
+
+	app, err := s.Appender(a.ctx)
+	if err == tsdb.ErrNotReady {
+		return nil, err
+	}
+	if err != nil {
+		return nil, errors.Wrap(err, "get appender")
+	}
+	ta := &tenantAppender{
+		app: &ReceiveAppender{
+			tLogger:        a.tLogger,
+			tooFarInFuture: a.tooFarInFuture,
+			Appender:       app,
+		},
+		getRef: app.(storage.GetRef),
+	}
+
+	if replica == "" {
+		a.tenant = ta
+	} else {
+		if a.replicas == nil {
+			a.replicas = map[string]*tenantAppender{}
+		}
+		a.replicas[replica] = ta
+	}
+	return ta, nil
+}
+
+func (a *tenantAppenders) all() []*tenantAppender {
+	all := make([]*tenantAppender, 0, 1+len(a.replicas))
+	if a.tenant != nil {
+		all = append(all, a.tenant)
+	}
+	for _, ta := range a.replicas {
+		all = append(all, ta)
+	}
+	return all
+}
+
+// commit commits all opened appenders and adds their errors to errs.
+func (a *tenantAppenders) commit(errs *writeErrors) {
+	for _, ta := range a.all() {
+		if err := ta.app.Commit(); err != nil {
+			errs.Add(errors.Wrap(err, "commit samples"))
+		}
+	}
+}
+
+// rollback rolls back all opened appenders.
+func (a *tenantAppenders) rollback() {
+	for _, ta := range a.all() {
+		if err := ta.app.Rollback(); err != nil {
+			level.Warn(a.tLogger).Log("msg", "rolling back appender failed", "err", err)
+		}
+	}
+}
+
+// withoutZLabel returns the labels without the non-empty label of the given name, and that label's
+// value. It returns the labels unchanged and an empty value if there is no such label. It never
+// modifies lbls, which can be shared with requests forwarded to other receivers.
+func withoutZLabel(lbls []labelpb.ZLabel, name string) ([]labelpb.ZLabel, string) {
+	for i, l := range lbls {
+		if l.Name != name {
+			continue
+		}
+		if l.Value == "" {
+			break
+		}
+		out := make([]labelpb.ZLabel, 0, len(lbls)-1)
+		out = append(out, lbls[:i]...)
+		return append(out, lbls[i+1:]...), l.Value
+	}
+	return lbls, ""
 }
 
 // Wraps storage.Appender to add validation and logging.
@@ -59,44 +200,32 @@ type Writer struct {
 	logger    log.Logger
 	multiTSDB TenantStorage
 	opts      *WriterOptions
+
+	seriesReplicaLabel string
 }
 
+// NewWriter returns a Writer to the tenants' TSDBs. If multiTSDB has a series replica label (see
+// WithSeriesReplicaLabelName), the Writer removes it from series and writes them to the per-replica TSDBs.
 func NewWriter(logger log.Logger, multiTSDB TenantStorage, opts *WriterOptions) *Writer {
 	if opts == nil {
 		opts = &WriterOptions{}
 	}
 	return &Writer{
-		logger:    logger,
-		multiTSDB: multiTSDB,
-		opts:      opts,
+		logger:             logger,
+		multiTSDB:          multiTSDB,
+		opts:               opts,
+		seriesReplicaLabel: seriesReplicaLabelName(multiTSDB),
 	}
 }
 
 func (r *Writer) Write(ctx context.Context, tenantID string, wreq []prompb.TimeSeries) error {
 	tLogger := log.With(r.logger, "tenant", tenantID)
 
-	s, err := r.multiTSDB.TenantAppendable(tenantID)
-	if err != nil {
-		return errors.Wrap(err, "get tenant appendable")
-	}
-
-	app, err := s.Appender(ctx)
-	if err == tsdb.ErrNotReady {
-		return err
-	}
-	if err != nil {
-		return errors.Wrap(err, "get appender")
-	}
-	getRef := app.(storage.GetRef)
+	apps := newTenantAppenders(ctx, r.multiTSDB, tenantID, tLogger, r.opts.TooFarInFutureTimeWindow)
 	var (
 		ref          storage.SeriesRef
 		errorTracker writeErrorTracker
 	)
-	app = &ReceiveAppender{
-		tLogger:        tLogger,
-		tooFarInFuture: r.opts.TooFarInFutureTimeWindow,
-		Appender:       app,
-	}
 
 	for _, t := range wreq {
 		// Check if time series labels are valid. If not, skip the time series
@@ -107,10 +236,25 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq []prompb.TimeS
 			continue
 		}
 
+		var replica string
+		if r.seriesReplicaLabel != "" {
+			lbls := t.Labels
+			if t.Labels, replica = withoutZLabel(lbls, r.seriesReplicaLabel); len(t.Labels) == 0 {
+				errorTracker.addLabelsError(labelpb.ErrEmptyLabels, &labelpb.ZLabelSet{Labels: lbls}, tLogger)
+				continue
+			}
+		}
+		ta, err := apps.get(replica)
+		if err != nil {
+			apps.rollback()
+			return err
+		}
+		app := ta.app
+
 		lset := labelpb.ZLabelsToPromLabels(t.Labels)
 
 		// Check if the TSDB has cached reference for those labels.
-		ref, lset = getRef.GetRef(lset, lset.Hash())
+		ref, lset = ta.getRef.GetRef(lset, lset.Hash())
 		if ref == 0 {
 			// If not, copy labels, as TSDB will hold those strings long term. Given no
 			// copy unmarshal we don't want to keep memory for whole protobuf, only for labels.
@@ -160,8 +304,6 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq []prompb.TimeS
 	}
 
 	errs := errorTracker.collectErrors(tLogger)
-	if err := app.Commit(); err != nil {
-		errs.Add(errors.Wrap(err, "commit samples"))
-	}
+	apps.commit(&errs)
 	return errs.ErrOrNil()
 }

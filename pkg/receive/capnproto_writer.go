@@ -14,7 +14,6 @@ import (
 	"github.com/prometheus/prometheus/model/exemplar"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
-	"github.com/prometheus/prometheus/tsdb"
 
 	"github.com/thanos-io/thanos/pkg/receive/writecapnp"
 )
@@ -27,51 +26,44 @@ type CapNProtoWriter struct {
 	logger    log.Logger
 	multiTSDB TenantStorage
 	opts      *CapNProtoWriterOptions
+
+	seriesReplicaLabel string
 }
 
+// NewCapNProtoWriter returns a CapNProtoWriter to the tenants' TSDBs. If multiTSDB has a series replica
+// label (see WithSeriesReplicaLabelName), the writer removes it from series and writes them to the
+// per-replica TSDBs.
 func NewCapNProtoWriter(logger log.Logger, multiTSDB TenantStorage, opts *CapNProtoWriterOptions) *CapNProtoWriter {
 	if opts == nil {
 		opts = &CapNProtoWriterOptions{}
 	}
 	return &CapNProtoWriter{
-		logger:    logger,
-		multiTSDB: multiTSDB,
-		opts:      opts,
+		logger:             logger,
+		multiTSDB:          multiTSDB,
+		opts:               opts,
+		seriesReplicaLabel: seriesReplicaLabelName(multiTSDB),
 	}
 }
 
 func (r *CapNProtoWriter) Write(ctx context.Context, tenantID string, wreq *writecapnp.Request) error {
 	tLogger := log.With(r.logger, "tenant", tenantID)
 
-	s, err := r.multiTSDB.TenantAppendable(tenantID)
-	if err != nil {
-		return errors.Wrap(err, "get tenant appendable")
-	}
-
-	app, err := s.Appender(ctx)
-	if err == tsdb.ErrNotReady {
-		return err
-	}
-	if err != nil {
-		return errors.Wrap(err, "get appender")
-	}
-	getRef := app.(storage.GetRef)
+	apps := newTenantAppenders(ctx, r.multiTSDB, tenantID, tLogger, r.opts.TooFarInFutureTimeWindow)
 	var (
 		ref          storage.SeriesRef
 		errorTracker = &writeErrorTracker{}
 	)
-	app = &ReceiveAppender{
-		tLogger:        tLogger,
-		tooFarInFuture: r.opts.TooFarInFutureTimeWindow,
-		Appender:       app,
-	}
 
 	var (
 		series  writecapnp.Series
 		builder labels.ScratchBuilder
+
+		replicaBuilder labels.ScratchBuilder
+		withoutReplica labels.Labels
 	)
 	for wreq.Next() {
 		if err := wreq.At(&series); err != nil {
+			apps.rollback()
 			return errors.Wrap(err, "request.At")
 		}
 
@@ -83,15 +75,42 @@ func (r *CapNProtoWriter) Write(ctx context.Context, tenantID string, wreq *writ
 			continue
 		}
 
+		var (
+			lbls    = series.Labels
+			replica string
+		)
+		if r.seriesReplicaLabel != "" {
+			if replica = lbls.Get(r.seriesReplicaLabel); replica != "" {
+				replicaBuilder.Reset()
+				lbls.Range(func(l labels.Label) {
+					if l.Name != r.seriesReplicaLabel {
+						replicaBuilder.Add(l.Name, l.Value)
+					}
+				})
+				replicaBuilder.Overwrite(&withoutReplica)
+				lbls = withoutReplica
+				if lbls.IsEmpty() {
+					errorTracker.addLabelsError(labelpb.ErrEmptyLabels, &labelpb.ZLabelSet{Labels: labelpb.ZLabelsFromPromLabels(series.Labels)}, tLogger)
+					continue
+				}
+			}
+		}
+		ta, err := apps.get(replica)
+		if err != nil {
+			apps.rollback()
+			return err
+		}
+		app := ta.app
+
 		var lset labels.Labels
 		// Check if the TSDB has cached reference for those labels.
-		ref, lset = getRef.GetRef(series.Labels, series.Labels.Hash())
+		ref, lset = ta.getRef.GetRef(lbls, lbls.Hash())
 		if ref == 0 {
 			// NOTE(GiedriusS): do a deep copy because the labels are reused in the capnp message.
 			// Creation of new series is much rarer compared to adding extra samples
 			// to an existing series.
 			builder.Reset()
-			series.Labels.Range(func(l labels.Label) {
+			lbls.Range(func(l labels.Label) {
 				builder.Add(strings.Clone(l.Name), strings.Clone(l.Value))
 			})
 			lset = builder.Labels()
@@ -142,9 +161,7 @@ func (r *CapNProtoWriter) Write(ctx context.Context, tenantID string, wreq *writ
 	}
 
 	errs := errorTracker.collectErrors(tLogger)
-	if err := app.Commit(); err != nil {
-		errs.Add(errors.Wrap(err, "commit samples"))
-	}
+	apps.commit(&errs)
 	return errs.ErrOrNil()
 }
 

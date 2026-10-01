@@ -121,6 +121,10 @@ type Options struct {
 	ReplicationProtocol     ReplicationProtocol
 	OtlpEnableTargetInfo    bool
 	OtlpResourceAttributes  []string
+
+	// SeriesReplicaLabelName is the series replica label (see WithSeriesReplicaLabelName). Series are
+	// routed by their labels without it, so that all replicas of a series go to the same receivers.
+	SeriesReplicaLabelName string
 }
 
 // Handler serves a Prometheus remote write receiving HTTP endpoint.
@@ -893,8 +897,16 @@ func (h *Handler) distributeTimeseriesToReplicas(
 			}
 		}
 
+		hashedSeries := &ts
+		if h.options.SeriesReplicaLabelName != "" {
+			if lbls, replica := withoutZLabel(ts.Labels, h.options.SeriesReplicaLabelName); replica != "" {
+				// The series keeps the label: the receiver that writes it to its TSDB removes it.
+				hashedSeries = &prompb.TimeSeries{Labels: lbls}
+			}
+		}
+
 		for _, rn := range replicas {
-			endpoint, err := h.hashring.GetN(tenant, &ts, rn)
+			endpoint, err := h.hashring.GetN(tenant, hashedSeries, rn)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -1145,6 +1157,7 @@ func isConflict(err error) bool {
 		return false
 	}
 	return err == errConflict ||
+		err == errInvalidTSDBName ||
 		isSampleConflictErr(err) ||
 		isExemplarConflictErr(err) ||
 		isLabelsConflictErr(err) ||
